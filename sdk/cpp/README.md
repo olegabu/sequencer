@@ -56,6 +56,7 @@ ctest --preset debug --output-on-failure
 | `alarm_test.cpp` | Not-yet-overdue, becomes-overdue-past-the-bound, cleared-by-`proofReceived`, and multiple concurrently-tracked sequence numbers. |
 | `reconciler_test.cpp` | Matching bytes reconcile cleanly; mismatched bytes are reported as specification.md §7.3's fraud proof; not-yet-committed is distinguished from an actual mismatch; `checkAll`'s batch convenience. |
 | `propose_client_test.cpp` | Two real transports: `ProposeClient` wired straight to a real, in-process node's `ProposeService` (the "pass-through, no gateway" shape); and wired through a real `InputGatewayImpl` configured with `client_signer.hpp`'s own `makeEnvelopeSignatureVerifier` — proving the signer and gateway/input's verification hook actually fit together, including a hand-tampered envelope being rejected before it ever reaches `Propose`. |
+| `acceptance_drill_test.cpp` | specification.md §14 item 3's two angles not already covered above: proof reconstruction from a *fresh* colocated `JournalReader` alone (standing in for a client with nothing left but the published journal), and `ProofTimeoutAlarm` firing against a real, genuinely-stalled `SigningGatewayImpl` (its journal deliberately left short of a full block, so it can never sign — specification.md §7.1). |
 
 ## Seeing it in action
 

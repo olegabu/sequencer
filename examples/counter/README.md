@@ -78,6 +78,7 @@ ctest --preset debug --output-on-failure
 | `counter_codec_test.cpp` | Both codecs in isolation, no gateway or process involved: `CounterInputCodec` parsing valid/negative/whitespace-tolerant/missing-field/non-JSON bodies and building its response JSON; `CounterOutputCodec` broadcasting a record's total (and defaulting to `0` for a record with no outputs) to the `"totals"` topic of a recording `Fanout` test double. |
 | `websocket_transport_test.cpp` | `WebSocketTransport` against a real synchronous Beast client: a connected client receives a broadcast, several broadcasts arrive in order, and broadcasting to a topic with no subscribers is a silent no-op. Stress-tested well beyond a single clean run while chasing the thread-safety redesign below. |
 | `end_to_end_test.cpp` | The full pipeline, four real processes (`counter_node`, `counter_input_gateway`, `counter_output_gateway`, plus a test WebSocket client) and one real submitting `brpc::Channel`: submits three deltas through the input gateway, asserts each synchronous response and each WebSocket broadcast carry the identical, correctly-accumulating `{"sequence_number":N,"total":M}` JSON — specification.md §15 item 6's deliverable, and the closest thing in this repository to a full deployment. Verified with 10+ consecutive clean runs beyond its first pass, following this session's pattern for anything involving subprocesses and networking. |
+| `kill_leader_drill_test.cpp` | specification.md §14's acceptance-checklist items 2 and 5: a real 3-node cluster, a client proposing continuously exactly as an input gateway would (follow redirects, retry on failure), and an abrupt `SIGKILL` — of the leader in one test, of a follower in the other — while load is in flight. Verifies dense sequence numbers straight through the fault, byte-for-byte agreement between every surviving (and the killed node's own already-committed) journal, and continued commits after the kill. Deliberately never asserts an exact post-kill total — see the file's own header comment for why, given `CounterStateMachine` has no idempotency-key deduplication. |
 
 ## A real bug this test caught
 
@@ -123,12 +124,39 @@ same, and always easy to miss in a one-line test setup.
 
 ## Seeing it in action
 
-Run a single node directly (it needs `--peer` and `--data_dir`; `--peers`
-defaults to itself, forming a trivial one-node group):
+### The fastest way: `demo.sh`
+
+```sh
+./examples/counter/demo.sh
+```
+
+Starts a real single-node raft group, a real input gateway, and a real
+output gateway, then drives the whole pipeline using tools *outside*
+this repository entirely — `curl` to submit three deltas as plain
+HTTP+JSON, [`websocat`](https://github.com/vi/websocat) to watch the
+running total arrive live over plain WebSocket — and checks that what
+`websocat` received matches what `curl` was told, byte for byte. It's
+the external-tool counterpart to `end_to_end_test.cpp` (which drives
+the identical pipeline from an in-process gtest via `brpc::Channel` and
+a Beast client instead): proof that the system speaks plain HTTP and
+plain WebSocket to *any* client, not just this repository's own C++
+code. Needs `websocat` on `PATH` — **not `curl` itself**: WebSocket
+support in curl is experimental, opt-in at compile time, and absent
+from most distro-packaged builds (this repository's own dev image ships
+curl 7.68, which predates it entirely), so `websocat` is curl's natural
+counterpart for the receiving side, not curl with a different flag.
+
+### By hand
+
+Run a single node directly. `--peers` is **not** defaulted to `--peer`
+— despite what an earlier draft of this README claimed, an empty
+`--peers` leaves the raft group entirely unconfigured (no election
+timer ever starts) rather than bootstrapping a trivial one-node group,
+so pass it explicitly, equal to `--peer`, to self-elect:
 
 ```sh
 ./build/debug/examples/counter/counter_node \
-  --peer=127.0.0.1:8100:0 --data_dir=/tmp/counter-node-0
+  --peer=127.0.0.1:8100:0 --peers=127.0.0.1:8100:0 --data_dir=/tmp/counter-node-0
 ```
 
 Point an input gateway at it, and an output gateway at the same data
@@ -143,18 +171,19 @@ directory (colocated — see
   --listen_port=8300
 ```
 
-Submit a delta and watch the total accumulate, either with the load
-generator (open-loop: fires at a fixed rate regardless of response
-latency, per specification.md §12's load-testing guidance):
+Submit a delta and watch the total accumulate: with the load generator
+(open-loop: fires at a fixed rate regardless of response latency, per
+specification.md §12's load-testing guidance),
 
 ```sh
 ./build/debug/examples/counter/counter_load_generator \
   --input_gateway_addr=127.0.0.1:8200 --count=100 --rate=50
 ```
 
-or by hand with any WebSocket client pointed at `ws://127.0.0.1:8300/`
-to observe broadcasts, and any brpc client (or `end_to_end_test.cpp`'s
-`submitDelta` for the exact shape) to submit `{"delta": N}` bodies.
+with `curl` and `websocat` exactly as `demo.sh` does (see its
+`SubmitService/Submit` URL and `-n`/`--no-close` flag for the two
+details easy to get wrong by hand), or with any brpc client (or
+`end_to_end_test.cpp`'s `submitDelta` for the exact shape).
 
 Once a node has proposed a few deltas, its data directory holds a real
 journal — inspect it with `tools/dumper`, or certify it with this

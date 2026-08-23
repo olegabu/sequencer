@@ -49,6 +49,16 @@ class ChildProcess {
     }
   }
 
+  pid_t pid() const { return pid_; }
+
+  // For a fault-injection drill that needs to kill this process at a
+  // controlled moment mid-test (specification.md §14's kill-leader and
+  // zone-loss drills), rather than waiting for the destructor's
+  // graceful SIGTERM at scope exit. Safe to call before destruction —
+  // the destructor's own SIGTERM/waitpid on an already-exited pid is a
+  // harmless no-op.
+  void kill(int signal) { ::kill(pid_, signal); }
+
  private:
   std::string path_;
   std::vector<std::string> args_;

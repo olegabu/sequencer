@@ -77,6 +77,29 @@ until each one's `on_closed()` has actually confirmed. Verified against
 25 consecutive clean full-suite runs after the fix, versus a
 reproducible failure within the first couple of runs before it.
 
+## A second, symmetric crash — this time on the client side of the tests themselves
+
+The same `brpc::StreamClose()` gap has a mirror image: a *test's own*
+client-side stream handler can just as easily be freed out from under
+an in-flight asynchronous `on_closed()`/`on_received_messages()`
+callback if nothing waits for confirmed closure before destroying it.
+This surfaced as a one-off segfault in
+`tests/restart_drill_test.cpp` (specification.md §14 item 4's drill,
+added later — see its own header comment) while stress-testing it: that
+test tears down three `OutputGatewayImpl` instances in one process
+(more than any other test here), which made the same narrow timing
+window this component had already fixed once — but on the *client*
+side this time, in test-only code — enough more likely to hit that it
+finally showed up, after 50+ prior isolated/targeted attempts to
+reproduce it found nothing. `tests/collecting_stream_client.hpp` is the
+fix: a shared `Subscription`/`CollectingStreamHandler` (previously
+duplicated, unfixed, in both `output_gateway_test.cpp` and this file)
+whose `Subscription` now closes its stream and blocks — bounded, same
+shape as `StreamFanout::closeAll()` — until `on_closed()` has actually
+confirmed, in its own destructor, so correctness never depends on a
+test remembering to do this by hand. Verified against 40 consecutive
+clean full-suite runs after the fix.
+
 ## Testing
 
 ```sh
@@ -94,6 +117,15 @@ needed — `journal::JournalWriter`, matching
 |---|---|
 | `DeliversLiveRecordsInOrderToAConnectedSubscriber` | A connected subscriber receives newly-appended records, in order, byte-correct. |
 | `ResumesFromDurablePositionAfterRestartWithoutRedelivering` | Stop the gateway mid-stream, append more records, start a fresh instance pointed at the same resume file: a newly-connecting subscriber sees only the new records, never a redelivery of what was already processed before the restart. |
+
+`tests/restart_drill_test.cpp` covers specification.md §14 item 4's
+literal claim — not just "no redelivery" but "identical to an
+uninterrupted run" — by running two gateways side by side: one
+continuous ("gateway A"), one stopped and restarted at an arbitrary
+sequence number partway through ("gateway B"), then asserting gateway
+B's total delivered sequence (its pre-restart segment plus its
+post-restart segment, concatenated) is byte-for-byte equal to gateway
+A's.
 
 ## Seeing it in action
 

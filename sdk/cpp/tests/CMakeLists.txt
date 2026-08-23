@@ -17,6 +17,17 @@ add_executable(sdk_reconciler_test reconciler_test.cpp)
 target_link_libraries(sdk_reconciler_test PRIVATE sequencer::sdk GTest::gtest GTest::gtest_main)
 gtest_discover_tests(sdk_reconciler_test)
 
+add_executable(sdk_acceptance_drill_test acceptance_drill_test.cpp)
+target_link_libraries(sdk_acceptance_drill_test PRIVATE
+  sequencer::sdk
+  sequencer::evidence_proto
+  unofficial::brpc::brpc-static
+  GTest::gtest
+  GTest::gtest_main
+  Threads::Threads
+)
+gtest_discover_tests(sdk_acceptance_drill_test PROPERTIES TIMEOUT 60)
+
 add_executable(sdk_propose_client_test propose_client_test.cpp)
 target_link_libraries(sdk_propose_client_test PRIVATE
   sequencer::sdk

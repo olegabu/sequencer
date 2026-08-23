@@ -7,18 +7,17 @@
 // (§8.3: "restartable from any sequence number with identical output").
 
 #include "brpc_stream_transport.hpp"
+#include "collecting_stream_client.hpp"
 #include "output_gateway_impl.hpp"
 
 #include <sequencer/journal/writer.hpp>
 
 #include <brpc/channel.h>
 #include <brpc/controller.h>
-#include <brpc/stream.h>
 
 #include <chrono>
 #include <cstring>
 #include <filesystem>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,29 +36,6 @@ class EchoOutputCodec : public sequencer::OutputCodec {
     const Payload input = record.input();
     fanout.broadcast("all", Bytes(input.begin(), input.end()));
   }
-};
-
-// Collects every message the server streams to this client, in order.
-class CollectingStreamHandler : public brpc::StreamInputHandler {
- public:
-  int on_received_messages(brpc::StreamId, butil::IOBuf* const messages[], size_t size) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (size_t i = 0; i < size; ++i) {
-      received_.push_back(messages[i]->to_string());
-    }
-    return 0;
-  }
-  void on_idle_timeout(brpc::StreamId) override {}
-  void on_closed(brpc::StreamId) override {}
-
-  std::vector<std::string> snapshot() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return received_;
-  }
-
- private:
-  std::mutex mutex_;
-  std::vector<std::string> received_;
 };
 
 std::filesystem::path makeTempDir() {
@@ -81,50 +57,6 @@ void appendRecords(const std::filesystem::path& dataDir, std::uint64_t startSeq,
     writer.append(startSeq + i, payloadOf(values[i]), {});
   }
   writer.flush(false);
-}
-
-// A live subscription: the handler, the client-side stream, and —
-// importantly — the Controller that created it. brpc ties a
-// client-created stream's lifetime to the Controller that established
-// it; destroying the Controller tears the stream down too, so all
-// three must be kept alive together for as long as the subscription
-// should keep receiving messages.
-struct Subscription {
-  std::unique_ptr<CollectingStreamHandler> handler;
-  std::unique_ptr<brpc::Controller> cntl;
-  brpc::StreamId streamId = brpc::INVALID_STREAM_ID;
-};
-
-Subscription subscribe(brpc::Channel& channel, const std::string& topic) {
-  Subscription sub;
-  sub.handler = std::make_unique<CollectingStreamHandler>();
-  sub.cntl = std::make_unique<brpc::Controller>();
-  brpc::StreamOptions options;
-  options.handler = sub.handler.get();
-  if (brpc::StreamCreate(&sub.streamId, *sub.cntl, &options) != 0) {
-    throw std::runtime_error("StreamCreate failed");
-  }
-
-  sequencer::gateway::output::proto::OutputSubscribeService_Stub stub(&channel);
-  sequencer::gateway::output::proto::OutputSubscribeRequest request;
-  request.set_topic(topic);
-  sequencer::gateway::output::proto::OutputSubscribeResponse response;
-  stub.Subscribe(sub.cntl.get(), &request, &response, nullptr);
-  if (sub.cntl->Failed() || !response.error_message().empty()) {
-    throw std::runtime_error("Subscribe failed: " + response.error_message());
-  }
-  return sub;
-}
-
-bool waitForCount(CollectingStreamHandler& handler, std::size_t count, std::chrono::seconds timeout) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (handler.snapshot().size() >= count) {
-      return true;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  return false;
 }
 
 TEST(OutputGateway, DeliversLiveRecordsInOrderToAConnectedSubscriber) {
@@ -149,9 +81,9 @@ TEST(OutputGateway, DeliversLiveRecordsInOrderToAConnectedSubscriber) {
   // realistic test — and a real deployment — connects first.
   Subscription sub = subscribe(channel, "all");
   appendRecords(dir, 1, {5, -2, 10, -13, 100});
-  ASSERT_TRUE(waitForCount(*sub.handler, 5, std::chrono::seconds(5)));
+  ASSERT_TRUE(waitForCount(sub.handler(), 5, std::chrono::seconds(5)));
 
-  const std::vector<std::string> received = sub.handler->snapshot();
+  const std::vector<std::string> received = sub.handler().snapshot();
   const std::vector<std::int64_t> expected = {5, -2, 10, -13, 100};
   ASSERT_EQ(received.size(), expected.size());
   for (std::size_t i = 0; i < expected.size(); ++i) {
@@ -185,7 +117,7 @@ TEST(OutputGateway, ResumesFromDurablePositionAfterRestartWithoutRedelivering) {
 
     Subscription sub = subscribe(channel, "all");
     appendRecords(dir, 1, {1, 2, 3});
-    ASSERT_TRUE(waitForCount(*sub.handler, 3, std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForCount(sub.handler(), 3, std::chrono::seconds(5)));
     gateway.stop();
     // The resume file now durably holds 4 — the tailing loop advances
     // it as it processes records, independent of whether any
@@ -209,9 +141,9 @@ TEST(OutputGateway, ResumesFromDurablePositionAfterRestartWithoutRedelivering) {
     // restart: the subscriber sees only 40 and 50, never 1-3 again.
     Subscription sub = subscribe(channel, "all");
     appendRecords(dir, 4, {40, 50});
-    ASSERT_TRUE(waitForCount(*sub.handler, 2, std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForCount(sub.handler(), 2, std::chrono::seconds(5)));
 
-    const std::vector<std::string> received = sub.handler->snapshot();
+    const std::vector<std::string> received = sub.handler().snapshot();
     ASSERT_EQ(received.size(), 2u);
     std::int64_t first, second;
     std::memcpy(&first, received[0].data(), sizeof(first));

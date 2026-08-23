@@ -188,3 +188,45 @@ separate from `ctest` and run directly:
 including `docs/specification.md` §11's determinism-replay gate — on
 every push and pull request against `main`.
 
+## Deployment
+
+`docs/specification.md` §13's recommendation: **one node per
+availability zone, across three zones** — survives the loss of any
+single zone at the roughly one-millisecond commit floor §12 describes.
+Placement of the majority, not the total node count, is the lever that
+trades latency against resilience; a single-zone-optimized deployment
+(a majority of nodes co-located in one zone) lowers commit latency
+substantially but means that zone's loss halts the system entirely —
+**a deployment choosing this must document that all-or-nothing exposure
+explicitly**, per §13 and §14 item 5, rather than presenting it as the
+general recommendation. Run at least two instances of every gateway
+type (§3.2).
+
+Failover is automatic and lossless: on leader loss the cluster
+re-elects without operator intervention, no committed record is lost,
+and clients recover by resubmitting unacknowledged in-flight inputs
+against the new leader. Latency and throughput measurement themselves
+are out of this repository's scope (§9, §12) and live in a separate
+benchmarking repository built against this one — what this repository
+verifies directly is the *functional* claim (no gaps, no divergence,
+service continues), via the drills below.
+
+## Acceptance checklist
+
+`docs/specification.md` §14's five items, and where each is verified in
+this repository:
+
+| # | Checklist item | Verified by |
+|---|---|---|
+| 1 | Replay is byte-identical on a fresh build | `examples/counter/tests/replay_test.cpp`, run on every push by `.github/workflows/ci.yml` |
+| 2 | A kill-leader-under-load drill shows no journal gaps, no divergence, client recovery, and the new leader's journal continuing densely | `examples/counter/tests/kill_leader_drill_test.cpp`'s `KillLeaderUnderLoadShowsNoGapsNoDivergenceAndContinuedCommits` |
+| 3 | A client verifies a proof against retained bytes; proof reconstruction from the published journal alone succeeds; the proof-timeout alarm fires when the signing gateway is stalled | `sdk/cpp/tests/proof_verifier_test.cpp` (retained bytes); `sdk/cpp/tests/acceptance_drill_test.cpp` (journal-alone reconstruction and the stalled-alarm drill) |
+| 4 | A restarted output gateway's dissemination is identical to an uninterrupted run | `gateway/output/tests/restart_drill_test.cpp` |
+| 5 | A zone-loss drill shows continued operation; a single-zone-optimized deployment documents its exposure | `examples/counter/tests/kill_leader_drill_test.cpp`'s `ZoneLossKillingAFollowerLeavesTheSystemOperatingOnTheRemainingTwoZones`, and the Deployment section above |
+
+Every drill test above runs a real, multi-process cluster (or, for item
+3's signing-gateway drill, a real signing gateway against a
+deliberately incomplete journal) and injects the actual fault —
+`SIGKILL` for process loss, a permanently-incomplete block for a
+stalled signing gateway — rather than mocking the failure mode.
+

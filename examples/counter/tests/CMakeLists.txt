@@ -28,6 +28,14 @@ add_executable(websocket_transport_test websocket_transport_test.cpp)
 target_link_libraries(websocket_transport_test PRIVATE counter::websocket_transport GTest::gtest GTest::gtest_main Threads::Threads)
 gtest_discover_tests(websocket_transport_test)
 
+add_executable(kill_leader_drill_test kill_leader_drill_test.cpp)
+target_link_libraries(kill_leader_drill_test PRIVATE sequencer::node GTest::gtest GTest::gtest_main Threads::Threads)
+target_compile_definitions(kill_leader_drill_test PRIVATE
+  COUNTER_NODE_MAIN_PATH="$<TARGET_FILE:counter_node_main>"
+)
+add_dependencies(kill_leader_drill_test counter_node_main)
+gtest_discover_tests(kill_leader_drill_test PROPERTIES TIMEOUT 120)
+
 add_executable(counter_end_to_end_test end_to_end_test.cpp)
 target_link_libraries(counter_end_to_end_test PRIVATE sequencer::gateway_input Boost::beast GTest::gtest GTest::gtest_main Threads::Threads)
 # The real binaries this test spawns as three subprocesses — built, not
