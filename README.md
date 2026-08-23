@@ -73,6 +73,11 @@ specification:
 writing code; it is the single source of truth and is written to drive
 the entire development.
 
+**[`docs/testing.md`](./docs/testing.md)** — every end-to-end test and
+every specification.md §14 acceptance-checklist test in the
+repository, described in full: what's real, what's asserted, and where
+it lives.
+
 ## Scope notes
 
 Performance measurement — load-generation rigs, tuning sweeps, published
@@ -229,4 +234,10 @@ Every drill test above runs a real, multi-process cluster (or, for item
 deliberately incomplete journal) and injects the actual fault —
 `SIGKILL` for process loss, a permanently-incomplete block for a
 stalled signing gateway — rather than mocking the failure mode.
+
+**[`docs/testing.md`](./docs/testing.md)** covers this in full — every
+checklist item's test cases described in detail, plus every end-to-end
+test in the repository (multi-process and single-process-real-transport
+alike) that isn't a plain per-file unit test already covered in its own
+component's README.
 
