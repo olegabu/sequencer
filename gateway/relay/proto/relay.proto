@@ -1,0 +1,28 @@
+syntax = "proto2";
+
+package sequencer.gateway.relay.proto;
+
+option cc_generic_services = true;
+
+// specification.md §8.2: "re-serve Subscribe(fromSequenceNumber) over
+// the network with byte-identical records." The unary handshake that
+// establishes a client's brpc::Stream — the actual published record
+// bytes never touch this message; they flow over the stream via
+// brpc::StreamWrite, one write per record, in sequence-number order.
+message RelaySubscribeRequest {
+  // 0 (the default) means "from the very beginning" — sequence number
+  // 1. Unlike gateway/output's Fanout (live delivery only to whoever
+  // is currently connected), a relay supports resuming from any
+  // already-committed sequence number: the whole point of "byte-
+  // identical records" is that historical and live delivery are the
+  // same mechanism, not two different code paths.
+  optional uint64 from_sequence_number = 1 [default = 0];
+}
+
+message RelaySubscribeResponse {
+  optional string error_message = 1;
+}
+
+service RelayService {
+  rpc Subscribe(RelaySubscribeRequest) returns (RelaySubscribeResponse);
+}

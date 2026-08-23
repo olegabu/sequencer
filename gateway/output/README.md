@@ -8,7 +8,7 @@ application-supplied `OutputCodec::toOutput(record, fanout)` once per
 record, in order, and let the codec route bytes through `Fanout` to
 whichever clients care.
 
-## This phase's `journal tailing`: colocated, not yet relay-fed
+## This component's `journal tailing`: colocated, not relay-fed
 
 `RunOutputGateway` reads the journal directly, via a plain
 `journal::JournalReader` memory-map on `--data_dir` — specification.md
@@ -17,10 +17,12 @@ journal file directly." An earlier draft of this component added a
 `Subscribe` RPC to `node/` so the output gateway could be a remote
 *Subscribe client* instead, matching §8.5's fuller description of this
 component ("journal tailing, Subscribe client, transport"); that was
-reverted; `gateway/relay/` doesn't exist yet, and until it does, an
-output gateway *is* colocated with the node it serves — Subscribe-based
-remote tailing is future work for when relay lands, not a gap in this
-phase.
+reverted. `gateway/relay/` exists now (specification.md §8.2 — reads a
+colocated replica's journal and re-serves `Subscribe(fromSequenceNumber)`
+over the network), but this component was deliberately **not** wired to
+consume it: an output gateway here still tails colocated only.
+Switching to a relay-fed, remote-tailing mode is real future work, not
+a gap in this phase — see `gateway/relay/README.md`.
 
 ## Transport: pluggable, brpc Streaming by default
 
