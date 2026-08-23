@@ -27,12 +27,21 @@ the body as protobuf-JSON in the first place.
 `signature_verifier.hpp`'s `SignatureVerifier` is a callable the
 chassis invokes on every input before proposing it — specification.md
 §7's "verified by default at the input gateway." No concrete signature
-scheme is specified anywhere in the spec; choosing and shipping one is
-`sdk/`'s job, a later phase. The default, `acceptAllSignatures`, is an
-explicit, loudly-commented placeholder, not a real verifier — it exists
-so the rest of the chassis is usable and testable before `sdk/` lands.
-**Do not deploy the default anywhere a signature must actually be
-checked.**
+scheme is specified anywhere in the spec; choosing and shipping one was
+`sdk/`'s job, and `sdk/`'s `client_signer.hpp` now has one:
+`sdk::makeEnvelopeSignatureVerifier(publicKey)` returns a callable of
+exactly this type (same underlying `std::function<bool(Payload)>`
+alias, no extra dependency needed to plug it in — see
+[sdk/README.md](../../sdk/README.md)), ready to pass wherever an
+application constructs its `InputGatewayImpl`. The chassis's own
+default, `acceptAllSignatures`, remains an explicit, loudly-commented
+placeholder, not a real verifier — it exists so the rest of the chassis
+is usable and testable without requiring every test to wire up real
+keys. **Do not deploy the default anywhere a signature must actually be
+checked** — pass a real verifier, such as `sdk/`'s, instead. See
+`sdk/cpp/tests/propose_client_test.cpp` for the two plugged together
+against a real gateway, including a tampered envelope being rejected
+before it ever reaches `Propose`.
 
 ## Testing
 

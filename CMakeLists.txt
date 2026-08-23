@@ -40,6 +40,11 @@ find_package(unofficial-brpc CONFIG REQUIRED)
 find_package(unofficial-braft CONFIG REQUIRED)
 find_package(gflags CONFIG REQUIRED)
 find_package(glog CONFIG REQUIRED)
+# specification.md §9.1: the cryptography library evidence/'s Merkle
+# signing and sdk/'s header-only proof verification both need. Shared
+# by more than one component, unlike Boost.Beast (scoped to
+# examples/counter's CMakeLists.txt alone), so it's found here.
+find_package(OpenSSL REQUIRED)
 
 add_subdirectory(journal)
 add_subdirectory(node)
@@ -47,4 +52,6 @@ add_subdirectory(tools/replay)
 add_subdirectory(tools/dumper)
 add_subdirectory(gateway/input)
 add_subdirectory(gateway/output)
+add_subdirectory(evidence)
+add_subdirectory(sdk/cpp)
 add_subdirectory(examples/counter)

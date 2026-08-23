@@ -1,0 +1,45 @@
+syntax = "proto2";
+
+package sequencer.evidence.proto;
+
+option cc_generic_services = true;
+
+// specification.md §7.2: "signed roots are themselves published... so
+// an inclusion proof is reconstructible from public data forever" —
+// this is the "published" part: a client (or sdk/'s reconciler) fetches
+// a block's signed root directly, independent of ever having submitted
+// anything in it.
+message GetSignedRootRequest {
+  required uint64 block_index = 1;
+}
+
+message GetSignedRootResponse {
+  optional bool found = 1 [default = false];
+  optional uint64 first_sequence_number = 2;
+  optional uint64 last_sequence_number = 3;
+  optional bytes root = 4;       // 32 bytes
+  optional bytes signature = 5;  // 64 bytes, Ed25519 over root ‖ bounds
+}
+
+// specification.md §7.2: "an inclusion proof... is reconstructible
+// from public data forever" — this RPC is exactly that reconstruction,
+// served for convenience; nothing here is itself evidence until the
+// caller verifies the returned signature against a key it trusts
+// independently (sdk/'s ProofVerifier does exactly that).
+message GetInclusionProofRequest {
+  required uint64 sequence_number = 1;
+}
+
+message GetInclusionProofResponse {
+  optional bool found = 1 [default = false];
+  optional uint64 first_sequence_number = 2;
+  optional uint64 last_sequence_number = 3;
+  optional bytes root = 4;
+  optional bytes signature = 5;
+  repeated bytes sibling_hashes = 6;  // bottom-up, 32 bytes each
+}
+
+service EvidenceService {
+  rpc GetSignedRoot(GetSignedRootRequest) returns (GetSignedRootResponse);
+  rpc GetInclusionProof(GetInclusionProofRequest) returns (GetInclusionProofResponse);
+}
