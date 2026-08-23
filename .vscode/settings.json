@@ -1,0 +1,30 @@
+{
+    // Use this repo's own CMakePresets.json (debug/release/tsan —
+    // see README.md's Development section) instead of CMake Tools'
+    // separate kit/variant system.
+    "cmake.useCMakePresets": "always",
+    "cmake.configureOnOpen": true,
+
+    // CMakePresets.json's toolchainFile reads VCPKG_ROOT from the
+    // environment; CMake Tools needs it too when it invokes cmake
+    // itself. Adjust if your vcpkg checkout isn't at
+    // ~/workspace/vcpkg (see README.md's Prerequisites).
+    "cmake.environment": {
+        "VCPKG_ROOT": "${userHome}/workspace/vcpkg"
+    },
+
+    // Belt-and-suspenders with c_cpp_properties.json's
+    // "compileCommands": some setups read this key instead.
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
+
+    // build/ holds vcpkg's entire built dependency tree plus every
+    // object file (routinely several GB) — excluded from search and
+    // the file watcher so the editor stays responsive, without
+    // hiding it from the explorer.
+    "search.exclude": {
+        "**/build": true
+    },
+    "files.watcherExclude": {
+        "**/build/**": true
+    }
+}

@@ -1,0 +1,29 @@
+{
+    // compileCommands points IntelliSense at CMake's own generated
+    // compile_commands.json (CMAKE_EXPORT_COMPILE_COMMANDS ON in the
+    // root CMakeLists.txt) — the exact per-file compiler, flags,
+    // defines, and include paths actually used to build each
+    // translation unit, including everything vcpkg installed
+    // (braft/brpc/protobuf/openssl/boost/gflags/glog under
+    // build/debug/vcpkg_installed/x64-linux/include). This is what
+    // resolves headers correctly without hand-maintaining includePath.
+    //
+    // Requires at least one `cmake --preset debug` (or `make`/`make
+    // build`) to have run first, so the file exists — see README.md's
+    // Development section. If it's missing, IntelliSense falls back to
+    // includePath below, which is much less accurate.
+    "configurations": [
+        {
+            "name": "Linux",
+            "compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "compilerPath": "/usr/bin/g++-10",
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
