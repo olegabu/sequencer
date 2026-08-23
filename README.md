@@ -53,7 +53,7 @@ with nobody's pager firing before service resumes.
 
 | Component | What it is |
 |---|---|
-| `node/` | The harness: braft wiring (private, in `node/raft/`), the pinned apply thread, sequence-number minting, deferred acknowledgement. `RunNode(argv, yourStateMachine)` is a whole node. |
+| `node/` | The harness: braft wiring (private, in `node/src/raft/`), the pinned apply thread, sequence-number minting, deferred acknowledgement. `RunNode(argv, yourStateMachine)` is a whole node. |
 | `journal/` | The product: memory-mapped, lock-free, single-writer/many-reader log of inputs and outputs; readers tail without ever backpressuring the writer. |
 | `gateway/` | Stateless edge chassis: `RunInputGateway` (brpc/REST/gRPC on one port), `RunOutputGateway`, and the symmetric `InputCodec`/`OutputCodec` interfaces applications implement — plus the **relay gateway**, a codec-free stock binary that carries a node's journal off its machine unmodified, so output gateways and the signing gateway never touch a node directly at scale. Run at least two instances of each type. |
 | `evidence/` | Deterministic Merkle blocks over journal records, signed by the signing gateway — an ordinary journal reader, so a node itself does no operator cryptography. |

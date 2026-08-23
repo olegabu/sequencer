@@ -1,0 +1,41 @@
+syntax = "proto2";
+
+package sequencer.node.proto;
+
+// brpc's classic "generic services" style (protobuf's own built-in,
+// still-supported service codegen) — the pattern brpc's own examples
+// and services use throughout, in preference to a gRPC-plugin style.
+option cc_generic_services = true;
+
+// specification.md §3, §5.2: a client-signed, opaque input. The
+// sequencer never interprets these bytes — the client's signature is
+// embedded inside `input` itself (§7).
+message ProposeRequest {
+  required bytes input = 1;
+}
+
+// specification.md §5.2: "committed at this position; will be
+// deterministically processed; outcome per the designated output and
+// the output stream." Deliberately absent: an input hash (§5.2 — a
+// client verifies against its own retained bytes, never an echo) and a
+// block identifier (derivable from sequence_number by the fixed block
+// rule, §7.1).
+message ProposeResponse {
+  // Set when the input was committed and applied.
+  optional uint64 sequence_number = 1;
+  optional bytes designated_output = 2;
+
+  // Set when this node is not the leader (specification.md §3:
+  // "Propose(bytes) -> {...} | redirect(leader) | error"). The caller
+  // should retry against leader_hint if non-empty.
+  optional bool redirect = 3 [default = false];
+  optional string leader_hint = 4;
+
+  // Set on any other failure (for example: shutting down, or the
+  // in-flight raft task was aborted by a leadership change).
+  optional string error_message = 5;
+}
+
+service ProposeService {
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+}

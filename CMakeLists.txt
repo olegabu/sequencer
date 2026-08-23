@@ -35,4 +35,10 @@ if(SEQUENCER_BUILD_BENCHMARKS)
   find_package(benchmark CONFIG REQUIRED)
 endif()
 
+find_package(Protobuf CONFIG REQUIRED)
+find_package(unofficial-brpc CONFIG REQUIRED)
+find_package(unofficial-braft CONFIG REQUIRED)
+find_package(gflags CONFIG REQUIRED)
+
 add_subdirectory(journal)
+add_subdirectory(node)
