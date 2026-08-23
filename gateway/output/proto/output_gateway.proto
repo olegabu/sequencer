@@ -1,0 +1,30 @@
+syntax = "proto2";
+
+package sequencer.gateway.output.proto;
+
+option cc_generic_services = true;
+
+// The unary handshake that establishes a client's brpc::Stream — the
+// actual published bytes never touch this message; they flow over the
+// stream via brpc::StreamWrite. See output_gateway.md §8.7: "brpc's own
+// full-duplex Streaming RPC... a natural, zero-additional-dependency
+// choice for consumers that are themselves brpc- or gRPC-aware."
+message OutputSubscribeRequest {
+  // 0 means "assign me one"; a nonzero value lets a returning client
+  // (or an application-level scheme correlating outputs back to a
+  // specific session — see Fanout::toSession) request a specific id.
+  optional uint64 session_id = 1 [default = 0];
+
+  // Which broadcast topic to receive; empty means the implicit
+  // catch-all topic every session joins by default.
+  optional string topic = 2;
+}
+
+message OutputSubscribeResponse {
+  optional uint64 session_id = 1;
+  optional string error_message = 2;
+}
+
+service OutputSubscribeService {
+  rpc Subscribe(OutputSubscribeRequest) returns (OutputSubscribeResponse);
+}

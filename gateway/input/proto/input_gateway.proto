@@ -1,0 +1,20 @@
+syntax = "proto2";
+
+package sequencer.gateway.input.proto;
+
+option cc_generic_services = true;
+
+// Deliberately empty. specification.md §8.6's whole point is that the
+// gateway must accept whatever wire format an application's InputCodec
+// understands (JSON, or anything else) — brpc treats a service whose
+// request/response schemas are both empty as a "pure http" service and
+// leaves the entire body in the request/response *attachment* instead
+// of trying to map it onto protobuf fields first (also true for native
+// brpc/gRPC clients, who set the attachment explicitly). See
+// SubmitServiceImpl for where the actual bytes are read and written.
+message SubmitRequest {}
+message SubmitResponse {}
+
+service SubmitService {
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+}
