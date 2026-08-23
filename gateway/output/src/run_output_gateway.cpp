@@ -6,8 +6,10 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <functional>
 #include <thread>
 
+#include "brpc_stream_transport.hpp"
 #include "output_gateway_impl.hpp"
 
 DEFINE_string(data_dir, "", "A node's journal directory to tail, colocated (required)");
@@ -20,9 +22,8 @@ namespace {
 std::atomic<bool> gStopRequested{false};
 void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
-}  // namespace
-
-int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec) {
+int runOutputGatewayCommon(int argc, char** argv, std::unique_ptr<OutputCodec> codec,
+                            const std::function<std::unique_ptr<OutputTransport>()>& transportFactory) {
   google::InitGoogleLogging(argv[0]);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
@@ -36,7 +37,8 @@ int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec) 
   config.resumeFile = FLAGS_resume_file;
   config.listenPort = FLAGS_listen_port;
 
-  gateway::output::detail::OutputGatewayImpl gateway(std::move(config), std::move(codec));
+  gateway::output::detail::OutputGatewayImpl gateway(std::move(config), std::move(codec),
+                                                       transportFactory());
   gateway.start();
   LOG(INFO) << "output gateway started: listen_port=" << FLAGS_listen_port
             << " data_dir=" << FLAGS_data_dir;
@@ -50,6 +52,19 @@ int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec) 
   LOG(INFO) << "output gateway stopping";
   gateway.stop();
   return 0;
+}
+
+}  // namespace
+
+int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec) {
+  return runOutputGatewayCommon(argc, argv, std::move(codec), [] {
+    return std::make_unique<gateway::output::detail::BrpcStreamTransport>();
+  });
+}
+
+int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec,
+                      std::function<std::unique_ptr<OutputTransport>()> transportFactory) {
+  return runOutputGatewayCommon(argc, argv, std::move(codec), transportFactory);
 }
 
 }  // namespace sequencer

@@ -5,6 +5,8 @@
 // rather than one, a byte-for-byte comparison of all three replicas'
 // journals: the concrete proof behind "replicas lag, never diverge" (§3).
 
+#include "child_process.hpp"
+
 #include <sequencer/journal/reader.hpp>
 
 #include <brpc/channel.h>
@@ -12,9 +14,6 @@
 
 #include "node.pb.h"
 
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -31,48 +30,6 @@
 
 namespace sequencer::examples::counter {
 namespace {
-
-// A subprocess running the real `counter_node` binary — the same one a
-// deployment runs — not an in-process stand-in. RAII: SIGTERM on
-// destruction, exactly how the acceptance drills in specification.md
-// §14 describe stopping a node.
-class ChildProcess {
- public:
-  ChildProcess(std::string path, std::vector<std::string> args)
-      : path_(std::move(path)), args_(std::move(args)) {
-    std::vector<char*> argv;
-    argv.push_back(path_.data());
-    for (auto& arg : args_) {
-      argv.push_back(arg.data());
-    }
-    argv.push_back(nullptr);
-
-    pid_ = ::fork();
-    if (pid_ < 0) {
-      throw std::runtime_error("ChildProcess: fork failed");
-    }
-    if (pid_ == 0) {
-      ::execv(path_.c_str(), argv.data());
-      ::_exit(127);  // execv only returns on failure
-    }
-  }
-
-  ChildProcess(const ChildProcess&) = delete;
-  ChildProcess& operator=(const ChildProcess&) = delete;
-
-  ~ChildProcess() {
-    if (pid_ > 0) {
-      ::kill(pid_, SIGTERM);
-      int status = 0;
-      ::waitpid(pid_, &status, 0);
-    }
-  }
-
- private:
-  std::string path_;
-  std::vector<std::string> args_;
-  pid_t pid_ = -1;
-};
 
 std::filesystem::path makeTempDir() {
   std::string tmpl = (std::filesystem::temp_directory_path() / "counter_smoke_XXXXXX").string();

@@ -6,7 +6,8 @@
     "gtest",
     "benchmark",
     "braft",
-    "brpc"
+    "brpc",
+    "boost-beast"
   ],
   "overrides": [
     { "name": "glog", "version": "0.6.0" }

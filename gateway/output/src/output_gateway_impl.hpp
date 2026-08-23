@@ -1,26 +1,22 @@
 #pragma once
 
-// Ties together the tailing thread, the resume position, the client-
-// facing brpc server, and the codec — everything RunOutputGateway
-// (output_gateway.hpp) sets up, minus argv/gflags parsing, exactly as
-// node/'s NodeImpl is separated from RunNode.
-
-#include <brpc/server.h>
+// Ties together the tailing thread, the resume position, the transport,
+// and the codec — everything RunOutputGateway (output_gateway.hpp) sets
+// up, minus argv/gflags parsing, exactly as node/'s NodeImpl is
+// separated from RunNode.
 
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <thread>
 
 #include <sequencer/journal/reader.hpp>
 #include <sequencer/output_codec.hpp>
+#include <sequencer/output_transport.hpp>
 
-#include "output_subscribe_service_impl.hpp"
 #include "resume_position.hpp"
-#include "stream_fanout.hpp"
 
 namespace sequencer::gateway::output::detail {
 
@@ -32,11 +28,12 @@ struct OutputGatewayConfig {
 
 class OutputGatewayImpl {
  public:
-  OutputGatewayImpl(OutputGatewayConfig config, std::unique_ptr<sequencer::OutputCodec> codec)
+  OutputGatewayImpl(OutputGatewayConfig config, std::unique_ptr<sequencer::OutputCodec> codec,
+                     std::unique_ptr<sequencer::OutputTransport> transport)
       : config_(std::move(config)),
         codec_(std::move(codec)),
-        resumePosition_(config_.resumeFile),
-        subscribeService_(fanout_) {}
+        transport_(std::move(transport)),
+        resumePosition_(config_.resumeFile) {}
 
   OutputGatewayImpl(const OutputGatewayImpl&) = delete;
   OutputGatewayImpl& operator=(const OutputGatewayImpl&) = delete;
@@ -51,14 +48,7 @@ class OutputGatewayImpl {
   }
 
   void start() {
-    if (server_.AddService(&subscribeService_, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-      throw std::runtime_error("OutputGatewayImpl::start: AddService(OutputSubscribeService) failed");
-    }
-    brpc::ServerOptions serverOptions;
-    if (server_.Start(config_.listenPort, &serverOptions) != 0) {
-      throw std::runtime_error("OutputGatewayImpl::start: brpc::Server::Start failed on port " +
-                                std::to_string(config_.listenPort));
-    }
+    transport_->start(config_.listenPort);
     tailThread_ = std::thread([this] { tailLoop(); });
     started_ = true;
   }
@@ -68,12 +58,7 @@ class OutputGatewayImpl {
     if (tailThread_.joinable()) {
       tailThread_.join();
     }
-    // brpc::Server::Join() waits for its acceptor to see every accepted
-    // connection fully closed; a Subscribe client that never
-    // voluntarily disconnects would otherwise hang shutdown forever.
-    fanout_.closeAll();
-    server_.Stop(0);
-    server_.Join();
+    transport_->stop();
     started_ = false;
   }
 
@@ -101,7 +86,7 @@ class OutputGatewayImpl {
       // specification.md §8.3: "in sequence-number order... in order,
       // exactly once." One codec call per record, strictly in order,
       // with the resume position advanced only after the call returns.
-      codec_->toOutput(reader->record(seq), fanout_);
+      codec_->toOutput(reader->record(seq), *transport_);
       ++seq;
       resumePosition_.store(seq);
     }
@@ -109,10 +94,8 @@ class OutputGatewayImpl {
 
   OutputGatewayConfig config_;
   std::unique_ptr<sequencer::OutputCodec> codec_;
+  std::unique_ptr<sequencer::OutputTransport> transport_;
   ResumePosition resumePosition_;
-  StreamFanout fanout_;
-  OutputSubscribeServiceImpl subscribeService_;
-  brpc::Server server_;
   std::thread tailThread_;
   std::atomic<bool> stopRequested_{false};
   bool started_ = false;

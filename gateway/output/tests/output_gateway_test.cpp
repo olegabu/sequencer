@@ -6,6 +6,7 @@
 // restart, which is the whole point of the durable resume position
 // (§8.3: "restartable from any sequence number with identical output").
 
+#include "brpc_stream_transport.hpp"
 #include "output_gateway_impl.hpp"
 
 #include <sequencer/journal/writer.hpp>
@@ -133,7 +134,8 @@ TEST(OutputGateway, DeliversLiveRecordsInOrderToAConnectedSubscriber) {
   config.dataDir = dir;
   config.resumeFile = dir / "resume";
   config.listenPort = 28961;
-  OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>());
+  OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>(),
+                            std::make_unique<BrpcStreamTransport>());
   gateway.start();
 
   brpc::Channel channel;
@@ -172,7 +174,8 @@ TEST(OutputGateway, ResumesFromDurablePositionAfterRestartWithoutRedelivering) {
   config.listenPort = 28962;
 
   {
-    OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>());
+    OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>(),
+                            std::make_unique<BrpcStreamTransport>());
     gateway.start();
 
     brpc::Channel channel;
@@ -190,7 +193,8 @@ TEST(OutputGateway, ResumesFromDurablePositionAfterRestartWithoutRedelivering) {
   }
 
   {
-    OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>());
+    OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>(),
+                            std::make_unique<BrpcStreamTransport>());
     gateway.start();
 
     brpc::Channel channel;

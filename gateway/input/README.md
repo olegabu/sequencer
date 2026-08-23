@@ -53,12 +53,14 @@ a signature-verifier rejection (same check).
 
 ## Seeing it in action
 
-There's no runnable binary here yet — `RunInputGateway` needs a codec to
-link against, and none exists in this repository until
-`examples/counter`'s `CounterInputCodec` lands (specification.md §15
-item 6). `NodeProposer` (`src/node_proposer.hpp`) is the piece most
-worth reading standalone: it's `three_node_smoke_test.cpp`'s
-ad hoc leader-following retry logic, generalized into real, reusable,
-leader-caching chassis code — see its header comment for why caching
-the last-known leader across calls matters for a gateway handling many
-requests, unlike a one-shot test helper.
+`examples/counter`'s `counter_input_gateway` is a real, runnable
+`RunInputGateway` linked against `CounterInputCodec` — see
+[examples/counter/README.md](../../examples/counter/README.md) for
+flags and a full worked example alongside its output gateway
+counterpart and load generator. `NodeProposer` (`src/node_proposer.hpp`)
+is the piece most worth reading standalone: it's
+`three_node_smoke_test.cpp`'s ad hoc leader-following retry logic,
+generalized into real, reusable, leader-caching chassis code — see its
+header comment for why caching the last-known leader across calls
+matters for a gateway handling many requests, unlike a one-shot test
+helper.

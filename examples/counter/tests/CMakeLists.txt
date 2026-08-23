@@ -19,3 +19,24 @@ gtest_discover_tests(three_node_smoke_test PROPERTIES TIMEOUT 60)
 add_executable(counter_replay_test replay_test.cpp)
 target_link_libraries(counter_replay_test PRIVATE counter::state_machine sequencer::replay GTest::gtest GTest::gtest_main)
 gtest_discover_tests(counter_replay_test)
+
+add_executable(counter_codec_test counter_codec_test.cpp)
+target_link_libraries(counter_codec_test PRIVATE counter::codecs GTest::gtest GTest::gtest_main)
+gtest_discover_tests(counter_codec_test)
+
+add_executable(websocket_transport_test websocket_transport_test.cpp)
+target_link_libraries(websocket_transport_test PRIVATE counter::websocket_transport GTest::gtest GTest::gtest_main Threads::Threads)
+gtest_discover_tests(websocket_transport_test)
+
+add_executable(counter_end_to_end_test end_to_end_test.cpp)
+target_link_libraries(counter_end_to_end_test PRIVATE sequencer::gateway_input Boost::beast GTest::gtest GTest::gtest_main Threads::Threads)
+# The real binaries this test spawns as three subprocesses — built, not
+# stubbed, so the test exercises the whole pipeline's actual argv/gflags
+# paths exactly as a deployment does.
+target_compile_definitions(counter_end_to_end_test PRIVATE
+  COUNTER_NODE_MAIN_PATH="$<TARGET_FILE:counter_node_main>"
+  COUNTER_INPUT_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_input_gateway_main>"
+  COUNTER_OUTPUT_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_output_gateway_main>"
+)
+add_dependencies(counter_end_to_end_test counter_node_main counter_input_gateway_main counter_output_gateway_main)
+gtest_discover_tests(counter_end_to_end_test PROPERTIES TIMEOUT 60)

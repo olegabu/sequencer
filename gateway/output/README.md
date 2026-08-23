@@ -22,16 +22,26 @@ output gateway *is* colocated with the node it serves — Subscribe-based
 remote tailing is future work for when relay lands, not a gap in this
 phase.
 
-## Transport: brpc's own Streaming RPC, delivering live only
+## Transport: pluggable, brpc Streaming by default
 
-`StreamFanout` (`src/stream_fanout.hpp`) is the concrete, built-in
-`Fanout` this chassis ships with, built on brpc's own full-duplex
-Streaming RPC — specification.md §8.7's zero-additional-dependency
-choice for brpc/gRPC-aware consumers. Clients call
-`OutputSubscribeService.Subscribe` (attaching a stream first, per
-brpc's usual handshake pattern) to join a topic; `Fanout::broadcast`
-delivers to every session on that topic, `Fanout::toSession` to one
-specific session by id.
+`OutputTransport` (`include/sequencer/output_transport.hpp`) is the
+extension point: a `Fanout` that also knows how to `start`/`stop` a
+listener. `RunOutputGateway` takes one via an optional
+`transportFactory` argument; the 3-argument overload (no factory)
+defaults to the chassis's own built-in `BrpcStreamTransport`
+(`src/brpc_stream_transport.hpp`), which wraps `StreamFanout` — built
+on brpc's own full-duplex Streaming RPC, specification.md §8.7's
+zero-additional-dependency choice for brpc/gRPC-aware consumers.
+Clients call `OutputSubscribeService.Subscribe` (attaching a stream
+first, per brpc's usual handshake pattern) to join a topic;
+`Fanout::broadcast` delivers to every session on that topic,
+`Fanout::toSession` to one specific session by id.
+
+This is what lets `examples/counter` plug in a WebSocket transport
+instead (§8.7 calls that out too, for browser-facing consumers) without
+touching the tailing loop at all — see
+[examples/counter/README.md](../../examples/counter/README.md)'s
+`WebSocketTransport`.
 
 **Delivery is live only — there is no historical replay for a client
 that subscribes late.** A session only receives records published
@@ -87,7 +97,8 @@ needed — `journal::JournalWriter`, matching
 
 ## Seeing it in action
 
-There's no runnable binary here yet, for the same reason as
-`gateway/input/`: `RunOutputGateway` needs a codec, and
-`examples/counter`'s `CounterOutputCodec` doesn't exist until
-specification.md §15 item 6.
+`examples/counter`'s `counter_output_gateway` is a real, runnable
+`RunOutputGateway` — see
+[examples/counter/README.md](../../examples/counter/README.md) for
+flags and a full worked example alongside its input gateway
+counterpart.
