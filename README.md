@@ -89,12 +89,11 @@ one.
 
 ## Development
 
-Once the prerequisites below are installed, `make` builds (debug
-preset) and `make test` builds and runs the full suite —
-`Makefile` is a thin wrapper around the `cmake`/`ctest` preset
-commands this section documents manually; run `make help` for every
-target (release/tsan presets, `TEST_FILTER=` for a filtered run,
-`make demo`, `make benchmark`, `make clean`).
+Once the prerequisites below are installed, `make` builds and `make
+test` builds and runs the full suite. `Makefile` is a thin wrapper
+around the `cmake`/`ctest` preset commands the Build and Test
+subsections below document manually — see [Make targets](#make-targets)
+for the full list.
 
 ### Prerequisites
 
@@ -160,9 +159,14 @@ cmake --build --preset debug
 ```
 
 The first configure resolves and builds every `vcpkg.json` dependency
-from source, which is slow (minutes, for the current gtest/benchmark-only
-manifest; expect considerably longer once braft/brpc join it) — later
-configures reuse vcpkg's cache and are fast.
+from source — braft and brpc alone can take the better part of an hour
+on modest hardware — but vcpkg caches what it builds, so later
+configures (including switching between the `debug`/`release`/`tsan`
+presets, each of which gets its own `build/<preset>/` directory) are
+fast. If a preset's own `build/<preset>/vcpkg_installed/` is deleted or
+was never populated (for example, only `debug` has ever been built),
+that preset pays the from-scratch cost independently, even though the
+others already paid it.
 
 For a Release build (enables link-time optimization per
 `docs/specification.md` §9.1):
@@ -199,6 +203,33 @@ separate from `ctest` and run directly:
 `.github/workflows/ci.yml` runs the full `ctest --preset debug` suite —
 including `docs/specification.md` §11's determinism-replay gate — on
 every push and pull request against `main`.
+
+### Make targets
+
+`Makefile` wraps every command in Build and Test above. It's the only
+Makefile in the repository — `find_package()` for
+braft/brpc/protobuf/etc. lives only in the root `CMakeLists.txt`
+(specification.md §9's dependency graph), so no subdirectory
+configures standalone.
+
+| Target | Equivalent to | Notes |
+|---|---|---|
+| `make` / `make build` | `cmake --preset debug && cmake --build --preset debug` | Default target; bare `make` builds, it doesn't print help |
+| `make test` | `make build`, then `ctest --preset debug --output-on-failure` | |
+| `make debug` / `make test-debug` | `make build`/`make test` with `PRESET=debug` | Same as the two above, spelled out explicitly |
+| `make release` / `make test-release` | `... PRESET=release` | The LTO build (§9.1) |
+| `make tsan` / `make test-tsan` | `... PRESET=tsan` | ThreadSanitizer — the journal's §6.3 cross-thread protocol |
+| `make configure` | `cmake --preset $(PRESET)` | Configure only, no build |
+| `make test TEST_FILTER=<regex>` | adds `-R "<regex>"` to the `ctest` call | Run only matching test names, e.g. `TEST_FILTER=RelayGateway` |
+| `make demo` | `make debug`, then `./examples/counter/demo.sh` | The curl + websocat walkthrough |
+| `make benchmark` | `make debug`, then `./build/debug/journal/benchmarks/journal_benchmark` | |
+| `make clean` | `rm -rf build/debug build/release build/tsan` | `make clean PRESET=release` removes just that one preset's directory |
+| `make distclean` | `make clean`, plus wiping vcpkg's `buildtrees`/`downloads`/`packages` | Forces every dependency to rebuild from source next configure — see the from-scratch cost noted in Build above |
+| `make help` | — | Prints this list |
+
+Any target that defaults to the `debug` preset accepts `PRESET=release`
+or `PRESET=tsan` to redirect it, e.g. `make build PRESET=tsan` is the
+same as `make tsan`.
 
 ## Deployment
 
