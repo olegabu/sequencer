@@ -15,3 +15,7 @@ target_compile_definitions(three_node_smoke_test PRIVATE
 )
 add_dependencies(three_node_smoke_test counter_node_main)
 gtest_discover_tests(three_node_smoke_test PROPERTIES TIMEOUT 60)
+
+add_executable(counter_replay_test replay_test.cpp)
+target_link_libraries(counter_replay_test PRIVATE counter::state_machine sequencer::replay GTest::gtest GTest::gtest_main)
+gtest_discover_tests(counter_replay_test)

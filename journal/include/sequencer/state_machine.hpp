@@ -1,9 +1,13 @@
 #pragma once
 
 // The state machine interface — specification.md §4 (normative). This
-// is the entire surface an application implements; everything else in
-// node/ exists to turn one apply() call per committed input into a
-// replicated, journaled, provable fact.
+// is the entire surface an application implements. It lives here, in
+// journal/ (the component with no dependencies of its own —
+// specification.md §9), rather than in node/, because more than one
+// component needs it without needing node/'s braft/brpc machinery:
+// node/ calls apply() from the pinned apply thread, and tools/replay
+// calls it too, to replay a recorded journal through a fresh instance,
+// with neither braft nor brpc anywhere in its link.
 
 #include <array>
 #include <cstddef>
@@ -47,8 +51,8 @@ class OutputCollector {
   }
 
   // --- Harness-internal accessors (not part of the application-facing
-  // surface in §4, but needed by node/ to retrieve what apply() just
-  // collected) ---
+  // surface in §4, but needed by node/ and tools/replay to retrieve
+  // what apply() just collected) ---
 
   void reset() noexcept {
     count_ = 0;
@@ -68,11 +72,11 @@ class OutputCollector {
 };
 
 // A sequential byte sink for StateMachine::snapshotSave(), backed by a
-// single file. node/raft/ opens one of these at a path inside braft's
-// own snapshot directory before calling snapshotSave(), and registers
-// that file with braft afterward — the state machine itself never sees
-// a braft type (specification.md §9: "no braft type appears in any
-// public interface").
+// single file. node/src/raft/ opens one of these at a path inside
+// braft's own snapshot directory before calling snapshotSave(), and
+// registers that file with braft afterward — the state machine itself
+// never sees a braft type (specification.md §9: "no braft type appears
+// in any public interface").
 class SnapshotWriter {
  public:
   explicit SnapshotWriter(const std::filesystem::path& path) : file_(path, std::ios::binary) {

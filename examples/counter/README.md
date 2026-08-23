@@ -6,10 +6,11 @@ total. Input is an 8-byte signed delta; state is the total; the one
 output — also the designated output, since the submitting client is its
 only interested party — is the new total after applying the delta.
 
-At this phase (§15 item 3) that means just the state machine and
-`node_main`, proven with a **real three-node raft group** — the input
-codec, output codec, gateways, and load generator that make up the rest
-of §10's full layout land in later phases.
+At this phase (§15 items 3–4) that means the state machine, `node_main`
+(proven with a **real three-node raft group**), and `replay_main` (the
+determinism gate, proven in CI on every push) — the input codec, output
+codec, gateways, and load generator that make up the rest of §10's full
+layout land in later phases.
 
 ## Testing
 
@@ -23,6 +24,7 @@ ctest --preset debug --output-on-failure
 |---|---|
 | `counter_state_machine_test.cpp` | The state machine in isolation: single and accumulated deltas, the designated output, rejecting a wrong-sized input, and a snapshot save/load round trip. No braft, no journal, no process. |
 | `three_node_smoke_test.cpp` | **Three real `counter_node` subprocesses** — the actual compiled binary, not a stand-in — forming a real raft group. Proposes several deltas, following leader redirects exactly as a gateway would (§8.1), then reads all three replicas' journal files directly and asserts they are **byte-for-byte identical** — the concrete proof behind §3's "replicas lag, never diverge." |
+| `replay_test.cpp` | Records a journal with the real `CounterStateMachine`, then replays it through a completely fresh instance via `tools/replay` and asserts byte-identical output — specification.md §11's determinism gate for this example, and what `.github/workflows/ci.yml` runs on every push. Complementary to `three_node_smoke_test.cpp`: that proves cross-*replica* determinism, this proves cross-*time* (record now, replay later, possibly after a rebuild) determinism — together, §2.1's full claim: "two replicas — or one replica and a later replay — produce byte-identical journals." |
 
 ## A real bug this test caught
 
@@ -63,6 +65,18 @@ defaults to itself, forming a trivial one-node group):
 ./build/debug/examples/counter/counter_node \
   --peer=127.0.0.1:8100:0 --data_dir=/tmp/counter-node-0
 ```
+
+Once that node (or any run of it) has proposed a few deltas, its
+data directory holds a real journal — inspect it with `tools/dumper`,
+or certify it with this example's own replay binary:
+
+```sh
+./build/debug/tools/dumper/dumper --data_dir=/tmp/counter-node-0
+./build/debug/examples/counter/counter_replay --data_dir=/tmp/counter-node-0
+```
+
+See `tools/replay/README.md` and `tools/dumper/README.md` for what
+each prints and what their flags do.
 
 `three_node_smoke_test.cpp` is the fuller demonstration — three real
 processes, a real election, real `Propose` RPCs — and is the best place

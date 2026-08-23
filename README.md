@@ -181,3 +181,7 @@ separate from `ctest` and run directly:
 ./build/debug/journal/benchmarks/journal_benchmark
 ```
 
+`.github/workflows/ci.yml` runs the full `ctest --preset debug` suite —
+including `docs/specification.md` §11's determinism-replay gate — on
+every push and pull request against `main`.
+
