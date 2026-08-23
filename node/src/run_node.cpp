@@ -22,6 +22,12 @@ DEFINE_int32(apply_thread_cpu, -1,
              "CPU core to pin the pinned apply thread to, or -1 to not pin "
              "(specification.md §5.3's recommended production layout: a dedicated core with its "
              "hyperthread sibling left empty)");
+DEFINE_bool(apply_thread_pure_spin, true,
+            "specification.md §5.4: production default is true (busy-spin unconditionally). "
+            "Set to false only for local development running several node processes on one "
+            "small machine, where multiple unconditionally-spinning apply threads would "
+            "otherwise starve the raft replication threads leader election depends on — never "
+            "set false in production or in any published measurement.");
 
 namespace sequencer {
 namespace {
@@ -51,6 +57,7 @@ int RunNode(int argc, char** argv, std::unique_ptr<StateMachine> stateMachine) {
   config.dataDir = FLAGS_data_dir;
   config.electionTimeoutMs = FLAGS_election_timeout_ms;
   config.applyThreadCpu = FLAGS_apply_thread_cpu;
+  config.applyThreadPureSpin = FLAGS_apply_thread_pure_spin;
 
   node::detail::NodeImpl nodeImpl(std::move(config), std::move(stateMachine));
   nodeImpl.start();

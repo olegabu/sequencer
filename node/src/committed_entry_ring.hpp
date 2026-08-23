@@ -42,7 +42,16 @@ class CommittedEntryRing {
         maxInputSize_(maxInputSize),
         lengths_(std::make_unique<std::uint32_t[]>(capacity)),
         contexts_(std::make_unique<void*[]>(capacity)),
-        storage_(std::make_unique<std::byte[]>(capacity * maxInputSize)) {
+        // `new std::byte[n]` (no trailing parens), not make_unique: the
+        // latter value-initializes — an explicit, non-lazy zero-fill of
+        // every byte, which at the default sizing costs seconds of
+        // wall-clock time, not a lazy mmap page-fault cost. Default-
+        // initializing a scalar array leaves it uninitialized instead
+        // (make_unique_for_overwrite would express this directly, but
+        // it's C++23; unavailable here). Safe: tryPop() only ever reads
+        // a slot after push() has written it — see the acquire/release
+        // protocol between head_ and tail_ below.
+        storage_(new std::byte[capacity * maxInputSize]) {
     if (capacity < 2) {
       throw std::invalid_argument("CommittedEntryRing: capacity must be >= 2");
     }

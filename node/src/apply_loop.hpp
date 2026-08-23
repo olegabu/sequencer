@@ -10,7 +10,9 @@
 // to braft.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 #include <sequencer/journal/writer.hpp>
 #include <sequencer/state_machine.hpp>
@@ -62,9 +64,22 @@ class ApplyLoop {
   // on every state machine author's behalf"). `stopRequested` is polled
   // with a relaxed load between entries; it is not on any latency-
   // sensitive path, only the shutdown path.
-  void run(const std::atomic<bool>& stopRequested) {
+  //
+  // `pureSpin` (default true) is the production behavior §5.4 mandates.
+  // Passing false trades a small, bounded wakeup latency for not
+  // pegging a full core while idle — an explicit, clearly-labeled
+  // concession for local development, never a default (§5.4: "A
+  // park-capable mode may exist... never as a default and never in any
+  // published measurement"). It exists because several node processes
+  // sharing one small development machine — as in
+  // examples/counter/tests/three_node_smoke_test.cpp — would otherwise
+  // each unconditionally peg a core, starving the very raft replication
+  // threads leader election depends on.
+  void run(const std::atomic<bool>& stopRequested, bool pureSpin = true) {
     while (!stopRequested.load(std::memory_order_relaxed)) {
-      step();
+      if (!step() && !pureSpin) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
     }
   }
 

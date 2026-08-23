@@ -97,7 +97,7 @@ void NodeImpl::start() {
       }
     }
     // specification.md §5.4: the apply thread busy-spins unconditionally.
-    applyLoop_->run(stopRequested_);
+    applyLoop_->run(stopRequested_, config_.applyThreadPureSpin);
   });
 
   started_ = true;

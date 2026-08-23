@@ -42,3 +42,4 @@ find_package(gflags CONFIG REQUIRED)
 
 add_subdirectory(journal)
 add_subdirectory(node)
+add_subdirectory(examples/counter)

@@ -38,9 +38,12 @@ struct NodeConfig {
 
   // Sized generously so the ring is never expected to apply
   // backpressure in practice (specification.md §5.4); maxInputSize
-  // bounds one proposed input's size.
+  // bounds one proposed input's size. 4096 * 64 KiB = 256 MiB reserved
+  // per node by default — comfortably larger than any realistic
+  // client-signed command; raise maxInputSize explicitly if an
+  // application's inputs are genuinely larger.
   std::size_t committedEntryRingCapacity = 4096;
-  std::size_t maxInputSize = std::size_t{1} << 20;  // 1 MiB
+  std::size_t maxInputSize = std::size_t{64} << 10;  // 64 KiB
 
   // -1 = don't pin (the portable default for development and tests).
   // specification.md §5.3 recommends pinning the apply thread to a
@@ -48,6 +51,11 @@ struct NodeConfig {
   // production; that is a deployment-time decision this knob exposes
   // rather than one the harness can make on an operator's behalf.
   int applyThreadCpu = -1;
+
+  // See apply_loop.hpp's run() for the full rationale: true (the
+  // default) is the production behavior specification.md §5.4
+  // mandates; false is strictly a local-development concession.
+  bool applyThreadPureSpin = true;
 };
 
 class NodeImpl {

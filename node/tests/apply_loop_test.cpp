@@ -133,5 +133,36 @@ TEST_F(ApplyLoopTest, RunDrainsConcurrentProducerInSequenceOrder) {
   }
 }
 
+// The non-default, local-development-only park mode (§5.4) must be
+// functionally identical to pure spin — only its idle CPU behavior
+// differs, which this test does not attempt to measure.
+TEST_F(ApplyLoopTest, RunWithParkModeStillDrainsInSequenceOrder) {
+  std::atomic<bool> stop{false};
+  std::thread applyThread([&] { loop_->run(stop, /*pureSpin=*/false); });
+
+  constexpr int kCount = 200;
+  std::vector<CompletionCtx> ctxs(kCount);
+  for (int i = 0; i < kCount; ++i) {
+    static thread_local std::int64_t delta;
+    delta = i;
+    ring_->push(payloadOf(delta), &ctxs[i]);
+    // A deliberate gap between pushes so the apply thread observes an
+    // empty ring (and takes the park branch) between most entries,
+    // not just at the very end.
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+
+  while (!ctxs[kCount - 1].called.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  stop.store(true, std::memory_order_relaxed);
+  applyThread.join();
+
+  for (int i = 0; i < kCount; ++i) {
+    EXPECT_TRUE(ctxs[i].called.load());
+    EXPECT_EQ(ctxs[i].sequenceNumber, static_cast<std::uint64_t>(i + 1));
+  }
+}
+
 }  // namespace
 }  // namespace sequencer::node::detail
