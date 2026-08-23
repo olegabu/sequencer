@@ -6,11 +6,20 @@
     "cmake.configureOnOpen": true,
 
     // CMakePresets.json's toolchainFile reads VCPKG_ROOT from the
-    // environment; CMake Tools needs it too when it invokes cmake
-    // itself. Adjust if your vcpkg checkout isn't at
-    // ~/workspace/vcpkg (see README.md's Prerequisites).
+    // environment (see README.md's Prerequisites: each person clones
+    // vcpkg wherever they like and exports VCPKG_ROOT themselves — no
+    // fixed path is assumed anywhere else in this repo, so this
+    // doesn't assume one either). ${env:VCPKG_ROOT} just forwards
+    // whatever's already in your shell environment; CMake Tools needs
+    // it passed explicitly because a GUI-launched VSCode doesn't
+    // always inherit a shell profile's exports the way a terminal
+    // does. If VCPKG_ROOT isn't set wherever VSCode itself runs, this
+    // resolves to empty and configure will fail the same way it would
+    // from a terminal without it exported — export it before launching
+    // VSCode, or override this one line in your own (untracked) user
+    // settings.
     "cmake.environment": {
-        "VCPKG_ROOT": "${userHome}/workspace/vcpkg"
+        "VCPKG_ROOT": "${env:VCPKG_ROOT}"
     },
 
     // Belt-and-suspenders with c_cpp_properties.json's
