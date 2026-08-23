@@ -44,11 +44,15 @@ build/
 Build/
 build-*/
 
-# CMake generated files
+# CMake generated files (redundant with build/ above for this
+# project's own build directories, but harmless to keep for
+# CMakeFiles/ et al.; Makefile itself is deliberately NOT listed here
+# — this repository has a real, hand-authored one at the root, and
+# every CMake-generated one already lives inside build/, already
+# ignored)
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
-Makefile
 install_manifest.txt
 compile_commands.json
 
