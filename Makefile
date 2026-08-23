@@ -27,7 +27,7 @@ ifneq ($(strip $(TEST_FILTER)),)
 CTEST_FLAGS += -R "$(TEST_FILTER)"
 endif
 
-.PHONY: help all configure build test clean distclean \
+.PHONY: help all configure build test clean prune distclean \
         debug test-debug \
         release test-release \
         tsan test-tsan \
@@ -58,7 +58,11 @@ help:
 	@echo "  make demo              examples/counter/demo.sh — curl + websocat, debug preset"
 	@echo ""
 	@echo "  make clean             remove build/\$$(PRESET) (all three if PRESET is unset: 'make clean')"
-	@echo "  make distclean         clean, plus vcpkg's own build cache (buildtrees/downloads/packages)"
+	@echo "  make prune             reclaim disk from already-built presets without an expensive"
+	@echo "                         vcpkg dependency rebuild — see the prune target's own comment"
+	@echo "                         (never touches vcpkg's downloads/ or packages/ — see why there)"
+	@echo "  make distclean         clean, plus a full vcpkg reset (buildtrees/packages/downloads,"
+	@echo "                         except downloads/tools/ — see distclean's own comment for why)"
 
 all: build
 
@@ -102,5 +106,51 @@ else
 	rm -rf build/debug build/release build/tsan
 endif
 
+# Reclaims disk from presets you've already built, without paying
+# `clean`'s cost of a from-scratch vcpkg dependency rebuild
+# (braft/brpc/openssl/boost — the thing that can take the better part
+# of an hour, per README.md's Build subsection): for each preset
+# that's been configured, `ninja -t clean` removes just this project's
+# own compiled object files and test binaries, leaving that preset's
+# vcpkg_installed/ (the expensive part) untouched — the next build
+# only has to recompile our own source, not the dependency stack. Also
+# clears vcpkg's buildtrees/ (intermediate per-port build litter, safe
+# to remove once a port is installed — reused as-is by every preset).
+#
+# Deliberately NOT touched here: vcpkg's downloads/ and packages/.
+# They look like more of the same kind of reclaimable cache, but
+# aren't: deleting them once broke a working build on this exact repo
+# — vcpkg's own pinned CMake tool lives under downloads/tools/, needed
+# because some older vcpkg ports (e.g. libevent) fail outright under a
+# too-new system CMake (CMake >= 4.0 removed support for the very old
+# cmake_minimum_required versions those ports still declare); losing
+# it silently fell back to system CMake and broke the *next*
+# `cmake --preset` reconfigure, not the build that deleted it, which
+# is what made it easy to miss. packages/ is where vcpkg stages a
+# port's build output before copying it into vcpkg_installed/, and
+# vcpkg's install bookkeeping expects it to still be there even after
+# a package is fully installed. Both are cheap enough (packages/ and
+# downloads/ together are usually a fraction of buildtrees/'s size)
+# that the disk saved isn't worth relitigating this — see distclean
+# below if you actually want a from-scratch vcpkg reset.
+prune:
+	@for preset in debug release tsan; do \
+		if [ -f build/$$preset/build.ninja ]; then \
+			echo "==> ninja -C build/$$preset -t clean (vcpkg_installed kept)"; \
+			ninja -C build/$$preset -t clean; \
+		fi; \
+	done
+	@echo "==> clearing vcpkg's buildtrees/ (downloads/ and packages/ deliberately left alone — see comment above)"
+	rm -rf $(VCPKG_ROOT)/buildtrees
+
+# Forces every dependency to rebuild from source on the next configure
+# — clears buildtrees/, packages/, and downloads/'s cached port source
+# tarballs. downloads/tools/ is deliberately spared even here: it's
+# vcpkg's own pinned build tools (cmake, ninja, patchelf, ...), not
+# port sources — see prune's comment above for what actually goes
+# wrong if that's lost too (a working `cmake --preset` reconfigure
+# breaking on the *next* run, not this one, which makes it a nasty one
+# to track down).
 distclean: clean
-	rm -rf $(VCPKG_ROOT)/buildtrees $(VCPKG_ROOT)/downloads $(VCPKG_ROOT)/packages
+	rm -rf $(VCPKG_ROOT)/buildtrees $(VCPKG_ROOT)/packages
+	find $(VCPKG_ROOT)/downloads -mindepth 1 -maxdepth 1 ! -name tools -exec rm -rf {} +
