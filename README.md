@@ -89,6 +89,13 @@ one.
 
 ## Development
 
+Once the prerequisites below are installed, `make` builds (debug
+preset) and `make test` builds and runs the full suite —
+`Makefile` is a thin wrapper around the `cmake`/`ctest` preset
+commands this section documents manually; run `make help` for every
+target (release/tsan presets, `TEST_FILTER=` for a filtered run,
+`make demo`, `make benchmark`, `make clean`).
+
 ### Prerequisites
 
 Install and clone all of the following before attempting a build.
