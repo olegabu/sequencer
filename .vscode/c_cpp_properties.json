@@ -1,22 +1,50 @@
 {
-    // compileCommands points IntelliSense at CMake's own generated
+    // Primary source of truth: CMake's own generated
     // compile_commands.json (CMAKE_EXPORT_COMPILE_COMMANDS ON in the
     // root CMakeLists.txt) — the exact per-file compiler, flags,
     // defines, and include paths actually used to build each
-    // translation unit, including everything vcpkg installed
-    // (braft/brpc/protobuf/openssl/boost/gflags/glog under
-    // build/debug/vcpkg_installed/x64-linux/include). This is what
-    // resolves headers correctly without hand-maintaining includePath.
+    // translation unit. Requires at least one `cmake --preset debug`
+    // (or `make`/`make build`) to have run first — see README.md's
+    // Development section.
     //
-    // Requires at least one `cmake --preset debug` (or `make`/`make
-    // build`) to have run first, so the file exists — see README.md's
-    // Development section. If it's missing, IntelliSense falls back to
-    // includePath below, which is much less accurate.
+    // Header files (like this one, output_codec.hpp) are never
+    // themselves translation units, so they're not directly listed in
+    // compile_commands.json — cpptools infers their flags from the
+    // "closest" compiled .cpp that includes them. If that heuristic
+    // ever misses (a header included from several places with
+    // different flags, or the extension hasn't picked up
+    // compile_commands.json yet — try "C/C++: Reset IntelliSense
+    // Database" from the command palette first), includePath below is
+    // the fallback: every component's own include/ directory, plus
+    // CMake's generated protobuf headers and vcpkg's installed
+    // headers — one flat list applied to every file uniformly, so
+    // it's less precise than compile_commands.json but always finds
+    // the headers.
     "configurations": [
         {
             "name": "Linux",
             "compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
             "includePath": [
+                "${workspaceFolder}/journal/include",
+                "${workspaceFolder}/node/include",
+                "${workspaceFolder}/node/src",
+                "${workspaceFolder}/gateway/input/include",
+                "${workspaceFolder}/gateway/input/src",
+                "${workspaceFolder}/gateway/output/include",
+                "${workspaceFolder}/gateway/output/src",
+                "${workspaceFolder}/gateway/relay/include",
+                "${workspaceFolder}/gateway/relay/src",
+                "${workspaceFolder}/evidence/include",
+                "${workspaceFolder}/evidence/src",
+                "${workspaceFolder}/sdk/cpp/include",
+                "${workspaceFolder}/tools/replay/include",
+                "${workspaceFolder}/examples/counter",
+                "${workspaceFolder}/build/debug/node/generated",
+                "${workspaceFolder}/build/debug/gateway/input/generated",
+                "${workspaceFolder}/build/debug/gateway/output/generated",
+                "${workspaceFolder}/build/debug/gateway/relay/generated",
+                "${workspaceFolder}/build/debug/evidence/generated",
+                "${workspaceFolder}/build/debug/vcpkg_installed/x64-linux/include",
                 "${workspaceFolder}/**"
             ],
             "compilerPath": "/usr/bin/g++-10",
