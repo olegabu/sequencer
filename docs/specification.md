@@ -117,7 +117,7 @@ clients ──REST/FIX/WS/gRPC/brpc──► INPUT GATEWAYS ──Propose(bytes)
                                                                 RELAY GATEWAY (§3.3, §8.2)
                                                                  re-serves Subscribe over the
                                                                  network, unmodified, at scale
-                                                                        │ Subscribe (remote)
+                                                                         │ Subscribe (remote)
                                             ┌────────────────────────────┴──────────────┐
                                             ▼                                            ▼
                                   OUTPUT GATEWAYS (WS/FIX/gRPC/brpc)               SIGNING GATEWAY
@@ -860,6 +860,31 @@ this project's other permissively-licensed dependencies) is the
 suggested choice, with a lighter-weight library such as `uWebSockets` a
 reasonable alternative if a future output gateway needs very high
 subscriber fan-out.
+
+### 8.8 Relay versus output gateways — a comparison
+
+Both are colocated journal readers serving subscriptions over
+`brpc::Stream`, and both are easy to conflate at a glance. They exist
+for structurally different reasons and must not be confused:
+
+| | Relay gateway (§8.2) | Output gateway (§8.3) |
+|---|---|---|
+| Contract | Carries the journal off a node's machine, byte-identical, unmodified | Translates and filters per audience via an application-supplied `OutputCodec` |
+| Consumers | Other gateways (output gateways, the signing gateway) that would otherwise read a node's journal directly | End clients — applications, browsers, anything an `OutputCodec` targets |
+| Delivery | Any starting sequence number: `Subscribe(fromSequenceNumber)` serves historical replay and live delivery through one mechanism | Live only — a session receives only what's disseminated after it connects |
+| Session model | One independent tailing cursor per subscriber, each at its own pace and starting point; no topics, no filtering | Sessions grouped by audience/topic; one dissemination reaches every session in that group |
+| Wire content | The complete, raw journal record | Whatever bytes the codec's `toOutput` produces |
+| Interprets input | Never — no `InputCodec`/`OutputCodec` involved | Yes — that interpretation is the entire point |
+| Ships as | A stock binary; no application repository ever implements one (§9) | A chassis an application links, supplying a codec |
+
+Put differently: a relay is infrastructure — a faithful, dumb copy of
+the journal that exists purely to absorb fan-out load off a node
+(§3.3). An output gateway is where an application's own meaning enters
+the picture. A production deployment's output gateways and signing
+gateway instances are meant to consume a relay's `Subscribe` stream
+rather than a node's directly (§3.3, §8.3); reading a node's journal
+colocated is the allowance for local development and small deployments
+(§3), not the target architecture at scale.
 
 ## 9. Repository layout and build tooling
 
