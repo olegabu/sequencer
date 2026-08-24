@@ -8,7 +8,8 @@
     "braft",
     "brpc",
     "boost-beast",
-    "openssl"
+    "openssl",
+    "grpc"
   ],
   "overrides": [
     { "name": "glog", "version": "0.6.0" }

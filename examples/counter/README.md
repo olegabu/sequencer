@@ -63,6 +63,46 @@ overload in `output_gateway_main.cpp` — still "the one place the
 example depends on something beyond brpc" (§8.7), just via a shared
 dependency now instead of a private one.
 
+## The gRPC alternative: two patterns, one for each side
+
+`demo_grpc.sh` is the real-gRPC counterpart to `demo.sh` — same
+single-node raft group, but submission and dissemination both go over
+the real, standard C++ gRPC library instead of brpc/WebSocket, driven
+entirely by `grpcurl`. It shows two deliberately different patterns,
+one for each side of the pipeline:
+
+- **Output** (`grpc_output_gateway_main.cpp`): wires
+  `sequencer::GrpcOutputTransport` (`gateway/output/`) into the
+  *existing*, unchanged `CounterOutputCodec` — the same generic,
+  reusable transport `gateway/output/README.md` describes, "just like"
+  `WebSocketOutputTransport`. Its wire message is a generic bytes
+  envelope, so `grpcurl` prints the codec's JSON base64-encoded inside
+  `OutputRecord.payload` — correct, but not directly readable without
+  decoding.
+- **Input** (`grpc_input_gateway_main.cpp`): a small, *counter-specific*
+  gRPC service (`CounterSubmitService`, `proto/counter_input_grpc.proto`)
+  with real, distinct fields (`delta` in, `sequence_number`/`total`
+  out) — the fully-typed alternative, for when an application wants
+  `grpcurl` to print real business fields directly instead of an
+  opaque envelope. This one reuses
+  `gateway::input::detail::NodeProposer` directly rather than the
+  chassis's brpc-based `SubmitService`, since that chassis's
+  empty-schema `SubmitRequest` has no field to carry a delta and brpc
+  doesn't support gRPC reflection anyway (see
+  `gateway/output/README.md`'s and `gateway/relay/README.md`'s own
+  `GrpcOutputTransport`/`RelayGrpcServiceImpl` sections for why real
+  gRPC is a separate library from brpc's own Streaming RPC here).
+
+```sh
+./examples/counter/demo_grpc.sh
+```
+
+submits three deltas with `grpcurl ... CounterSubmitService/SubmitDelta`
+and consumes the running total with
+`grpcurl ... GenericOutputService/Subscribe`, decoding and printing
+each broadcast — no `.proto` file needed on either `grpcurl` command
+line, since both services enable server reflection.
+
 ## Testing
 
 ```sh
@@ -145,6 +185,15 @@ support in curl is experimental, opt-in at compile time, and absent
 from most distro-packaged builds (this repository's own dev image ships
 curl 7.68, which predates it entirely), so `websocat` is curl's natural
 counterpart for the receiving side, not curl with a different flag.
+
+### The real-gRPC counterpart: `demo_grpc.sh`
+
+```sh
+./examples/counter/demo_grpc.sh
+```
+
+Same pipeline, driven by `grpcurl` instead of `curl`/`websocat` — see
+"The gRPC alternative" section above for what each side demonstrates.
 
 ### By hand
 

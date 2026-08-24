@@ -102,11 +102,30 @@ class RelayGatewayImpl {
     return sessions_.size();
   }
 
- private:
   std::shared_ptr<journal::JournalReader> currentReader() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return reader_;
   }
+
+  // For a caller that needs direct colocated read access rather than
+  // going through startSession's brpc-specific session management —
+  // RelayGrpcServiceImpl (relay_grpc_service_impl.hpp), which runs its
+  // own tailing loop directly on gRPC's synchronous-streaming call
+  // thread rather than through RelaySession. Blocks, bounded, until
+  // the journal becomes readable (matching startSession's own retry
+  // window, just synchronous instead of returning an immediate error).
+  std::shared_ptr<journal::JournalReader> waitForReader(std::chrono::seconds timeout) const {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (auto reader = currentReader()) {
+        return reader;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return nullptr;
+  }
+
+ private:
 
   void maintenanceLoop() {
     while (!stopRequested_.load(std::memory_order_relaxed)) {

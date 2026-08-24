@@ -141,9 +141,12 @@ export PATH="$VCPKG_ROOT:$PATH"
 **Libraries:** declared in `vcpkg.json` and fetched automatically by
 `vcpkg` on first configure — nothing to install by hand. The manifest
 now lists `gtest`, `benchmark`, `braft`, `brpc`, `boost-beast` (the
-output side's WebSocket transport — `examples/counter`'s only use, per
-§8.7), and `openssl` (the cryptography library `evidence/`'s Merkle
-signing and `sdk/`'s proof verification share, per §9.1) — the full set
+output side's WebSocket transport, `gateway/output/`'s
+`WebSocketOutputTransport`, per §8.7), `grpc` (the output side's real
+gRPC streaming transport and the relay's real gRPC service, both in
+`gateway/`, per §8.7 — brpc speaks only *unary* gRPC, not streaming),
+and `openssl` (the cryptography library `evidence/`'s Merkle signing
+and `sdk/`'s proof verification share, per §9.1) — the full set
 `docs/specification.md` §9 anticipates for this repository, unless a
 future phase's design calls for something new.
 

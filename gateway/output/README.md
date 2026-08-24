@@ -93,6 +93,56 @@ pick up tailing exactly where it left off (specification.md §8.3:
 "restartable from any sequence number with identical output"), entirely
 independent of which clients happen to be connected at any given moment.
 
+## `GrpcOutputTransport`: real gRPC streaming, since brpc doesn't have it
+
+`include/sequencer/grpc_output_transport.hpp` +
+`src/grpc_output_transport.cpp` — an `OutputTransport` built on the
+real, standard C++ gRPC library, added "just like"
+`WebSocketOutputTransport` above: a separate library target
+(`sequencer::gateway_output_grpc`) so an application that doesn't want
+gRPC never pulls in the gRPC C++ library just by linking the chassis.
+
+**Why not brpc, given brpc already speaks the gRPC wire protocol?**
+Only for *unary* calls. brpc does not implement genuine gRPC-protocol
+*streaming* — confirmed against brpc's own upstream repository: ["BRPC
+兼容GRPC stream"](https://github.com/apache/brpc/issues/1589) is an
+open, unresolved feature request, not a shipped capability. brpc's own
+"Streaming RPC" (`brpc::Stream`, what `BrpcStreamTransport` above is
+built on) is a `baidu_std`-protocol-specific mechanism — not gRPC-wire-
+compatible, and not consumable by a real gRPC client (`grpcurl`,
+`grpc-go`, `grpc-java`, ...) at all. `proto/output_grpc.proto` is
+therefore a genuinely separate codegen unit, using the standard protoc
+`grpc_cpp_plugin` — this repository's one deliberate exception to its
+usual `cc_generic_services=true` style (see
+`docs/specification.md` §8.7).
+
+**Generic, exactly like WebSocket, for the same reason.** The chassis
+never interprets an `OutputCodec`'s bytes, so `output_grpc.proto`'s
+`OutputRecord` message wraps them verbatim (`bytes payload = 1`)
+rather than declaring application-specific fields — grpcurl prints
+`payload` base64-encoded, protobuf's own JSON mapping for a `bytes`
+field, regardless of what's actually inside. An application wanting
+grpcurl to print real, distinct business fields directly defines and
+serves its own service against its own domain types instead, the way
+`examples/counter/grpc_input_gateway_main.cpp` does for submission —
+see that file and `examples/counter/README.md` for the tradeoff
+between the two patterns.
+
+**Session design.** gRPC's synchronous server-streaming API runs each
+`Subscribe()` call on its own dedicated thread for the call's entire
+lifetime — there's no async callback machinery to build here the way
+`WebSocketOutputTransport`'s single-io-thread design needs. Each
+session is just a mutex/condition-variable queue that
+`broadcast()`/`toSession()` push onto (from the output gateway's own
+tailing thread) and the call's own thread drains, writing to its
+`grpc::ServerWriter` — the one thing that *does* carry over from
+`WebSocketOutputTransport` is that a `grpc::ServerWriter` (like a
+`websocket::stream`) is only ever touched from its own call's thread.
+
+**Server reflection is enabled** (`grpc::reflection::InitProtoReflectionServerBuilderPlugin()`),
+so `grpcurl` needs no `.proto` file of its own to call this — unlike
+brpc, which does not implement gRPC's reflection service either.
+
 ## A real, rare crash this component's tests caught
 
 `gateway/output/tests/output_gateway_test.cpp` intermittently segfaulted
@@ -172,6 +222,16 @@ A's.
 | `BroadcastToUnknownTopicIsANoOp` | Broadcasting to a topic with no subscribers is silent — no crash, no hang. |
 | `TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn` | Two clients connected to different URL paths each receive only their own topic's broadcasts — the path-based topic routing actually works, not just compiles. |
 
+`tests/grpc_output_transport_test.cpp` drives `GrpcOutputTransport`
+with a real synchronous gRPC C++ client (`grpc::CreateChannel` +
+`GenericOutputService::Stub` — the same generated stub any real gRPC
+client, including `grpcurl`, would use), covering the identical four
+cases as the WebSocket table above (`BroadcastDeliversToConnectedClient`,
+`MultipleMessagesArriveInOrder`, `BroadcastToUnknownTopicIsANoOp`,
+`TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn`) — the two transports
+are held to the same bar since they implement the same
+`OutputTransport` contract.
+
 ## Seeing it in action
 
 `examples/counter`'s `counter_output_gateway` is a real, runnable
@@ -179,4 +239,7 @@ A's.
 [examples/counter/README.md](../../examples/counter/README.md) for
 flags and a full worked example alongside its input gateway
 counterpart, or `examples/counter/demo.sh` for a live walkthrough
-driven entirely by `curl` and `websocat`.
+driven entirely by `curl` and `websocat`. `counter_grpc_output_gateway`
+is the same codec, same journal, wired to `GrpcOutputTransport`
+instead — see `examples/counter/demo_grpc.sh` for the `grpcurl`
+counterpart to `demo.sh`.

@@ -50,6 +50,63 @@ add_executable(counter_load_generator_main load_generator_main.cpp)
 target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input unofficial::brpc::brpc-static gflags::gflags_static glog::glog)
 set_target_properties(counter_load_generator_main PROPERTIES OUTPUT_NAME counter_load_generator)
 
+# specification.md §8.7: real gRPC entry points, alongside the existing
+# brpc/REST-via-curl input gateway and WebSocket-via-websocat output
+# gateway — see examples/counter/README.md for the pattern each one
+# demonstrates.
+find_package(gRPC CONFIG REQUIRED)
+# See gateway/output/CMakeLists.txt's identical block: vcpkg's grpc port
+# embeds a duplicate of a few abseil translation units inside libgrpc.a,
+# colliding with the standalone libabsl_status.a also on the link line.
+set_property(TARGET gRPC::grpc++ APPEND PROPERTY
+  INTERFACE_LINK_OPTIONS "-Wl,--allow-multiple-definition")
+
+# Output: reuses the shared, generic sequencer::GrpcOutputTransport
+# (gateway/output/) with the existing CounterOutputCodec, unchanged —
+# "just like" the WebSocket output gateway above. No counter-specific
+# proto or codegen needed for this half.
+add_executable(counter_grpc_output_gateway_main grpc_output_gateway_main.cpp)
+target_link_libraries(counter_grpc_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output_grpc sequencer::gateway_output)
+set_target_properties(counter_grpc_output_gateway_main PROPERTIES OUTPUT_NAME counter_grpc_output_gateway)
+
+# Input: a fully-typed, counter-specific gRPC service (its own proto),
+# not a retrofit of the byte-opaque RunInputGateway chassis — see
+# proto/counter_input_grpc.proto's file comment for why.
+protobuf_generate(
+  LANGUAGE cpp
+  OUT_VAR COUNTER_INPUT_GRPC_PROTO_SOURCES
+  PROTOS proto/counter_input_grpc.proto
+  IMPORT_DIRS proto
+  PROTOC_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
+protobuf_generate(
+  LANGUAGE grpc
+  GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
+  OUT_VAR COUNTER_INPUT_GRPC_SERVICE_SOURCES
+  PROTOS proto/counter_input_grpc.proto
+  IMPORT_DIRS proto
+  PROTOC_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  PLUGIN "protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
+)
+
+add_executable(counter_grpc_input_gateway_main
+  grpc_input_gateway_main.cpp
+  ${COUNTER_INPUT_GRPC_PROTO_SOURCES}
+  ${COUNTER_INPUT_GRPC_SERVICE_SOURCES}
+)
+target_include_directories(counter_grpc_input_gateway_main PRIVATE
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>"
+)
+target_link_libraries(counter_grpc_input_gateway_main PRIVATE
+  sequencer::gateway_input
+  gRPC::grpc++
+  gRPC::grpc++_reflection
+  protobuf::libprotobuf
+  gflags::gflags_static
+  glog::glog
+)
+set_target_properties(counter_grpc_input_gateway_main PROPERTIES OUTPUT_NAME counter_grpc_input_gateway)
+
 # find_package(... CONFIG) targets are scoped to the calling directory
 # and its subdirectories, not the whole build — gateway/output/'s own
 # find_package(boost_beast) doesn't reach this sibling directory tree.

@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package sequencer.gateway.relay.grpc_proto;
+
+// A real, standard-gRPC-compatible mirror of relay.proto's Subscribe
+// contract (specification.md §8.2) — using the standard C++ gRPC
+// library, not brpc. brpc does *not* implement genuine gRPC-protocol
+// streaming (an acknowledged, still-open gap in brpc itself, as of
+// this writing — see README.md); brpc's own "Streaming RPC"
+// (brpc::Stream, used by relay.proto's RelayService) is a baidu_std-
+// protocol-specific mechanism, not gRPC-wire-compatible. This service
+// is consumable by any real gRPC client in any language (grpc-go,
+// grpc-java, grpcurl) with no brpc dependency at all — the whole point
+// of running it alongside the existing brpc-based one, per §3.3's
+// framing of a relay as the piece other gateways (potentially written
+// in other languages) consume instead of touching a node directly.
+//
+// A separate .proto and codegen unit from relay.proto, not an
+// extension of it: real gRPC `stream`-keyword RPCs need the standard
+// protoc grpc_cpp_plugin codegen, entirely different from this
+// repository's usual cc_generic_services=true style (see
+// docs/specification.md §8.7's "brpc's own examples... in preference
+// to a gRPC-plugin style" — this is deliberately the one exception).
+// Server reflection is enabled, so `grpcurl` needs no `.proto` of its
+// own either.
+
+message SubscribeRequest {
+  // 0 means "from the beginning" — matches relay.proto's own
+  // from_sequence_number semantics exactly.
+  uint64 from_sequence_number = 1;
+}
+
+// The complete, raw journal record — byte-identical to a colocated
+// reader's own journal::RecordView::rawBytes(), exactly like
+// relay.proto's own delivery. This service carries the journal
+// unmodified; it never interprets these bytes.
+message Record {
+  bytes raw_record = 1;
+}
+
+service RelayService {
+  rpc Subscribe(SubscribeRequest) returns (stream Record);
+}

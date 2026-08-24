@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package sequencer.examples.counter.grpc_proto;
+
+// A properly-typed, real-gRPC-compatible submission path for the
+// counter example — a second, parallel entry point alongside the
+// existing brpc/REST-via-curl input gateway (input_gateway_main.cpp),
+// demonstrating how an application builds its own small, richly-typed
+// gRPC service directly against its domain data, rather than going
+// through the generic RunInputGateway chassis's byte-opaque
+// InputCodec (see docs/specification.md §8.6's rationale for why that
+// chassis is deliberately byte-opaque, and examples/counter/README.md
+// for why this is a separate demonstration rather than a retrofit of
+// it). Server reflection is enabled, so `grpcurl` needs no `.proto` of
+// its own to call this.
+
+message SubmitDeltaRequest {
+  int64 delta = 1;
+}
+
+message SubmitDeltaResponse {
+  uint64 sequence_number = 1;
+  int64 total = 2;
+}
+
+service CounterSubmitService {
+  rpc SubmitDelta(SubmitDeltaRequest) returns (SubmitDeltaResponse);
+}

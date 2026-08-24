@@ -12,3 +12,7 @@ gtest_discover_tests(output_gateway_restart_drill_test PROPERTIES TIMEOUT 60)
 add_executable(websocket_output_transport_test websocket_output_transport_test.cpp)
 target_link_libraries(websocket_output_transport_test PRIVATE sequencer::gateway_output_websocket GTest::gtest GTest::gtest_main Threads::Threads)
 gtest_discover_tests(websocket_output_transport_test)
+
+add_executable(grpc_output_transport_test grpc_output_transport_test.cpp)
+target_link_libraries(grpc_output_transport_test PRIVATE sequencer::gateway_output_grpc gRPC::grpc++ GTest::gtest GTest::gtest_main Threads::Threads)
+gtest_discover_tests(grpc_output_transport_test)

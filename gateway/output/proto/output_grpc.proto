@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package sequencer.gateway.output.grpc_proto;
+
+// A generic, byte-oriented gRPC streaming OutputTransport
+// (specification.md §8.7) — built on the real, standard C++ gRPC
+// library, not brpc. brpc does *not* implement genuine gRPC-protocol
+// streaming (an acknowledged, still-open gap in brpc itself, as of
+// this writing — see gateway/output/README.md); brpc's own "Streaming
+// RPC" (brpc::Stream, used by BrpcStreamTransport) is a baidu_std-
+// protocol-specific mechanism, not gRPC-wire-compatible. This service
+// is consumable by any real gRPC client in any language (grpc-go,
+// grpc-java, grpcurl), with no brpc dependency needed on the client
+// side.
+//
+// Deliberately generic, exactly like WebSocketOutputTransport: the
+// chassis never interprets an OutputCodec's bytes, so this message
+// wraps them verbatim rather than declaring application-specific
+// fields. An application wanting a fully-typed proto response (real
+// distinct fields grpcurl prints without a second decode step, not a
+// bytes envelope) defines and serves its own service directly against
+// its own domain types instead — see examples/counter's
+// grpc_output_gateway_main.cpp for that alternative pattern, and its
+// README for the tradeoff between the two.
+message OutputRecord {
+  bytes payload = 1;
+}
+
+message SubscribeRequest {
+  // Empty means the implicit catch-all topic every session joins by
+  // default — matches OutputSubscribeRequest's own "empty means
+  // catch-all" convention in output_gateway.proto.
+  string topic = 1;
+}
+
+service GenericOutputService {
+  rpc Subscribe(SubscribeRequest) returns (stream OutputRecord);
+}

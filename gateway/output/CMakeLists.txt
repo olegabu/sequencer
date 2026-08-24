@@ -61,6 +61,59 @@ target_link_libraries(sequencer_gateway_output_websocket
 )
 target_compile_features(sequencer_gateway_output_websocket PUBLIC cxx_std_20)
 
+# specification.md §8.7: a real, standard-gRPC-compatible
+# OutputTransport — brpc does not implement genuine gRPC streaming (see
+# proto/output_grpc.proto's file comment), so this uses the real gRPC
+# C++ library instead. A separate target for the same reason as the
+# WebSocket one above: an application that doesn't want gRPC never
+# pulls in the gRPC C++ library just by linking the chassis.
+find_package(gRPC CONFIG REQUIRED)
+# vcpkg's grpc port embeds its own copy of a few abseil translation units
+# (e.g. inproc_transport.cc.o duplicates absl::Status::kMovedFromString)
+# inside libgrpc.a, which collides with the standalone libabsl_status.a
+# also on the link line. Both definitions are byte-identical (same abseil
+# version), so this is a packaging duplicate, not an ODR violation — safe
+# to tell the linker to keep the first one it sees.
+set_property(TARGET gRPC::grpc++ APPEND PROPERTY
+  INTERFACE_LINK_OPTIONS "-Wl,--allow-multiple-definition")
+
+protobuf_generate(
+  LANGUAGE cpp
+  OUT_VAR SEQUENCER_GATEWAY_OUTPUT_GRPC_PROTO_SOURCES
+  PROTOS proto/output_grpc.proto
+  IMPORT_DIRS proto
+  PROTOC_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
+protobuf_generate(
+  LANGUAGE grpc
+  GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
+  OUT_VAR SEQUENCER_GATEWAY_OUTPUT_GRPC_SERVICE_SOURCES
+  PROTOS proto/output_grpc.proto
+  IMPORT_DIRS proto
+  PROTOC_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  PLUGIN "protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
+)
+
+add_library(sequencer_gateway_output_grpc STATIC
+  src/grpc_output_transport.cpp
+  ${SEQUENCER_GATEWAY_OUTPUT_GRPC_PROTO_SOURCES}
+  ${SEQUENCER_GATEWAY_OUTPUT_GRPC_SERVICE_SOURCES}
+)
+add_library(sequencer::gateway_output_grpc ALIAS sequencer_gateway_output_grpc)
+
+target_include_directories(sequencer_gateway_output_grpc PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>"
+)
+target_link_libraries(sequencer_gateway_output_grpc
+  PUBLIC
+    sequencer::gateway_output
+  PRIVATE
+    gRPC::grpc++
+    gRPC::grpc++_reflection
+    protobuf::libprotobuf
+)
+target_compile_features(sequencer_gateway_output_grpc PUBLIC cxx_std_20)
+
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
