@@ -9,7 +9,8 @@
     "brpc",
     "boost-beast",
     "openssl",
-    "grpc"
+    "grpc",
+    "hdr-histogram"
   ],
   "overrides": [
     { "name": "glog", "version": "0.6.0" }

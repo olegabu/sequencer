@@ -221,12 +221,15 @@ directory (colocated — see
 ```
 
 Submit a delta and watch the total accumulate: with the load generator
-(open-loop: fires at a fixed rate regardless of response latency, per
-specification.md §12's load-testing guidance),
+— a real open/closed-loop, HDR-histogram benchmark harness now (see
+[bench/load_generator/README.md](../../bench/load_generator/README.md)),
+not just a rate-limited firehose; a short open-loop run at 50 req/s
+reporting the submission-to-synchronous-receipt round trip
+(specification.md §12's load-testing guidance):
 
 ```sh
 ./build/debug/examples/counter/counter_load_generator \
-  --input_gateway_addr=127.0.0.1:8200 --count=100 --rate=50
+  --input_gateway_addr=127.0.0.1:8200 --mode=open --rate=50 --warmup=2 --measure=5
 ```
 
 with `curl` and `websocat` exactly as `demo.sh` does (see its

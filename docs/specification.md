@@ -1110,10 +1110,19 @@ sequencer/
 │                     #   text preview) for human inspection, without
 │                     #   interpreting payload meaning — needs no
 │                     #   application code, unlike replay
+├── bench/
+│   └── load_generator/  # a reusable open/closed-loop, HDR-histogram
+│                     #   load-testing harness (§10's load_generator_main.cpp
+│                     #   is its counter-specific half) — not this
+│                     #   repository's actual benchmarking harness, which
+│                     #   is the sibling raft-tests repository this feeds
+│                     #   into; see this directory's own README
 ├── examples/
 │   └── counter/     # the one example — see §10
 ├── vcpkg.json       # dependencies: braft, brpc, protobuf, gtest, benchmark,
-│                     #   boost-beast (WebSocket, output gateways only — see §8.7)
+│                     #   boost-beast (WebSocket, output gateways only —
+│                     #   §8.7), openssl (§9.1), grpc (real gRPC streaming,
+│                     #   §8.9), hdr-histogram (bench/load_generator/ only)
 └── CMakeLists.txt   # CMake with the Ninja generator
 ```
 
@@ -1228,10 +1237,13 @@ examples/counter/
 │                              #   WebSocket support, so this is the one place
 │                              #   the example depends on something beyond brpc
 ├── replay_main.cpp           # links tools/replay against CounterStateMachine
-├── load_generator_main.cpp   # a small open-loop-capable client, exercised
-│                              #   in tests — a smoke test and a rough
-│                              #   throughput/latency sanity check, not a
-│                              #   substitute for the benchmarking repository
+├── load_generator_main.cpp   # the counter-specific half (request body,
+│                              #   input gateway address) of a real open/
+│                              #   closed-loop, HDR-histogram benchmark
+│                              #   harness — see bench/load_generator/ for
+│                              #   the reusable other half, and its own
+│                              #   README for this repository's actual
+│                              #   benchmarking harness, a sibling repo
 ├── tests/                    # Google Test: state-machine unit tests, a
 │                              #   replay test, and a three-local-node
 │                              #   end-to-end test driven by the load

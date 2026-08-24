@@ -119,6 +119,9 @@ benchmark: debug
 demo: debug
 	./examples/counter/demo.sh
 
+demo-grpc: debug
+	./examples/counter/demo_grpc.sh
+
 # `make clean` (no PRESET given) removes every preset's build
 # directory; `make clean PRESET=release` removes just that one.
 clean:

@@ -47,6 +47,7 @@ find_package(glog CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_subdirectory(journal)
+add_subdirectory(bench/load_generator)
 add_subdirectory(node)
 add_subdirectory(tools/replay)
 add_subdirectory(tools/dumper)

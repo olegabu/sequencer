@@ -47,7 +47,8 @@ target_link_libraries(counter_output_gateway_main PRIVATE counter::codecs sequen
 set_target_properties(counter_output_gateway_main PROPERTIES OUTPUT_NAME counter_output_gateway)
 
 add_executable(counter_load_generator_main load_generator_main.cpp)
-target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input unofficial::brpc::brpc-static gflags::gflags_static glog::glog)
+target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::bench_load_generator
+                                                            unofficial::brpc::brpc-static gflags::gflags_static glog::glog)
 set_target_properties(counter_load_generator_main PROPERTIES OUTPUT_NAME counter_load_generator)
 
 # specification.md §8.7: real gRPC entry points, alongside the existing

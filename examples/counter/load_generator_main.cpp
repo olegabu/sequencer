@@ -1,10 +1,12 @@
-// specification.md §10: "a small open-loop-capable client, exercised in
-// tests — a smoke test and a rough throughput/latency sanity check, not
-// a substitute for the benchmarking repository." Open-loop: requests
-// are scheduled at a fixed target rate regardless of how quickly (or
-// slowly) responses come back — unlike a closed-loop client, which
-// would wait for each response before sending the next, silently
-// self-throttling to whatever the system's own latency imposes.
+// specification.md §10's "a small open-loop-capable client" — now the
+// thin, counter-specific half of a benchmark-grade harness, matching
+// raft-tests/braft/client.cpp's own design: the generic open/closed-
+// loop scheduling, HDR histograms, and percentile-summary reporting
+// live in bench/load_generator/ (reusable by any future sequencer
+// application); this file supplies only what's actually counter-
+// specific — the request body and where it goes.
+
+#include <sequencer/bench/load_generator.hpp>
 
 #include <brpc/callback.h>
 #include <brpc/channel.h>
@@ -13,47 +15,65 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include <atomic>
-#include <chrono>
 #include <cstdint>
-#include <iostream>
-#include <memory>
-#include <random>
 #include <string>
-#include <thread>
 
 #include "input_gateway.pb.h"
 
 DEFINE_string(input_gateway_addr, "", "The input gateway's \"ip:port\" to submit to (required)");
-DEFINE_int32(count, 100, "Number of requests to submit");
-DEFINE_double(rate, 100.0,
-              "Target requests/second, open-loop — requests are scheduled at this fixed rate "
-              "regardless of response latency. 0 means send as fast as this thread can loop.");
+DEFINE_string(mode, "open", "closed: keep thread_num outstanding. open: emit at rate");
+DEFINE_int64(rate, 0, "Target requests per second (open mode)");
+DEFINE_int32(burst, 1, "Requests per scheduled instant, sharing its scheduled time (open mode)");
+DEFINE_int64(max_inflight, 0, "Cap on unanswered requests (open mode); 0 derives one");
+DEFINE_int32(thread_num, 100, "Number of concurrent senders (closed mode)");
+DEFINE_int32(warmup, 10, "Seconds of traffic discarded before measuring");
+DEFINE_int32(measure, 30, "Seconds recorded");
+DEFINE_int32(drain_timeout, 10, "Seconds to wait for in-flight replies after the window closes");
+DEFINE_string(pace, "spin", "open mode wait strategy between sends: spin or park");
+DEFINE_string(hdr_out, "", "Write a percentile report here");
 
 namespace {
 
-std::atomic<int> gSucceeded{0};
-std::atomic<int> gFailed{0};
-std::atomic<int> gCompleted{0};
+// One delta per sequence number, deterministic (not random) so that
+// concurrent closed-loop sender threads never share mutable RNG state
+// — the actual value submitted plays no role in the measurement.
+std::int64_t deltaFor(std::int64_t sequence) { return (sequence % 201) - 100; }
 
-struct RequestContext {
-  brpc::Controller cntl;
-  sequencer::gateway::input::proto::SubmitRequest request;
-  sequencer::gateway::input::proto::SubmitResponse response;
-};
-
-// brpc::NewCallback's closure self-deletes after this runs (see
-// brpc/callback.h) — RequestContext is a separate allocation this
-// function owns and must free itself.
-void onRpcDone(RequestContext* rawCtx) {
-  std::unique_ptr<RequestContext> ctx(rawCtx);
-  if (ctx->cntl.Failed()) {
-    gFailed.fetch_add(1, std::memory_order_relaxed);
-  } else {
-    gSucceeded.fetch_add(1, std::memory_order_relaxed);
+class SubmitRequester : public sequencer::bench::LoadGeneratorRequester {
+ public:
+  explicit SubmitRequester(std::string inputGatewayAddr) {
+    brpc::ChannelOptions options;
+    options.timeout_ms = 2000;
+    CHECK_EQ(0, channel_.Init(inputGatewayAddr.c_str(), &options))
+        << "failed to connect to " << inputGatewayAddr;
   }
-  gCompleted.fetch_add(1, std::memory_order_relaxed);
-}
+
+  void send(std::int64_t sequence, std::function<void(bool ok)> onDone) override {
+    sequencer::gateway::input::proto::SubmitService_Stub stub(&channel_);
+    auto* ctx = new Context();
+    ctx->onDone = std::move(onDone);
+    ctx->cntl.request_attachment().append("{\"delta\": " + std::to_string(deltaFor(sequence)) + "}");
+    stub.Submit(&ctx->cntl, &ctx->request, &ctx->response, brpc::NewCallback(&onRpcDone, ctx));
+  }
+
+ private:
+  struct Context {
+    brpc::Controller cntl;
+    sequencer::gateway::input::proto::SubmitRequest request;
+    sequencer::gateway::input::proto::SubmitResponse response;
+    std::function<void(bool ok)> onDone;
+  };
+
+  // brpc::NewCallback's closure self-deletes after this runs; `ctx` is
+  // a separate allocation this function owns and must free itself.
+  static void onRpcDone(Context* rawCtx) {
+    std::unique_ptr<Context> ctx(rawCtx);
+    const bool ok = !ctx->cntl.Failed();
+    ctx->onDone(ok);
+  }
+
+  brpc::Channel channel_;
+};
 
 }  // namespace
 
@@ -62,44 +82,24 @@ int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   if (FLAGS_input_gateway_addr.empty()) {
-    std::cerr << "load_generator: --input_gateway_addr is required" << std::endl;
+    LOG(ERROR) << "load_generator: --input_gateway_addr is required";
     return 1;
   }
 
-  brpc::Channel channel;
-  brpc::ChannelOptions channelOptions;
-  channelOptions.timeout_ms = 2000;
-  if (channel.Init(FLAGS_input_gateway_addr.c_str(), &channelOptions) != 0) {
-    std::cerr << "load_generator: failed to connect to " << FLAGS_input_gateway_addr << std::endl;
-    return 1;
-  }
-  sequencer::gateway::input::proto::SubmitService_Stub stub(&channel);
+  SubmitRequester requester(FLAGS_input_gateway_addr);
 
-  std::mt19937_64 rng(std::random_device{}());
-  std::uniform_int_distribution<std::int64_t> deltaDist(-100, 100);
+  sequencer::bench::LoadGeneratorConfig config;
+  config.mode = FLAGS_mode;
+  config.rate = FLAGS_rate;
+  config.burst = FLAGS_burst;
+  config.maxInflight = FLAGS_max_inflight;
+  config.threadNum = FLAGS_thread_num;
+  config.warmupSeconds = FLAGS_warmup;
+  config.measureSeconds = FLAGS_measure;
+  config.drainTimeoutSeconds = FLAGS_drain_timeout;
+  config.pace = FLAGS_pace;
+  config.hdrOut = FLAGS_hdr_out;
 
-  const auto start = std::chrono::steady_clock::now();
-  const std::chrono::duration<double> interval(FLAGS_rate > 0 ? 1.0 / FLAGS_rate : 0.0);
-
-  for (int i = 0; i < FLAGS_count; ++i) {
-    if (FLAGS_rate > 0) {
-      std::this_thread::sleep_until(start + i * interval);
-    }
-
-    const std::string body = "{\"delta\": " + std::to_string(deltaDist(rng)) + "}";
-    auto* ctx = new RequestContext();
-    ctx->cntl.request_attachment().append(body);
-    stub.Submit(&ctx->cntl, &ctx->request, &ctx->response, brpc::NewCallback(&onRpcDone, ctx));
-  }
-
-  while (gCompleted.load(std::memory_order_relaxed) < FLAGS_count) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-
-  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  std::cout << "load_generator: sent=" << FLAGS_count << " succeeded=" << gSucceeded.load()
-            << " failed=" << gFailed.load() << " elapsed=" << seconds << "s"
-            << " throughput=" << (seconds > 0 ? FLAGS_count / seconds : 0.0) << " req/s" << std::endl;
-
-  return gFailed.load() > 0 ? 1 : 0;
+  sequencer::bench::LoadGenerator generator(requester, config);
+  return generator.run() ? 0 : 1;
 }
