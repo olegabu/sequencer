@@ -30,9 +30,26 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      # Pinned to vcpkg.json's own builtin-baseline commit, not vcpkg's
+      # moving HEAD. vcpkg.json pins *port* versions via that baseline,
+      # but an unpinned vcpkg CLI checkout still pulls whatever tool
+      # versions vcpkg's own scripts/vcpkg-tools.json currently
+      # specifies (its bundled CMake, notably) — and those drift
+      # independently of the baseline as vcpkg's own repo moves
+      # forward. That drift broke every CI run so far: a newer bundled
+      # CMake (4.4.0) hard-rejects a `-Werror=old-style-cast` argument
+      # the old, baseline-pinned `benchmark` port (v1.9.1) passes it,
+      # something older CMake versions tolerated. Checking out the
+      # exact baseline commit keeps the whole toolchain — port
+      # versions and the tool that builds them — reproducible together,
+      # matching how local development here has worked all along
+      # (nobody's local vcpkg checkout has ever been `git pull`ed past
+      # this commit).
       - name: Bootstrap vcpkg
         run: |
+          baseline=$(jq -r '.["builtin-baseline"]' vcpkg.json)
           git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          git -C "$HOME/vcpkg" checkout "$baseline"
           "$HOME/vcpkg/bootstrap-vcpkg.sh"
           echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
 
