@@ -111,18 +111,38 @@ atomically).
 clients ──REST/FIX/WS/gRPC/brpc──► INPUT GATEWAYS ──Propose(bytes)──► NODES [harness + state machine]
                                                                         │ each node writes
                                                                         ▼
-                                                                     JOURNAL (memory-mapped file pair)
-                                                                        │ colocated mmap read, one process only
-                                                                        ▼
-                                                                RELAY GATEWAY (§3.3, §8.2)
-                                                                 re-serves Subscribe over the
-                                                                 network, unmodified, at scale
-                                                                         │ Subscribe (remote)
-                                            ┌────────────────────────────┴──────────────┐
-                                            ▼                                            ▼
-                                  OUTPUT GATEWAYS (WS/FIX/gRPC/brpc)               SIGNING GATEWAY
-                                  results disseminated to clients                  Merkle roots + proofs
+                                            JOURNAL (memory-mapped file pair)
+                         colocated mmap read, same machine as the node (§3.3)
+                                   ┌────────────────────────────────┼────────────────────────────────┐
+                                   ▼                                ▼                                ▼
+                        OUTPUT GATEWAYS (§8.3)         RELAY GATEWAY (§3.3, §8.2)         SIGNING GATEWAY (§8.4)
+                      brpc Stream / WebSocket /      re-serves Subscribe verbatim,
+                        real gRPC (§8.7, §8.9)       over real gRPC streaming (§8.9)       Merkle roots + proofs
+                                   ▼                                ▼                                ▼
+                             end clients             OTHER GATEWAYS, other machines             verifiers
+                        (browsers, any brpc or       (redundancy, scale, any gRPC-
+                          real-gRPC client)             capable language — §8.9)            (inclusion proofs)
 ```
+
+This phase's actual deployment: output gateways, the relay gateway, and
+the signing gateway all run **colocated with the node**, on the same
+machine, each independently memory-mapping the same journal — three
+readers, no coordination between them, exactly the "any number of
+independent, concurrent readers" journal was built for (§6.4). The
+output gateway and signing gateway disseminate to *their own* audiences
+directly from there (three interchangeable transports on the output
+side — §8.7, §8.9 — and signed roots/proofs on the signing side, §8.4).
+The relay gateway's own audience is different in kind: not end clients,
+but **other gateway processes on other machines** — a second output
+gateway, a second signing gateway, or any other journal consumer that
+would otherwise have to be colocated too. It reaches them over **real
+gRPC streaming** specifically (§8.9) because that is the one transport
+in this stack any of those other machines can speak regardless of what
+language they are written in, without also needing a colocated
+memory-map or brpc's own client library. §3.3 below covers the
+structural reasoning; §8.9 covers why gRPC is the specific mechanism,
+and why it had to be a second, separate transport from brpc's own
+Streaming RPC rather than an extension of it.
 
 Nodes never speak client protocols. Gateways are stateless translators
 outside the replication group (contracts: §8). Any replica's journal
@@ -841,11 +861,17 @@ the brpc library, and needs no additional dependency regardless of which
 of those three protocols a client uses.
 
 An output gateway's transport depends on its audience. brpc's own
-full-duplex **Streaming RPC** (and gRPC server-streaming over H2) are
-genuine streaming mechanisms and a natural, zero-additional-dependency
-choice for consumers that are themselves brpc- or gRPC-aware — an
-internal analytics pipeline, or the signing gateway subscribing to a
-remote node. brpc does **not**, however, implement the WebSocket
+full-duplex **Streaming RPC** is a genuine streaming mechanism and a
+natural, zero-additional-dependency choice for consumers that are
+themselves brpc-aware — an internal analytics pipeline, or the signing
+gateway subscribing to a remote node. This is *not* the same thing as
+gRPC-protocol streaming, despite brpc's own gRPC compatibility: the
+"gRPC on one port" an input gateway serves above is **unary-call-only**.
+brpc's Streaming RPC is a `baidu_std`-protocol-specific mechanism, not
+consumable by a real gRPC client at all — §8.9 covers this distinction
+in full, and the second, genuinely gRPC-wire-compatible transport built
+alongside it for consumers that need one. brpc does **not**, however,
+implement the WebSocket
 protocol (RFC 6455) — it is not among brpc's supported protocols, and
 while brpc's protocol set is extensible via a plugin mechanism,
 implementing the WebSocket handshake and frame format as a brpc protocol
@@ -885,6 +911,74 @@ gateway instances are meant to consume a relay's `Subscribe` stream
 rather than a node's directly (§3.3, §8.3); reading a node's journal
 colocated is the allowance for local development and small deployments
 (§3), not the target architecture at scale.
+
+Both gateways' `Subscribe` is additionally reachable over real gRPC
+streaming, alongside `brpc::Stream`, not instead of it — see §8.9. The
+comparison above is unchanged by which wire protocol carries it: a
+relay is still infrastructure, an output gateway is still where meaning
+enters, regardless of whether the bytes travel over `brpc::Stream` or
+real gRPC.
+
+### 8.9 Real gRPC streaming, alongside brpc's own — for reach beyond this stack
+
+§8.7 already distinguishes brpc's gRPC compatibility (unary calls,
+native, zero extra dependency) from brpc's own Streaming RPC (a
+`baidu_std`-protocol-specific mechanism, not gRPC-wire-compatible
+despite the name similarity). That gap matters concretely once the
+diagram in §3 is taken seriously: a relay gateway's whole purpose is
+letting **other gateway processes on other machines** consume the
+journal without ever touching a node (§3.3) — and some of those other
+processes will not be written in C++, will not link brpc, and will
+have no way to speak `baidu_std` at all. brpc's own upstream confirms
+this gap is not a documentation oversight but a genuinely unimplemented
+capability: ["BRPC兼容GRPC
+stream"](https://github.com/apache/brpc/issues/1589) is an open,
+unresolved feature request against brpc itself, not a shipped one.
+Real, standard gRPC — with mature client libraries in essentially every
+mainstream language, unlike brpc's much narrower client ecosystem — is
+the one transport a relay's remote audience can be assumed to reach it
+with regardless of what they are written in. This is why the §3
+diagram routes the relay's outbound arrow through gRPC specifically,
+not through brpc::Stream: reach beyond this stack is the entire reason
+that hop exists.
+
+Two components, additive to everything above — nothing existing
+changes, and both remain opt-in:
+
+**`GrpcOutputTransport`** (`gateway/output/`) is a second, real-gRPC
+implementation of the same `OutputTransport` interface §8.5 already
+defines, alongside the chassis's default `BrpcStreamTransport` and the
+WebSocket transport §8.7 describes — an application picks one via
+`RunOutputGateway`'s transport-factory argument, unchanged from before.
+Like the WebSocket transport, its wire message is a generic bytes
+envelope (`OutputRecord{bytes payload}`), not application-specific
+fields: the chassis never interprets an `OutputCodec`'s bytes, so
+routing them through a different transport must not change that. A
+separate library target, so an application that wants neither gRPC nor
+WebSocket never pulls in either dependency just by linking the chassis.
+
+**A second `RelayService`**, real-gRPC, served by the same
+`sequencer_relay` stock binary (§8.2) alongside its existing
+`brpc::Stream`-based one — on a **separate port**, gated by a
+`--grpc_listen_port` flag that defaults to disabled. Two, not one,
+because a real `grpc::Server` and brpc's own server (which is what
+serves the existing `RelayService`, per §3.1) are two structurally
+separate server stacks that cannot share one port the way brpc's own
+baidu_std/REST/gRPC-unary triad does (§3.1, §8.7) — brpc's gRPC
+compatibility is a protocol brpc's *own* server speaks, not a bridge to
+a second, independent gRPC server implementation. The contract being
+served is identical either way: `Subscribe(fromSequenceNumber)`,
+byte-identical raw records, any starting sequence number, one
+independent cursor per subscriber (§8.2) — the wire protocol is the
+only thing that differs between the two `RelayService` instances a
+`sequencer_relay` process can serve at once.
+
+**Server reflection is enabled** on both components
+(`grpc::reflection::InitProtoReflectionServerBuilderPlugin`), so a
+generic gRPC tool such as `grpcurl` needs no `.proto` file of its own
+to call either — a deliberate ergonomic choice, and one more concrete
+point of contrast with brpc, which implements neither gRPC streaming
+nor gRPC's reflection service.
 
 ## 9. Repository layout and build tooling
 
