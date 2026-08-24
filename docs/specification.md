@@ -980,6 +980,92 @@ to call either — a deliberate ergonomic choice, and one more concrete
 point of contrast with brpc, which implements neither gRPC streaming
 nor gRPC's reflection service.
 
+### 8.10 Fully-typed gateways: bypassing the generic chassis, and where FIX would fit
+
+Not sketched or built yet, unlike §8.9 — recorded here as a worked
+design, and as the general pattern behind it, for the next time a
+protocol doesn't fit the byte-opaque chassis cleanly.
+
+**The pattern already exists, on the input side, today.**
+`InputCodec`'s whole point (§8.5, §8.6) is that `RunInputGateway`'s
+chassis never interprets a request's bytes — but some protocols carry
+distinct, named fields at the transport layer itself, not just in a
+body a codec parses, and there is no way to express that through a
+codec plugged into a chassis built around `Payload body` in,
+`Bytes` out. `examples/counter/grpc_input_gateway_main.cpp` is exactly
+this case: a real gRPC `CounterSubmitService.SubmitDelta(int64 delta)
+→ {sequence_number, total}` needs `delta` to be an actual protobuf
+field grpcurl and any generated client can see and set — not a JSON
+blob inside an opaque body — which `RunInputGateway` cannot serve no
+matter what `InputCodec` is handed to it. Rather than force-fit this
+into the chassis or duplicate leader-following from scratch, it
+bypasses `RunInputGateway`/`InputGatewayImpl` entirely and reuses only
+`gateway::input::detail::NodeProposer` — the chassis's own
+"find the current leader, follow redirects, retry" component,
+factored out precisely so a standalone gateway like this one can call
+it directly. Everything downstream of `propose()` (raft, journaling,
+acknowledgement) is exactly the same either way; only the request's
+own shape differs. **Output side never needs this bypass**, and this
+is not a coincidence: `OutputTransport` (§8.5, §8.7, §8.9) has been a
+real, byte-opaque extension point since before this repository had
+more than one transport, so a new one is added *by implementing the
+interface*, not by working around the chassis.
+
+**A FIX output transport fits the existing extension point directly.**
+`FixOutputTransport : public OutputTransport`, alongside
+`WebSocketOutputTransport` and `GrpcOutputTransport` — no new
+abstraction needed, same as those two. Its `toSession`/`broadcast`
+bytes stay opaque to the chassis exactly as every other transport's do
+(§8.6): what a `FixOutputCodec` would produce is a pre-built FIX
+message *body* (tag=value content), which the transport wraps with the
+session-layer fields a FIX engine owns (`MsgSeqNum`, `SendingTime`,
+`CheckSum`) before sending. One open question with no clean precedent
+elsewhere in this specification: FIX has no notion of a client
+"joining a topic" the way a WebSocket URL path or a gRPC
+`SubscribeRequest` field does — a FIX session is just a
+(`BeginString`, `SenderCompID`, `TargetCompID`) tuple established at
+logon. Two resolutions, neither built here: reuse FIX's own
+`MarketDataRequest` (a real, standard subscription message) if
+`broadcast`'s topic is naturally an instrument symbol; or keep the
+transport itself topic-agnostic — every logged-on session receives
+everything, and an application-level codec filters if it needs to —
+mirroring how the other two transports stay generic about routing.
+
+**A FIX input transport has the same two choices as the counter gRPC
+example above, at library scope instead of one application's scope.**
+Either (a) a fully-typed gateway exactly like
+`grpc_input_gateway_main.cpp`'s pattern — a small standalone binary
+wrapping a FIX engine's `Application` callbacks directly around
+`NodeProposer`, no `InputCodec` involved, correct and buildable today
+without touching `gateway/input`'s existing chassis at all; or (b) a
+new `InputTransport` interface mirroring `OutputTransport`'s shape —
+roughly, `start(listenPort, onRequest, onDisconnect)` /`stop()`, with
+`RunInputGateway` gaining a `transportFactory` overload exactly
+paralleling `RunOutputGateway`'s existing one (§8.5) — so that FIX (and
+any future fully-typed input protocol) composes with an arbitrary
+`InputCodec` the same way `FixOutputTransport` would compose with an
+arbitrary `OutputCodec`. (b) is the architecturally symmetric answer
+and the one worth building if more than one non-brpc input transport
+ever exists; (a) is strictly less work and ships sooner. Neither is
+built or specified further here.
+
+Either way, a FIX engine — not a hand-rolled session layer — should own
+`Logon`/`Logout`/`Heartbeat`/`TestRequest`/`ResendRequest` and
+sequence-number bookkeeping, the same reasoning behind Boost.Beast for
+WebSocket (§8.7) and the standard gRPC library for §8.9: pick a
+focused, purpose-built dependency for the protocol's own machinery
+rather than reimplement it. QuickFIX is the concrete candidate: the
+mature, widely-used open-source C++ FIX engine, and — checked directly
+against this repository's own pinned vcpkg baseline, not assumed —
+already available there as the `quickfix` port, depending only on
+`openssl` (already a dependency of this repository, §9.1) beyond
+vcpkg's own tooling packages. `Application::onLogon`/`onLogout` map
+naturally onto `SessionId` creation/teardown and `InputCodec`'s own
+`onDisconnect` hook (§8.1's "propose a disconnect input on session
+loss") arguably better than brpc's implicit connection-close detection
+does, since a FIX logout is an explicit, named event rather than a
+socket merely going away.
+
 ## 9. Repository layout and build tooling
 
 ```
