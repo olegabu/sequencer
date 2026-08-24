@@ -39,11 +39,44 @@ first, per brpc's usual handshake pattern) to join a topic;
 `Fanout::broadcast` delivers to every session on that topic,
 `Fanout::toSession` to one specific session by id.
 
-This is what lets `examples/counter` plug in a WebSocket transport
-instead (§8.7 calls that out too, for browser-facing consumers) without
-touching the tailing loop at all — see
-[examples/counter/README.md](../../examples/counter/README.md)'s
-`WebSocketTransport`.
+This is what lets an application plug in a different transport entirely
+without touching the tailing loop at all — `WebSocketOutputTransport`
+below is exactly that, for browser-facing consumers (§8.7 calls this
+out too).
+
+## `WebSocketOutputTransport`: brpc has no WebSocket support of its own
+
+`include/sequencer/websocket_output_transport.hpp` +
+`src/websocket_output_transport.cpp`: an `OutputTransport` built on
+Boost.Beast instead of brpc's Streaming RPC, for any client speaking
+plain `ws://` — a browser, `websocat`, anything — with no brpc or
+protobuf tooling required (specification.md §8.7: "brpc does **not**...
+implement the WebSocket protocol"). A separate library target
+(`sequencer::gateway_output_websocket`), not folded into
+`sequencer_gateway_output` itself, so an application that doesn't want
+WebSocket never pulls in Boost.Beast/Asio just by linking the chassis —
+the same reason `evidence/` and `sdk/` are their own link targets
+rather than living inside `journal/`.
+
+Originally `examples/counter`'s own file (nothing else in this
+repository depends on something beyond brpc — see that example's
+README). Moved here once it became clear nothing about it was actually
+counter-specific, except one thing that had to change first:
+
+**Topic routing.** `Fanout::broadcast(topic, bytes)` needs to know
+which of a WebSocket transport's connected clients asked for `topic` —
+but WebSocket has no subscribe handshake of its own the way brpc's
+`Subscribe` RPC does (§8.5's plug interfaces assume one exists;
+WebSocket is just a raw bidirectional byte stream after the HTTP
+upgrade). The original counter-only version dodged this by hardcoding
+a single implicit topic ("totals", matching `CounterOutputCodec`'s only
+topic) that every connecting client joined regardless of what they
+asked for. The shared version instead takes the topic from the
+WebSocket URL's own request path, leading slash stripped:
+`ws://host:port/totals` joins "totals", `ws://host:port/alerts` joins
+"alerts", and `ws://host:port/` (no path) joins the empty-string topic,
+which simply never matches unless an application deliberately
+broadcasts to `""`.
 
 **Delivery is live only — there is no historical replay for a client
 that subscribes late.** A session only receives records published
@@ -129,10 +162,21 @@ B's total delivered sequence (its pre-restart segment plus its
 post-restart segment, concatenated) is byte-for-byte equal to gateway
 A's.
 
+`tests/websocket_output_transport_test.cpp` drives
+`WebSocketOutputTransport` with a real synchronous Beast client:
+
+| Case | Proves |
+|---|---|
+| `BroadcastDeliversToConnectedClient` | A connected client receives a broadcast to the topic it connected with. |
+| `MultipleMessagesArriveInOrder` | Several broadcasts arrive in order. |
+| `BroadcastToUnknownTopicIsANoOp` | Broadcasting to a topic with no subscribers is silent — no crash, no hang. |
+| `TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn` | Two clients connected to different URL paths each receive only their own topic's broadcasts — the path-based topic routing actually works, not just compiles. |
+
 ## Seeing it in action
 
 `examples/counter`'s `counter_output_gateway` is a real, runnable
-`RunOutputGateway` — see
+`RunOutputGateway` using `WebSocketOutputTransport` — see
 [examples/counter/README.md](../../examples/counter/README.md) for
 flags and a full worked example alongside its input gateway
-counterpart.
+counterpart, or `examples/counter/demo.sh` for a live walkthrough
+driven entirely by `curl` and `websocat`.

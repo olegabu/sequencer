@@ -38,32 +38,25 @@ add_executable(counter_input_gateway_main input_gateway_main.cpp)
 target_link_libraries(counter_input_gateway_main PRIVATE counter::codecs sequencer::gateway_input)
 set_target_properties(counter_input_gateway_main PROPERTIES OUTPUT_NAME counter_input_gateway)
 
-# specification.md §8.7: brpc has no native WebSocket support, so this
-# is the one place in the whole repository that depends on something
-# beyond brpc for transport — scoped to exactly this target, not the
-# top-level CMakeLists.txt, since nothing else needs it.
-find_package(boost_beast CONFIG REQUIRED)
-
-add_library(counter_websocket_transport STATIC
-  websocket_transport.cpp
-)
-add_library(counter::websocket_transport ALIAS counter_websocket_transport)
-target_include_directories(counter_websocket_transport PUBLIC
-  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
-)
-target_link_libraries(counter_websocket_transport
-  PUBLIC sequencer::gateway_output
-  PRIVATE Boost::beast
-)
-target_compile_features(counter_websocket_transport PUBLIC cxx_std_20)
-
+# specification.md §8.7's WebSocket OutputTransport (brpc has no native
+# WebSocket support) now lives in gateway/output/ — see that
+# component's CMakeLists.txt and README.md's "Topic routing" note for
+# why nothing here was actually counter-specific.
 add_executable(counter_output_gateway_main output_gateway_main.cpp)
-target_link_libraries(counter_output_gateway_main PRIVATE counter::codecs counter::websocket_transport sequencer::gateway_output)
+target_link_libraries(counter_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output_websocket sequencer::gateway_output)
 set_target_properties(counter_output_gateway_main PROPERTIES OUTPUT_NAME counter_output_gateway)
 
 add_executable(counter_load_generator_main load_generator_main.cpp)
 target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input unofficial::brpc::brpc-static gflags::gflags_static glog::glog)
 set_target_properties(counter_load_generator_main PROPERTIES OUTPUT_NAME counter_load_generator)
+
+# find_package(... CONFIG) targets are scoped to the calling directory
+# and its subdirectories, not the whole build — gateway/output/'s own
+# find_package(boost_beast) doesn't reach this sibling directory tree.
+# Still needed here directly: tests/end_to_end_test.cpp has its own
+# small Beast-based WebSocket test client (deliberately not shared with
+# gateway/output/tests/'s — see that file's comment for why).
+find_package(boost_beast CONFIG REQUIRED)
 
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)

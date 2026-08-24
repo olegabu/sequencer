@@ -41,26 +41,27 @@ each way, not worth pulling one in for.
 ## The output transport: WebSocket, not brpc Streaming
 
 `gateway/output/`'s chassis is transport-agnostic
-(`sequencer::OutputTransport`, see
-[gateway/output/README.md](../../gateway/output/README.md)); this
-example plugs in `WebSocketTransport` (`websocket_transport.hpp/.cpp`)
-instead of the chassis's built-in brpc-Streaming `BrpcStreamTransport`,
-so a browser can subscribe directly with no brpc client of its own —
-specification.md §8.7 calls out WebSocket as the other
-zero-additional-dependency choice, this time for browser-facing
-consumers, and Boost.Beast as the concrete library, scoped to just this
-target (`find_package(boost_beast CONFIG REQUIRED)` lives in this
-directory's `CMakeLists.txt`, not the top-level one — nothing else in
-the repository needs it).
+(`sequencer::OutputTransport`); this example plugs in
+`sequencer::WebSocketOutputTransport` instead of the chassis's built-in
+brpc-Streaming `BrpcStreamTransport`, so a browser can subscribe
+directly with no brpc client of its own — specification.md §8.7 calls
+out WebSocket as the other zero-additional-dependency choice, this time
+for browser-facing consumers.
 
-The implementation is one `boost::asio::io_context` running on a single
-dedicated thread, with every `websocket::stream` touched only from that
-thread — Beast's own documentation states plainly that a stream's
-"shared objects" are unsafe to touch concurrently, so `broadcast`/
-`toSession` (called from the tailing loop's thread) never write to a
-socket directly; they hand the message to the io-thread via
-`net::post()`, and a per-connection write queue (respecting Beast's
-"one outstanding write at a time" rule) does the actual send.
+That transport itself — its Beast implementation, thread-safety design,
+and path-based topic routing (`ws://host:port/totals` for this
+example's one topic) — now lives in
+[gateway/output/README.md](../../gateway/output/README.md), not here:
+it turned out to have nothing counter-specific about it once its one
+hardcoded assumption (a single implicit "totals" topic every client
+joined, regardless of what it asked for) was generalized, so it moved
+to `gateway/output/` for any application to reuse rather than
+reimplement. This example now just links
+`sequencer::gateway_output_websocket` and passes
+`WebSocketOutputTransport` to `RunOutputGateway`'s transport-factory
+overload in `output_gateway_main.cpp` — still "the one place the
+example depends on something beyond brpc" (§8.7), just via a shared
+dependency now instead of a private one.
 
 ## Testing
 
@@ -76,8 +77,7 @@ ctest --preset debug --output-on-failure
 | `three_node_smoke_test.cpp` | **Three real `counter_node` subprocesses** — the actual compiled binary, not a stand-in — forming a real raft group. Proposes several deltas, following leader redirects exactly as a gateway would (§8.1), then reads all three replicas' journal files directly and asserts they are **byte-for-byte identical** — the concrete proof behind §3's "replicas lag, never diverge." |
 | `replay_test.cpp` | Records a journal with the real `CounterStateMachine`, then replays it through a completely fresh instance via `tools/replay` and asserts byte-identical output — specification.md §11's determinism gate for this example, and what `.github/workflows/ci.yml` runs on every push. Complementary to `three_node_smoke_test.cpp`: that proves cross-*replica* determinism, this proves cross-*time* (record now, replay later, possibly after a rebuild) determinism — together, §2.1's full claim: "two replicas — or one replica and a later replay — produce byte-identical journals." |
 | `counter_codec_test.cpp` | Both codecs in isolation, no gateway or process involved: `CounterInputCodec` parsing valid/negative/whitespace-tolerant/missing-field/non-JSON bodies and building its response JSON; `CounterOutputCodec` broadcasting a record's total (and defaulting to `0` for a record with no outputs) to the `"totals"` topic of a recording `Fanout` test double. |
-| `websocket_transport_test.cpp` | `WebSocketTransport` against a real synchronous Beast client: a connected client receives a broadcast, several broadcasts arrive in order, and broadcasting to a topic with no subscribers is a silent no-op. Stress-tested well beyond a single clean run while chasing the thread-safety redesign below. |
-| `end_to_end_test.cpp` | The full pipeline, four real processes (`counter_node`, `counter_input_gateway`, `counter_output_gateway`, plus a test WebSocket client) and one real submitting `brpc::Channel`: submits three deltas through the input gateway, asserts each synchronous response and each WebSocket broadcast carry the identical, correctly-accumulating `{"sequence_number":N,"total":M}` JSON — specification.md §15 item 6's deliverable, and the closest thing in this repository to a full deployment. Verified with 10+ consecutive clean runs beyond its first pass, following this session's pattern for anything involving subprocesses and networking. |
+| `end_to_end_test.cpp` | The full pipeline, four real processes (`counter_node`, `counter_input_gateway`, `counter_output_gateway`, plus a test WebSocket client connecting to the `"totals"` topic) and one real submitting `brpc::Channel`: submits three deltas through the input gateway, asserts each synchronous response and each WebSocket broadcast carry the identical, correctly-accumulating `{"sequence_number":N,"total":M}` JSON — specification.md §15 item 6's deliverable, and the closest thing in this repository to a full deployment. Verified with 10+ consecutive clean runs beyond its first pass, following this session's pattern for anything involving subprocesses and networking. |
 | `kill_leader_drill_test.cpp` | specification.md §14's acceptance-checklist items 2 and 5: a real 3-node cluster, a client proposing continuously exactly as an input gateway would (follow redirects, retry on failure), and an abrupt `SIGKILL` — of the leader in one test, of a follower in the other — while load is in flight. Verifies dense sequence numbers straight through the fault, byte-for-byte agreement between every surviving (and the killed node's own already-committed) journal, and continued commits after the kill. Deliberately never asserts an exact post-kill total — see the file's own header comment for why, given `CounterStateMachine` has no idempotency-key deduplication. |
 
 ## A real bug this test caught
@@ -181,8 +181,11 @@ specification.md §12's load-testing guidance),
 ```
 
 with `curl` and `websocat` exactly as `demo.sh` does (see its
-`SubmitService/Submit` URL and `-n`/`--no-close` flag for the two
-details easy to get wrong by hand), or with any brpc client (or
+`SubmitService/Submit` URL, its `-n`/`--no-close` flag, and its
+`/totals` path on the WebSocket URL — `WebSocketOutputTransport` routes
+a connecting client's topic from the URL path, so `ws://host:port/`
+with no path joins nothing this codec ever broadcasts to — for the
+three details easy to get wrong by hand), or with any brpc client (or
 `end_to_end_test.cpp`'s `submitDelta` for the exact shape).
 
 Once a node has proposed a few deltas, its data directory holds a real

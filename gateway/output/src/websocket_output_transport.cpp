@@ -1,10 +1,11 @@
-#include "websocket_transport.hpp"
+#include <sequencer/websocket_output_transport.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/beast/websocket.hpp>
 
 #include <deque>
@@ -27,23 +28,29 @@
 // boost::asio::post the actual write onto that thread instead.
 
 namespace beast = boost::beast;
+namespace http = beast::http;
 namespace websocket = beast::websocket;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-namespace sequencer::examples::counter {
+namespace sequencer {
 
 namespace {
 
 class Connection : public std::enable_shared_from_this<Connection> {
  public:
-  Connection(tcp::socket socket, sequencer::SessionId sessionId, WebSocketTransport::Impl& transport)
+  Connection(tcp::socket socket, SessionId sessionId, WebSocketOutputTransport::Impl& transport)
       : ws_(std::move(socket)), sessionId_(sessionId), transport_(transport) {}
 
-  sequencer::SessionId sessionId() const { return sessionId_; }
+  SessionId sessionId() const { return sessionId_; }
 
   void start() {
-    ws_.async_accept([self = shared_from_this()](beast::error_code ec) { self->onAccept(ec); });
+    // Read the HTTP upgrade request ourselves, rather than the
+    // one-step ws_.async_accept(), so the request target (URL path) is
+    // available first — that's where a connecting client's topic
+    // comes from (see this header's file comment).
+    http::async_read(ws_.next_layer(), buffer_, request_,
+                      [self = shared_from_this()](beast::error_code ec, std::size_t) { self->onReadRequest(ec); });
   }
 
   // Only ever called on the io_context's own thread (via net::post),
@@ -61,6 +68,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   }
 
  private:
+  void onReadRequest(beast::error_code ec);
   void onAccept(beast::error_code ec);
   void doRead();
   void onRead(beast::error_code ec);
@@ -68,33 +76,30 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
   websocket::stream<tcp::socket> ws_;
   beast::flat_buffer buffer_;
-  sequencer::SessionId sessionId_;
-  WebSocketTransport::Impl& transport_;
+  http::request<http::string_body> request_;
+  SessionId sessionId_;
+  WebSocketOutputTransport::Impl& transport_;
   std::deque<std::shared_ptr<std::string>> writeQueue_;
   bool writing_ = false;
 };
 
 }  // namespace
 
-struct WebSocketTransport::Impl {
+struct WebSocketOutputTransport::Impl {
   net::io_context ioContext;
   std::unique_ptr<tcp::acceptor> acceptor;
   std::thread ioThread;
   bool stopping = false;
 
   std::mutex registryMutex;
-  std::unordered_map<sequencer::SessionId, std::shared_ptr<Connection>> sessionToConnection;
-  std::unordered_map<std::string, std::unordered_set<sequencer::SessionId>> topicToSessions;
-  std::atomic<sequencer::SessionId> nextSessionId{1};
-
-  // counter has exactly one implicit broadcast topic — every connected
-  // client joins it, matching CounterOutputCodec's own "totals" topic.
-  static constexpr const char* kTopic = "totals";
+  std::unordered_map<SessionId, std::shared_ptr<Connection>> sessionToConnection;
+  std::unordered_map<std::string, std::unordered_set<SessionId>> topicToSessions;
+  std::atomic<SessionId> nextSessionId{1};
 
   void doAccept() {
     acceptor->async_accept([this](beast::error_code ec, tcp::socket socket) {
       if (!ec) {
-        const sequencer::SessionId sessionId = nextSessionId.fetch_add(1, std::memory_order_relaxed);
+        const SessionId sessionId = nextSessionId.fetch_add(1, std::memory_order_relaxed);
         auto conn = std::make_shared<Connection>(std::move(socket), sessionId, *this);
         conn->start();
       }
@@ -104,13 +109,13 @@ struct WebSocketTransport::Impl {
     });
   }
 
-  void registerConnection(const std::shared_ptr<Connection>& conn) {
+  void registerConnection(const std::shared_ptr<Connection>& conn, const std::string& topic) {
     std::lock_guard<std::mutex> lock(registryMutex);
     sessionToConnection[conn->sessionId()] = conn;
-    topicToSessions[kTopic].insert(conn->sessionId());
+    topicToSessions[topic].insert(conn->sessionId());
   }
 
-  void deregisterConnection(sequencer::SessionId sessionId) {
+  void deregisterConnection(SessionId sessionId) {
     std::lock_guard<std::mutex> lock(registryMutex);
     sessionToConnection.erase(sessionId);
     for (auto& [topic, sessions] : topicToSessions) {
@@ -118,7 +123,7 @@ struct WebSocketTransport::Impl {
     }
   }
 
-  void postWrite(sequencer::SessionId sessionId, std::shared_ptr<std::string> message) {
+  void postWrite(SessionId sessionId, std::shared_ptr<std::string> message) {
     std::shared_ptr<Connection> conn;
     {
       std::lock_guard<std::mutex> lock(registryMutex);
@@ -132,18 +137,27 @@ struct WebSocketTransport::Impl {
   }
 };
 
+void Connection::onReadRequest(beast::error_code ec) {
+  if (ec) {
+    return;  // client disconnected before finishing the handshake
+  }
+  ws_.async_accept(request_, [self = shared_from_this()](beast::error_code ec) { self->onAccept(ec); });
+}
+
 void Connection::onAccept(beast::error_code ec) {
   if (ec) {
     return;  // handshake failed; nothing was registered, nothing to undo
   }
-  transport_.registerConnection(shared_from_this());
+  std::string topic(request_.target());
+  if (!topic.empty() && topic.front() == '/') {
+    topic.erase(0, 1);
+  }
+  transport_.registerConnection(shared_from_this(), topic);
   doRead();
 }
 
 void Connection::doRead() {
-  ws_.async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t) {
-    self->onRead(ec);
-  });
+  ws_.async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t) { self->onRead(ec); });
 }
 
 void Connection::onRead(beast::error_code ec) {
@@ -175,17 +189,17 @@ void Connection::writeNext() {
                   });
 }
 
-WebSocketTransport::WebSocketTransport() : impl_(std::make_unique<Impl>()) {}
-WebSocketTransport::~WebSocketTransport() = default;
+WebSocketOutputTransport::WebSocketOutputTransport() : impl_(std::make_unique<Impl>()) {}
+WebSocketOutputTransport::~WebSocketOutputTransport() = default;
 
-void WebSocketTransport::start(int listenPort) {
+void WebSocketOutputTransport::start(int listenPort) {
   impl_->acceptor = std::make_unique<tcp::acceptor>(
       impl_->ioContext, tcp::endpoint(tcp::v4(), static_cast<unsigned short>(listenPort)));
   impl_->doAccept();
   impl_->ioThread = std::thread([this] { impl_->ioContext.run(); });
 }
 
-void WebSocketTransport::stop() {
+void WebSocketOutputTransport::stop() {
   // Everything that touches acceptor_/a connection's stream must run on
   // the io thread — including telling it to stop accepting and to close
   // every live connection. Block until that has actually happened
@@ -216,14 +230,14 @@ void WebSocketTransport::stop() {
   }
 }
 
-void WebSocketTransport::toSession(sequencer::SessionId owner, Bytes bytes) {
+void WebSocketOutputTransport::toSession(SessionId owner, Bytes bytes) {
   auto message = std::make_shared<std::string>(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   impl_->postWrite(owner, std::move(message));
 }
 
-void WebSocketTransport::broadcast(const std::string& topic, Bytes bytes) {
+void WebSocketOutputTransport::broadcast(const std::string& topic, Bytes bytes) {
   auto message = std::make_shared<std::string>(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  std::vector<sequencer::SessionId> targets;
+  std::vector<SessionId> targets;
   {
     std::lock_guard<std::mutex> lock(impl_->registryMutex);
     const auto it = impl_->topicToSessions.find(topic);
@@ -232,9 +246,9 @@ void WebSocketTransport::broadcast(const std::string& topic, Bytes bytes) {
     }
     targets.assign(it->second.begin(), it->second.end());
   }
-  for (sequencer::SessionId sessionId : targets) {
+  for (SessionId sessionId : targets) {
     impl_->postWrite(sessionId, message);
   }
 }
 
-}  // namespace sequencer::examples::counter
+}  // namespace sequencer

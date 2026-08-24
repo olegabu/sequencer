@@ -24,10 +24,6 @@ add_executable(counter_codec_test counter_codec_test.cpp)
 target_link_libraries(counter_codec_test PRIVATE counter::codecs GTest::gtest GTest::gtest_main)
 gtest_discover_tests(counter_codec_test)
 
-add_executable(websocket_transport_test websocket_transport_test.cpp)
-target_link_libraries(websocket_transport_test PRIVATE counter::websocket_transport GTest::gtest GTest::gtest_main Threads::Threads)
-gtest_discover_tests(websocket_transport_test)
-
 add_executable(kill_leader_drill_test kill_leader_drill_test.cpp)
 target_link_libraries(kill_leader_drill_test PRIVATE sequencer::node GTest::gtest GTest::gtest_main Threads::Threads)
 target_compile_definitions(kill_leader_drill_test PRIVATE

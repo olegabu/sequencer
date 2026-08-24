@@ -36,6 +36,31 @@ target_link_libraries(sequencer_gateway_output
 
 target_compile_features(sequencer_gateway_output PUBLIC cxx_std_20)
 
+# specification.md §8.7: brpc has no native WebSocket support, so a
+# WebSocket OutputTransport needs a separate library — Boost.Beast, per
+# §8.7's suggested choice. A separate target (not folded into
+# sequencer_gateway_output itself) so an application that doesn't want
+# WebSocket never pulls in Boost.Beast/Asio just by linking the
+# chassis. Originally examples/counter's own file; moved here once it
+# became clear nothing about it was actually counter-specific (see
+# README.md's "Topic routing" note for the one thing that had to change
+# to make that true) and every other application would otherwise have
+# to reimplement the same ~230 lines of Beast plumbing.
+find_package(boost_beast CONFIG REQUIRED)
+
+add_library(sequencer_gateway_output_websocket STATIC
+  src/websocket_output_transport.cpp
+)
+add_library(sequencer::gateway_output_websocket ALIAS sequencer_gateway_output_websocket)
+
+target_link_libraries(sequencer_gateway_output_websocket
+  PUBLIC
+    sequencer::gateway_output
+  PRIVATE
+    Boost::beast
+)
+target_compile_features(sequencer_gateway_output_websocket PUBLIC cxx_std_20)
+
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
