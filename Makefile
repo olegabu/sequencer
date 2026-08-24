@@ -13,9 +13,15 @@
 # standalone. Filter to one component's tests instead with
 # TEST_FILTER (see `make help`).
 
-VCPKG_ROOT ?= $(HOME)/workspace/vcpkg
+# Not defaulted to any particular path — every machine's vcpkg checkout
+# lives wherever its owner put it (see README.md's Prerequisites: you
+# clone it yourself and export VCPKG_ROOT, no fixed location is assumed
+# anywhere else in this repo). If it's already exported in your shell,
+# `?=` leaves it alone; check-vcpkg-root below fails loudly, not
+# silently, for any target that actually needs it and doesn't have it.
+VCPKG_ROOT ?=
 export VCPKG_ROOT
-export PATH := $(VCPKG_ROOT):$(PATH)
+export PATH := $(if $(VCPKG_ROOT),$(VCPKG_ROOT):)$(PATH)
 
 # Which CMakePresets.json preset the default (unsuffixed) targets use.
 PRESET ?= debug
@@ -27,7 +33,7 @@ ifneq ($(strip $(TEST_FILTER)),)
 CTEST_FLAGS += -R "$(TEST_FILTER)"
 endif
 
-.PHONY: help all configure build test clean prune distclean \
+.PHONY: help all check-vcpkg-root configure build test clean prune distclean \
         debug test-debug \
         release test-release \
         tsan test-tsan \
@@ -66,7 +72,23 @@ help:
 
 all: build
 
-configure:
+# A clearer failure than what's left to discover otherwise: with
+# VCPKG_ROOT empty, `cmake --preset` fails on a toolchain file path
+# missing its prefix ("Could not find toolchain file:
+# /scripts/buildsystems/vcpkg.cmake" — technically correct, not
+# exactly obvious), and prune/distclean would construct an absolute,
+# root-level path like /buildtrees from $(VCPKG_ROOT)/buildtrees and
+# hand it straight to `rm -rf`. Never actually a real risk — no such
+# directory exists — but exactly the shape of mistake not worth
+# leaving unguarded, especially in a Makefile target whose entire job
+# is deleting things.
+check-vcpkg-root:
+	@if [ -z "$(VCPKG_ROOT)" ]; then \
+		echo 'error: VCPKG_ROOT is not set. Export it first -- e.g. "export VCPKG_ROOT=/path/to/your/vcpkg/checkout" -- see README.md'"'"'s Prerequisites' >&2; \
+		exit 1; \
+	fi
+
+configure: check-vcpkg-root
 	cmake --preset $(PRESET)
 
 build: configure
@@ -133,7 +155,7 @@ endif
 # downloads/ together are usually a fraction of buildtrees/'s size)
 # that the disk saved isn't worth relitigating this — see distclean
 # below if you actually want a from-scratch vcpkg reset.
-prune:
+prune: check-vcpkg-root
 	@for preset in debug release tsan; do \
 		if [ -f build/$$preset/build.ninja ]; then \
 			echo "==> ninja -C build/$$preset -t clean (vcpkg_installed kept)"; \
@@ -151,6 +173,6 @@ prune:
 # wrong if that's lost too (a working `cmake --preset` reconfigure
 # breaking on the *next* run, not this one, which makes it a nasty one
 # to track down).
-distclean: clean
+distclean: clean check-vcpkg-root
 	rm -rf $(VCPKG_ROOT)/buildtrees $(VCPKG_ROOT)/packages
 	find $(VCPKG_ROOT)/downloads -mindepth 1 -maxdepth 1 ! -name tools -exec rm -rf {} +
