@@ -69,14 +69,28 @@ struct LoadGeneratorConfig {
 
 // What an application supplies: how to send one request, tagged with a
 // monotonically increasing `sequence` an implementation may use to
-// build deterministic content. `onDone(ok)` must be called exactly
-// once — synchronously before send() returns (fine for either loop
-// mode) or later from any thread (e.g. a brpc callback; required for
-// open mode, since scheduling would otherwise block on each reply).
+// build deterministic content. `sendTimeUs` is the *reference* send
+// time this request's latency will be measured from — the scheduled
+// instant in open mode (immune to coordinated omission), the actual
+// issue instant in closed mode — handed to the implementation (not
+// just kept internal to LoadGenerator) so it can independently
+// correlate this same request against a side channel using the exact
+// same time base LoadGenerator's own histogram uses, without
+// LoadGenerator needing to know that side channel exists — see
+// relay_observer.hpp's RelayObserver and examples/counter's
+// SubmitRequester for a concrete instance: the journal sequence
+// number a request is assigned isn't known until the response
+// arrives, so a requester that wants to correlate it against
+// something else (RelayObserver::recordSend) has to be the one
+// carrying `sendTimeUs` forward to that point, not LoadGenerator.
+// `onDone(ok)` must be called exactly once — synchronously before
+// send() returns (fine for either loop mode) or later from any thread
+// (e.g. a brpc callback; required for open mode, since scheduling
+// would otherwise block on each reply).
 class LoadGeneratorRequester {
  public:
   virtual ~LoadGeneratorRequester() = default;
-  virtual void send(std::int64_t sequence, std::function<void(bool ok)> onDone) = 0;
+  virtual void send(std::int64_t sequence, std::int64_t sendTimeUs, std::function<void(bool ok)> onDone) = 0;
 };
 
 // Runs synchronously — blocks for warmup + measure + drain, prints the
@@ -197,7 +211,7 @@ class LoadGenerator {
               std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - scheduled).count();
           hdr_record_value_atomic(lag_, lagUs < 1 ? 1 : lagUs);
         }
-        requester_.send(sequence, [this, scheduledUs](bool /*ok*/) {
+        requester_.send(sequence, scheduledUs, [this, scheduledUs](bool /*ok*/) {
           inflight_.fetch_sub(1, std::memory_order_relaxed);
           const std::int64_t nowUs =
               std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
@@ -229,8 +243,11 @@ class LoadGenerator {
           std::condition_variable cv;
           bool done = false;
           const auto sentAt = Clock::now();
+          const std::int64_t sentAtUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                             sentAt.time_since_epoch())
+                                             .count();
           const std::int64_t sequence = nextSequence_.fetch_add(1, std::memory_order_relaxed);
-          requester_.send(sequence, [&](bool /*ok*/) {
+          requester_.send(sequence, sentAtUs, [&](bool /*ok*/) {
             std::lock_guard<std::mutex> lock(m);
             done = true;
             cv.notify_one();

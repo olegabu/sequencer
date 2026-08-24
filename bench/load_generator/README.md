@@ -103,17 +103,55 @@ bare-braft product with no gateway or relay tier at all:
    both link the same braft library) — not a new client-observed round
    trip, and not built here.
 3. **Submission to receipt via the relay gateway, over the network, on
-   the same machine as the client** — not built here either. See the
-   design note this same conversation produced for the shape it would
-   take: a background real-gRPC `RelayService` subscriber, colocated
-   with the load generator itself (not a separate process, and not a
-   gateway at all — no codec, no client protocol translation, just a
-   `grpc::ClientReader<Record>` loop, exactly `relay_grpc_test.cpp`'s
-   own `TestGrpcRelayClient`), correlating arrivals against this
-   harness's own send-time table by sequence number — entirely within
-   the client box's one clock, so the result is directly, safely
-   comparable to (1) with no cross-machine clock-sync assumption. The
-   delta between (3) and (1) is specifically how much longer dissemination
-   to a remote, relay-fed consumer takes beyond the synchronous ack path
-   — a number none of raft-tests' other three products have any
-   equivalent of, since none of them have a relay-gateway concept.
+   the same machine as the client** — `relay_observer.hpp`'s
+   `RelayObserver`. A background real-gRPC `RelayService` subscriber,
+   colocated with the load generator itself (not a separate process,
+   and not a gateway at all — no codec, no client protocol
+   translation, just a `grpc::ClientReader<Record>` loop, exactly
+   `relay_grpc_test.cpp`'s own `TestGrpcRelayClient`), correlating
+   arrivals against this harness's own send-time table by journal
+   sequence number — entirely within the client box's one clock, so
+   the result is directly, safely comparable to (1) with no
+   cross-machine clock-sync assumption. The delta between (3) and (1)
+   is specifically how much longer dissemination to a remote,
+   relay-fed consumer takes beyond the synchronous ack path — a number
+   none of raft-tests' other three products have any equivalent of,
+   since none of them have a relay-gateway concept.
+
+   Opt in with `--relay_grpc_addr` (`examples/counter/load_generator_main.cpp`'s
+   flag — empty, the default, disables it and costs nothing). Prints a
+   second, separately-labeled summary (`relay_p50_us`, not `p50` —
+   deliberately, so `raft-tests/sweep/sweep.sh`'s whitespace-anchored
+   grep can never mistake one summary for the other regardless of
+   print order) after the main one.
+
+   **Thread synchronization, precisely, since this is the one place in
+   this harness two independent threads race on purpose:** the journal
+   sequence number a request was assigned isn't known until its
+   response arrives — well after the request was actually sent — so
+   `LoadGeneratorRequester::send()`'s `sendTimeUs` parameter exists
+   specifically to carry the *original* reference send time forward to
+   that point (see that method's own comment). Meanwhile the relay can
+   — and regularly does — deliver a record *before* the synchronous ack
+   finishes its own extra hop back through the input gateway, so
+   `RelayObserver::recordSend()` (called when the ack's journal
+   sequence number becomes known) and the subscriber thread's own read
+   of the same slot genuinely race, not just in theory. Resolved with
+   a lock-free ring buffer, one send-time slot and one tag slot per
+   sequence number (`recordSend()` publishes with a release store on
+   the tag; the subscriber's matching acquire load on the same tag
+   guarantees it observes a consistent send time, not a stale one, per
+   the standard release/acquire single-writer publish pattern), plus a
+   bounded wait-and-retry (spin briefly, then back off, capped at
+   100ms of wall-clock time — long enough to resolve a race against a
+   genuinely slow-tail ack, not just a fast one, since dropping those
+   early would bias percentiles by disproportionately excluding
+   exactly the slowest, most interesting samples) rather than an
+   immediate skip on the first check. The timestamp actually recorded
+   is captured the instant the record arrives, before any of that
+   waiting — so however long resolving the race takes never leaks into
+   the reported latency itself. Sized correctly (`--relay_ring_capacity`,
+   or the generous default derived from `--rate`/`--thread_num` and the
+   warmup/measure/drain window), no slot is ever reused within one run
+   at all, so there is no wraparound to reason about, only the
+   ring-too-small case the tag check guards against defensively.

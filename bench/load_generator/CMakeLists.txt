@@ -20,3 +20,29 @@ target_link_libraries(sequencer_bench_load_generator INTERFACE
   $<IF:$<TARGET_EXISTS:hdr_histogram::hdr_histogram>,hdr_histogram::hdr_histogram,hdr_histogram::hdr_histogram_static>
 )
 target_compile_features(sequencer_bench_load_generator INTERFACE cxx_std_20)
+
+# sequencer_bench_relay_observer — a separate, opt-in target (see
+# include/sequencer/bench/relay_observer.hpp's own file comment): pulls
+# in gRPC and gateway/relay's generated proto code, which an
+# application not comparing against the relay path has no reason to
+# link just for sequencer_bench_load_generator above.
+find_package(gRPC CONFIG REQUIRED)
+# See gateway/output/CMakeLists.txt's identical block: vcpkg's grpc port
+# embeds a duplicate of a few abseil translation units inside libgrpc.a,
+# colliding with the standalone libabsl_status.a also on the link line.
+set_property(TARGET gRPC::grpc++ APPEND PROPERTY
+  INTERFACE_LINK_OPTIONS "-Wl,--allow-multiple-definition")
+
+add_library(sequencer_bench_relay_observer INTERFACE)
+add_library(sequencer::bench_relay_observer ALIAS sequencer_bench_relay_observer)
+
+target_include_directories(sequencer_bench_relay_observer INTERFACE
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(sequencer_bench_relay_observer INTERFACE
+  sequencer::journal
+  sequencer::relay_grpc_proto
+  gRPC::grpc++
+  $<IF:$<TARGET_EXISTS:hdr_histogram::hdr_histogram>,hdr_histogram::hdr_histogram,hdr_histogram::hdr_histogram_static>
+)
+target_compile_features(sequencer_bench_relay_observer INTERFACE cxx_std_20)

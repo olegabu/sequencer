@@ -48,6 +48,7 @@ set_target_properties(counter_output_gateway_main PROPERTIES OUTPUT_NAME counter
 
 add_executable(counter_load_generator_main load_generator_main.cpp)
 target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::bench_load_generator
+                                                            sequencer::bench_relay_observer
                                                             unofficial::brpc::brpc-static gflags::gflags_static glog::glog)
 set_target_properties(counter_load_generator_main PROPERTIES OUTPUT_NAME counter_load_generator)
 

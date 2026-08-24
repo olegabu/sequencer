@@ -47,7 +47,6 @@ find_package(glog CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_subdirectory(journal)
-add_subdirectory(bench/load_generator)
 add_subdirectory(node)
 add_subdirectory(tools/replay)
 add_subdirectory(tools/dumper)
@@ -56,4 +55,7 @@ add_subdirectory(gateway/output)
 add_subdirectory(gateway/relay)
 add_subdirectory(evidence)
 add_subdirectory(sdk/cpp)
+# After gateway/relay: sequencer_bench_relay_observer links its
+# generated sequencer::relay_grpc_proto.
+add_subdirectory(bench/load_generator)
 add_subdirectory(examples/counter)
