@@ -25,6 +25,17 @@
 // gateway's own tailing thread) and each Subscribe() call's thread
 // drains — a plain mutex/condition_variable queue, not gRPC-specific
 // machinery.
+//
+// Batched, not one payload per Write() call: the original one-message-
+// per-Write() design measured ~1.66s p50 at 70k msg/s on a live fleet
+// (bench/load_generator's new output-gateway observer benchmark) —
+// the identical bottleneck class the relay's own gRPC Subscribe had
+// before its batching fix (see gateway/relay/README.md's "Batching
+// the gRPC stream" section), just reached this time via a per-session
+// push queue instead of a journal-tailing pull loop. Each drain now
+// takes everything already queued (up to a cap), not just the front
+// item — never delaying a send to wait for more to arrive, so a
+// caught-up session still gets exactly one payload per batch.
 
 namespace sequencer {
 
@@ -102,12 +113,16 @@ class GenericOutputServiceImpl final : public gateway::output::grpc_proto::Gener
 
   ::grpc::Status Subscribe(::grpc::ServerContext* context,
                             const gateway::output::grpc_proto::SubscribeRequest* request,
-                            ::grpc::ServerWriter<gateway::output::grpc_proto::OutputRecord>* writer) override {
+                            ::grpc::ServerWriter<gateway::output::grpc_proto::OutputRecordBatch>* writer) override {
     auto queue = std::make_shared<WriteQueue>();
     const SessionId sessionId = registry_.registerSession(request->topic(), queue);
 
+    // ~1024 messages per batch cap, matching the relay's own
+    // FLAGS_relay_max_batch_records default and reasoning — comfortably
+    // under gRPC's 4MB message cap for counter-sized payloads.
+    constexpr std::size_t kMaxBatch = 1024;
     while (!context->IsCancelled()) {
-      std::shared_ptr<std::string> message;
+      std::vector<std::shared_ptr<std::string>> batch;
       {
         std::unique_lock<std::mutex> lock(queue->mutex);
         // Bounded wait, not a plain wait(): needs to periodically
@@ -121,12 +136,16 @@ class GenericOutputServiceImpl final : public gateway::output::grpc_proto::Gener
           }
           continue;
         }
-        message = queue->queue.front();
-        queue->queue.pop_front();
+        while (!queue->queue.empty() && batch.size() < kMaxBatch) {
+          batch.push_back(std::move(queue->queue.front()));
+          queue->queue.pop_front();
+        }
       }
-      gateway::output::grpc_proto::OutputRecord record;
-      record.set_payload(*message);
-      if (!writer->Write(record)) {
+      gateway::output::grpc_proto::OutputRecordBatch recordBatch;
+      for (const auto& message : batch) {
+        recordBatch.add_payloads(*message);
+      }
+      if (!writer->Write(recordBatch)) {
         break;  // client gone
       }
     }

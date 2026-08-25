@@ -22,8 +22,20 @@ package sequencer.gateway.output.grpc_proto;
 // its own domain types instead — see examples/counter's
 // grpc_output_gateway_main.cpp for that alternative pattern, and its
 // README for the tradeoff between the two.
-message OutputRecord {
-  bytes payload = 1;
+//
+// Delivered as batches, not one payload per streamed message — see
+// gateway/output/src/grpc_output_transport.cpp's own file comment:
+// one payload per Write() was the same fixed-per-call-overhead
+// bottleneck the relay's own gRPC Subscribe had before its batching
+// fix (docs/specification.md and gateway/relay/README.md's "Batching
+// the gRPC stream" section), confirmed here too (a live-fleet
+// benchmark measured ~1.66s p50 at 70k msg/s with one payload per
+// Write(), vs low-single-digit-ms for this transport's siblings at
+// the same rate). Each batch carries whatever is already queued when
+// the server gets a chance to send — 1 payload when caught up (no
+// batching delay ever imposed), more only when genuinely behind.
+message OutputRecordBatch {
+  repeated bytes payloads = 1;
 }
 
 message SubscribeRequest {
@@ -34,5 +46,5 @@ message SubscribeRequest {
 }
 
 service GenericOutputService {
-  rpc Subscribe(SubscribeRequest) returns (stream OutputRecord);
+  rpc Subscribe(SubscribeRequest) returns (stream OutputRecordBatch);
 }

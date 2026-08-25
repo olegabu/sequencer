@@ -6,16 +6,13 @@
 // (gateway/output/proto/output_grpc.proto), the output-side counterpart
 // to RelayObserver's own gRPC subscription (relay_observer.hpp).
 //
-// Unlike the relay's Subscribe (proto/relay_grpc.proto), this transport
-// was never rewritten to batch multiple records per streamed message
-// (gateway/output/src/grpc_output_transport.cpp:109-129 — one
-// OutputRecord per Write()) — so this observer's own numbers may
-// themselves surface that transport's throughput ceiling, the same way
-// the relay's originally did before it was fixed. That's a legitimate
-// benchmark finding to report if the sweep shows it, not something to
-// pre-fix here; see examples/counter/README.md and
-// gateway/relay/README.md's own "Batching the gRPC stream" section for
-// the precedent.
+// This transport was originally one OutputRecord per Write(), same as
+// the relay's own gRPC Subscribe before its batching fix — this
+// observer's own benchmark numbers were what surfaced the bottleneck
+// (~1.66s p50 at 70k msg/s, live fleet), and
+// gateway/output/src/grpc_output_transport.cpp now batches for exactly
+// the reasons documented in gateway/relay/README.md's "Batching the
+// gRPC stream" section. Reads OutputRecordBatch here to match.
 
 #include <grpcpp/grpcpp.h>
 
@@ -105,13 +102,18 @@ class GrpcOutputObserver final : public OutputGatewayObserver {
   void readLoop() {
     gateway::output::grpc_proto::SubscribeRequest request;
     request.set_topic(topic_);
-    std::unique_ptr<grpc::ClientReader<gateway::output::grpc_proto::OutputRecord>> reader(
+    std::unique_ptr<grpc::ClientReader<gateway::output::grpc_proto::OutputRecordBatch>> reader(
         stub_->Subscribe(&context_, request));
 
-    gateway::output::grpc_proto::OutputRecord record;
-    while (reader->Read(&record)) {
+    gateway::output::grpc_proto::OutputRecordBatch batch;
+    while (reader->Read(&batch)) {
+      // Captured once per batch — every payload it carries arrived at
+      // effectively the same instant from this observer's point of
+      // view (see grpc_output_transport.cpp's own batching comment).
       const std::int64_t nowUs = nowMicros();
-      correlator_.deliver(record.payload(), nowUs);
+      for (const std::string& payload : batch.payloads()) {
+        correlator_.deliver(payload, nowUs);
+      }
     }
   }
 

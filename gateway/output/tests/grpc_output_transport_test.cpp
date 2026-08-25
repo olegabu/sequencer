@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -31,18 +32,32 @@ class TestGrpcClient {
     reader_ = stub_->Subscribe(&context_, request);
   }
 
+  // Reads span whatever batch shape the server happened to send them
+  // in (see grpc_output_transport.cpp's own batching comment) — doles
+  // out one payload at a time regardless, pulling a fresh
+  // OutputRecordBatch off the stream whenever the buffered one is
+  // exhausted.
   std::string readOne() {
-    gateway::output::grpc_proto::OutputRecord record;
-    if (!reader_->Read(&record)) {
-      throw std::runtime_error("stream ended before a record arrived");
+    if (bufferPos_ >= buffered_.size()) {
+      gateway::output::grpc_proto::OutputRecordBatch batch;
+      if (!reader_->Read(&batch)) {
+        throw std::runtime_error("stream ended before a record arrived");
+      }
+      buffered_.assign(batch.payloads().begin(), batch.payloads().end());
+      bufferPos_ = 0;
+      if (buffered_.empty()) {
+        throw std::runtime_error("server sent an empty OutputRecordBatch");
+      }
     }
-    return record.payload();
+    return buffered_[bufferPos_++];
   }
 
  private:
   grpc::ClientContext context_;
   std::unique_ptr<gateway::output::grpc_proto::GenericOutputService::Stub> stub_;
-  std::unique_ptr<grpc::ClientReader<gateway::output::grpc_proto::OutputRecord>> reader_;
+  std::unique_ptr<grpc::ClientReader<gateway::output::grpc_proto::OutputRecordBatch>> reader_;
+  std::vector<std::string> buffered_;
+  std::size_t bufferPos_ = 0;
 };
 
 Bytes bytesOf(const std::string& s) {
