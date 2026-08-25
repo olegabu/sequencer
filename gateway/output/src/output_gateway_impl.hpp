@@ -58,6 +58,13 @@ class OutputGatewayImpl {
     if (tailThread_.joinable()) {
       tailThread_.join();
     }
+    // The tailing thread only persists periodically now (see
+    // tailLoop()'s own comment) — one final, unconditional persist
+    // here is what keeps ResumesFromDurablePositionAfterRestart
+    // WithoutRedelivering's own guarantee exactly true for a graceful
+    // stop(), even though a batched write cadence means an ungraceful
+    // crash could now redeliver up to one batch's worth of records.
+    resumePosition_.store(nextSeq_);
     transport_->stop();
     started_ = false;
   }
@@ -67,7 +74,10 @@ class OutputGatewayImpl {
  private:
   void tailLoop() {
     std::uint64_t seq = resumePosition_.load();
+    nextSeq_.store(seq, std::memory_order_relaxed);
     std::unique_ptr<journal::JournalReader> reader;
+    std::uint64_t persistedThrough = seq;
+    auto lastPersist = std::chrono::steady_clock::now();
     while (!stopRequested_.load(std::memory_order_relaxed)) {
       if (!reader) {
         try {
@@ -84,11 +94,35 @@ class OutputGatewayImpl {
         continue;
       }
       // specification.md §8.3: "in sequence-number order... in order,
-      // exactly once." One codec call per record, strictly in order,
-      // with the resume position advanced only after the call returns.
+      // exactly once." One codec call per record, strictly in order.
       codec_->toOutput(reader->record(seq), *transport_);
       ++seq;
-      resumePosition_.store(seq);
+      nextSeq_.store(seq, std::memory_order_relaxed);
+
+      // Persisting the resume position is not free — ResumePosition::
+      // store() is a full open/write/close/rename cycle, several real
+      // filesystem syscalls — and doing that after literally every
+      // record made this the dominant cost of the whole tailing loop,
+      // reproduced live: an output gateway couldn't sustain even
+      // 10k records/sec of dissemination, falling permanently behind
+      // and never catching up within an entire benchmark run (see
+      // bench/load_generator/README.md's "four round trips" section
+      // and examples/counter/README.md's own account of finding this).
+      // Batched instead, the same "asynchronously flushed by default"
+      // choice this file's own top comment already describes for the
+      // journal but this method wasn't actually following: persist at
+      // most every 1000 records or 200ms, whichever comes first — a
+      // graceful stop() (below) always does one final, unconditional
+      // persist, so ResumesFromDurablePositionAfterRestartWithout
+      // Redelivering's own guarantee stays exactly true for a normal
+      // restart; only an ungraceful crash can now redeliver, bounded
+      // to at most one batch's worth of records.
+      const auto now = std::chrono::steady_clock::now();
+      if (seq - persistedThrough >= 1000 || now - lastPersist >= std::chrono::milliseconds(200)) {
+        resumePosition_.store(seq);
+        persistedThrough = seq;
+        lastPersist = now;
+      }
     }
   }
 
@@ -96,6 +130,7 @@ class OutputGatewayImpl {
   std::unique_ptr<sequencer::OutputCodec> codec_;
   std::unique_ptr<sequencer::OutputTransport> transport_;
   ResumePosition resumePosition_;
+  std::atomic<std::uint64_t> nextSeq_{1};  // mirrors tailLoop()'s own seq, readable from stop()
   std::thread tailThread_;
   std::atomic<bool> stopRequested_{false};
   bool started_ = false;
