@@ -211,8 +211,18 @@ class LoadGenerator {
               std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - scheduled).count();
           hdr_record_value_atomic(lag_, lagUs < 1 ? 1 : lagUs);
         }
-        requester_.send(sequence, scheduledUs, [this, scheduledUs](bool /*ok*/) {
+        requester_.send(sequence, scheduledUs, [this, scheduledUs](bool ok) {
           inflight_.fetch_sub(1, std::memory_order_relaxed);
+          if (!ok) {
+            // A failed request (channel error, rejection, timeout at
+            // the transport layer) can resolve far faster than a real
+            // round trip — recording it anyway would silently pull
+            // the histogram toward zero, exactly masquerading as a
+            // fast system rather than a broken one. See failed_'s own
+            // comment on printSummary()'s warning.
+            failed_.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
           const std::int64_t nowUs =
               std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
           record(nowUs - scheduledUs);
@@ -242,18 +252,27 @@ class LoadGenerator {
           std::mutex m;
           std::condition_variable cv;
           bool done = false;
+          bool succeeded = false;
           const auto sentAt = Clock::now();
           const std::int64_t sentAtUs = std::chrono::duration_cast<std::chrono::microseconds>(
                                              sentAt.time_since_epoch())
                                              .count();
           const std::int64_t sequence = nextSequence_.fetch_add(1, std::memory_order_relaxed);
-          requester_.send(sequence, sentAtUs, [&](bool /*ok*/) {
+          requester_.send(sequence, sentAtUs, [&](bool ok) {
             std::lock_guard<std::mutex> lock(m);
             done = true;
+            succeeded = ok;
             cv.notify_one();
           });
           std::unique_lock<std::mutex> lock(m);
           cv.wait(lock, [&] { return done; });
+          if (!succeeded) {
+            // See runOpenLoop's identical check: a failed request's
+            // fast local resolution must never be recorded as a real
+            // latency sample.
+            failed_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+          }
           const std::int64_t latencyUs =
               std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - sentAt).count();
           record(latencyUs);
@@ -303,14 +322,23 @@ class LoadGenerator {
     std::printf("completed            %ld\n", static_cast<long>(count));
     std::printf("achieved rate        %.0f req/s\n", achieved);
     std::printf("dropped-by-rig       %ld\n", static_cast<long>(dropped));
+    std::printf("failed               %ld\n", static_cast<long>(failed_.load(std::memory_order_relaxed)));
     std::printf("unanswered           %ld\n", static_cast<long>(inflight_.load(std::memory_order_relaxed)));
-    std::printf("latency us   p50      %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 50.0)));
-    std::printf("             p90      %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 90.0)));
-    std::printf("             p99      %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 99.0)));
-    std::printf("             p99.9    %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 99.9)));
-    std::printf("             p99.99   %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 99.99)));
-    std::printf("             max      %ld\n", static_cast<long>(hdr_max(measured_)));
-    std::printf("             mean     %ld\n", static_cast<long>(hdr_mean(measured_)));
+    if (count > 0) {
+      std::printf("latency us   p50      %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 50.0)));
+      std::printf("             p90      %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 90.0)));
+      std::printf("             p99      %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 99.0)));
+      std::printf("             p99.9    %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 99.9)));
+      std::printf("             p99.99   %ld\n", static_cast<long>(hdr_value_at_percentile(measured_, 99.99)));
+      std::printf("             max      %ld\n", static_cast<long>(hdr_max(measured_)));
+      std::printf("             mean     %ld\n", static_cast<long>(hdr_mean(measured_)));
+    } else {
+      // hdr_mean/hdr_max on an empty histogram return meaningless
+      // sentinel values (not 0) — printing those as if they were real
+      // numbers would be its own small version of this same class of
+      // bug (a fast, wrong number standing in for "no data").
+      std::printf("latency us   n/a (no successful completions)\n");
+    }
 
     if (isOpen && lag_->total_count > 0) {
       std::printf(
@@ -325,6 +353,18 @@ class LoadGenerator {
           "\nWARNING: %ld requests were never sent, so an offered rate of %ld req/s was not\n"
           "actually achieved. This run cannot be reported as such.\n",
           static_cast<long>(dropped), static_cast<long>(config_.rate));
+    }
+
+    const std::int64_t failed = failed_.load(std::memory_order_relaxed);
+    if (failed > 0) {
+      std::printf(
+          "\nWARNING: %ld requests came back failed (ok == false) and were excluded from the\n"
+          "latency histogram above. If this number is large relative to completed, do not\n"
+          "trust the percentiles: check the target is actually reachable and answering — a\n"
+          "systematic failure (wrong address, connection refused, an immediate rejection)\n"
+          "resolves fast and, before this check existed, silently pulled p50 toward zero\n"
+          "instead of showing up as an error.\n",
+          static_cast<long>(failed));
     }
 
     if (!isOpen && count > 0) {
@@ -360,6 +400,13 @@ class LoadGenerator {
   std::atomic<bool> stopReporter_{false};
   std::atomic<std::int64_t> inflight_{0};
   std::atomic<std::int64_t> dropped_{0};
+  // Requests actually sent that came back failed (ok == false) —
+  // distinct from dropped_ (never sent at all, backpressured by
+  // maxInflight). See printSummary()'s warning: a run with any of
+  // these cannot be reported as a real latency measurement, since
+  // it means an unknown fraction of "completed" would otherwise have
+  // been a fast local failure rather than a genuine round trip.
+  std::atomic<std::int64_t> failed_{0};
   std::atomic<std::int64_t> completed_{0};
   std::atomic<std::int64_t> nextSequence_{0};
   Clock::time_point measureStart_{};
