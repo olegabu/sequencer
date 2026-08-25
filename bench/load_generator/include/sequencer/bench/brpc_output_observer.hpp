@@ -120,14 +120,32 @@ class BrpcOutputObserver final : public OutputGatewayObserver, private brpc::Str
 
   // brpc::StreamInputHandler: fires on brpc's own I/O thread pool, not
   // a thread this class owns — captures the arrival instant once per
-  // callback invocation (every message in this batch arrived at
-  // effectively the same instant from this observer's point of view,
-  // same reasoning RelayObserver's own batch-read loop uses) and hands
-  // each message straight to the correlator, doing nothing else here.
+  // callback invocation (every payload delivered by this callback
+  // arrived at effectively the same instant from this observer's point
+  // of view, same reasoning RelayObserver's own batch-read loop uses)
+  // and hands each payload straight to the correlator, doing nothing
+  // else here. Each of the `size` messages may itself be a batch of
+  // several length-prefixed payloads — see StreamFanout::append()'s
+  // own comment (gateway/output/src/stream_fanout.hpp) for why a raw
+  // concatenation wouldn't decode correctly and what the 4-byte
+  // big-endian length prefix is for.
   int on_received_messages(brpc::StreamId, butil::IOBuf* const messages[], std::size_t size) override {
     const std::int64_t nowUs = nowMicros();
     for (std::size_t i = 0; i < size; ++i) {
-      correlator_.deliver(messages[i]->to_string(), nowUs);
+      const std::string blob = messages[i]->to_string();
+      std::size_t offset = 0;
+      while (offset + 4 <= blob.size()) {
+        const auto length = static_cast<std::uint32_t>(static_cast<unsigned char>(blob[offset]) << 24 |
+                                                          static_cast<unsigned char>(blob[offset + 1]) << 16 |
+                                                          static_cast<unsigned char>(blob[offset + 2]) << 8 |
+                                                          static_cast<unsigned char>(blob[offset + 3]));
+        offset += 4;
+        if (offset + length > blob.size()) {
+          break;  // truncated frame; shouldn't happen, drop rather than misparse
+        }
+        correlator_.deliver(blob.substr(offset, length), nowUs);
+        offset += length;
+      }
     }
     return 0;
   }

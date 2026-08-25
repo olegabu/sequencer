@@ -46,6 +46,13 @@ class BrpcStreamTransport : public sequencer::OutputTransport {
 
   void toSession(sequencer::SessionId owner, Bytes bytes) override { fanout_.toSession(owner, std::move(bytes)); }
   void broadcast(const std::string& topic, Bytes bytes) override { fanout_.broadcast(topic, std::move(bytes)); }
+  // Must forward explicitly: Fanout::flush()'s own default is a no-op,
+  // and this class doesn't inherit from StreamFanout — without this
+  // override, OutputGatewayImpl::tailLoop()'s transport_->flush() call
+  // (through the OutputTransport/Fanout base pointer it actually holds)
+  // never reaches StreamFanout::flush() at all, so nothing StreamFanout
+  // accumulates via append() ever actually gets sent.
+  void flush() override { fanout_.flush(); }
 
  private:
   StreamFanout fanout_;

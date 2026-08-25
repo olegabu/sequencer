@@ -6,6 +6,27 @@
 // consumers). A different Fanout (e.g. WebSocket, via Boost.Beast) can
 // be plugged in elsewhere without touching OutputCodec or the tailing
 // loop — this is just the one this chassis ships with.
+//
+// append()/flush() batch multiple toSession()/broadcast() payloads
+// into one brpc::StreamWrite() call (see flush()'s own comment for
+// why) — but brpc::Stream is message-oriented, not a raw byte stream:
+// on_received_messages() delivers whatever one StreamWrite() call
+// sent as one opaque unit, so simply concatenating several payloads'
+// raw bytes into one buffer would produce one corrupted, unparseable
+// "message" on the receiving end instead of several correct ones.
+// Each append() therefore writes its own 4-byte big-endian length
+// prefix ahead of the payload — the minimal framing that lets a batch
+// of N payloads still decode as N payloads, deliberately not a
+// protobuf envelope (unlike GrpcOutputTransport's own
+// OutputRecordBatch): this transport's whole point, per
+// specification.md §8.7 and this file's own header, is carrying an
+// OutputCodec's bytes completely unmodified, no envelope at all, for
+// consumers with no protobuf dependency of their own — the length
+// prefix is the smallest addition that preserves that while still
+// allowing a batch. gateway/output/include/sequencer/bench (this
+// repo's own benchmark observer) and gateway/output/tests/
+// collecting_stream_client.hpp both decode it; any other brpc client
+// of this transport needs to as well now.
 
 #include <brpc/stream.h>
 #include <butil/iobuf.h>
@@ -13,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -85,7 +107,7 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
       }
       streamId = it->second;
     }
-    write(streamId, bytes);
+    append(streamId, bytes);
   }
 
   void broadcast(const std::string& topic, Bytes bytes) override {
@@ -99,7 +121,35 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
       targets.assign(it->second.begin(), it->second.end());
     }
     for (brpc::StreamId streamId : targets) {
-      write(streamId, bytes);
+      append(streamId, bytes);
+    }
+  }
+
+  // Sends everything accumulated by append() since the last flush(),
+  // one brpc::StreamWrite() per stream that actually has pending data
+  // — not one per toSession()/broadcast() call. Live-fleet perf
+  // profiling of a caller doing the old one-StreamWrite()-per-record
+  // thing found ~100k/sec of individual write()/sendmsg() syscalls
+  // (plus real kernel spinlock contention on top) was the dominant
+  // cost of the whole output-gateway pipeline: measured p50 ~4.7ms at
+  // 100k msg/s despite this gateway's own tailing loop itself
+  // accounting for barely 1% of CPU self-time in that same profile —
+  // almost all of it was TCP/socket-write path, not application code.
+  // See gateway/output/src/output_gateway_impl.hpp's tailLoop() for
+  // where flush() actually gets called (once per gathered batch, not
+  // once per record) and OutputGatewayImpl::stop() for why a graceful
+  // shutdown calls it once more unconditionally.
+  void flush() override {
+    std::unordered_map<brpc::StreamId, butil::IOBuf> toSend;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (pending_.empty()) {
+        return;
+      }
+      toSend.swap(pending_);
+    }
+    for (auto& [streamId, buf] : toSend) {
+      write(streamId, buf);
     }
   }
 
@@ -129,9 +179,27 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
   // stalling the others; a subscriber still EAGAIN after that is
   // genuinely not keeping up, and dropping (not blocking longer) is
   // the right tradeoff for a shared fanout.
-  void write(brpc::StreamId streamId, const Bytes& bytes) {
-    butil::IOBuf buf;
+  // Appends this payload's length-prefixed frame to the stream's
+  // pending buffer under mutex_ — cheap (IOBuf::append is a
+  // reference-counted block append, not a copy of existing content),
+  // called once per toSession()/broadcast() call, same as write() used
+  // to be. The actual send happens in flush(); see this file's own top
+  // comment for why a length prefix, not a raw concatenation.
+  void append(brpc::StreamId streamId, const Bytes& bytes) {
+    std::uint8_t lengthPrefix[4];
+    const auto length = static_cast<std::uint32_t>(bytes.size());
+    lengthPrefix[0] = static_cast<std::uint8_t>(length >> 24);
+    lengthPrefix[1] = static_cast<std::uint8_t>(length >> 16);
+    lengthPrefix[2] = static_cast<std::uint8_t>(length >> 8);
+    lengthPrefix[3] = static_cast<std::uint8_t>(length);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    butil::IOBuf& buf = pending_[streamId];
+    buf.append(lengthPrefix, sizeof(lengthPrefix));
     buf.append(bytes.data(), bytes.size());
+  }
+
+  void write(brpc::StreamId streamId, const butil::IOBuf& buf) {
     for (int attempt = 0; attempt < 50; ++attempt) {
       const int rc = brpc::StreamWrite(streamId, buf);
       if (rc == 0) {
@@ -162,6 +230,10 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
       }
       streamToTopic_.erase(topicIt);
     }
+    // A disconnected stream's own unflushed bytes (if flush() hasn't
+    // run since its last append()) can never be sent — drop them
+    // rather than let them accumulate in pending_ forever.
+    pending_.erase(streamId);
     if (pendingClose_.erase(streamId) > 0 && pendingClose_.empty()) {
       closedCv_.notify_all();
     }
@@ -173,6 +245,7 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
   std::unordered_map<brpc::StreamId, sequencer::SessionId> streamToSession_;
   std::unordered_map<brpc::StreamId, std::string> streamToTopic_;
   std::unordered_map<std::string, std::unordered_set<brpc::StreamId>> topicToStreams_;
+  std::unordered_map<brpc::StreamId, butil::IOBuf> pending_;  // accumulated by append(), sent by flush()
   std::unordered_set<brpc::StreamId> pendingClose_;
   std::atomic<sequencer::SessionId> nextSessionId_{1};
 };

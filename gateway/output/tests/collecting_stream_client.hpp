@@ -29,6 +29,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -40,10 +41,28 @@ namespace sequencer::gateway::output::detail {
 
 class CollectingStreamHandler : public brpc::StreamInputHandler {
  public:
+  // Each of the `size` messages may itself be a batch of several
+  // length-prefixed payloads now (StreamFanout::append()/flush(),
+  // gateway/output/src/stream_fanout.hpp) — decoded and flattened
+  // here so every test using this handler keeps seeing one already-
+  // unwrapped payload per received_ entry, unchanged.
   int on_received_messages(brpc::StreamId, butil::IOBuf* const messages[], size_t size) override {
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < size; ++i) {
-      received_.push_back(messages[i]->to_string());
+      const std::string blob = messages[i]->to_string();
+      size_t offset = 0;
+      while (offset + 4 <= blob.size()) {
+        const auto length = static_cast<uint32_t>(static_cast<unsigned char>(blob[offset]) << 24 |
+                                                    static_cast<unsigned char>(blob[offset + 1]) << 16 |
+                                                    static_cast<unsigned char>(blob[offset + 2]) << 8 |
+                                                    static_cast<unsigned char>(blob[offset + 3]));
+        offset += 4;
+        if (offset + length > blob.size()) {
+          break;  // truncated frame; shouldn't happen, drop rather than misparse
+        }
+        received_.push_back(blob.substr(offset, length));
+        offset += length;
+      }
     }
     return 0;
   }

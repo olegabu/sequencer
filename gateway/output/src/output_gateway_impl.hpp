@@ -65,6 +65,12 @@ class OutputGatewayImpl {
     // stop(), even though a batched write cadence means an ungraceful
     // crash could now redeliver up to one batch's worth of records.
     resumePosition_.store(nextSeq_);
+    // Same reasoning for transport_->flush(): tailLoop() only flushes
+    // after a batch, not per record now, so a graceful stop() must
+    // flush once more itself or the last partial batch's worth of
+    // already-codec'd records would sit forever in a transport's
+    // internal buffer, never actually sent.
+    transport_->flush();
     transport_->stop();
     started_ = false;
   }
@@ -93,11 +99,29 @@ class OutputGatewayImpl {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         continue;
       }
-      // specification.md §8.3: "in sequence-number order... in order,
-      // exactly once." One codec call per record, strictly in order.
-      codec_->toOutput(reader->record(seq), *transport_);
-      ++seq;
-      nextSeq_.store(seq, std::memory_order_relaxed);
+
+      // Gathers everything already available (up to a cap) before
+      // flushing the transport once — never delaying to wait for
+      // more, so a caught-up gateway still flushes after exactly one
+      // record. specification.md §8.3: "in sequence-number order...
+      // in order, exactly once" still holds — one codec call per
+      // record, strictly in order; only the *transport's own* write
+      // round trip is now batched, not the codec invocation. This
+      // exists for the same reason as the relay's own gRPC Subscribe
+      // batching (gateway/relay/README.md's "Batching the gRPC
+      // stream" section): live-fleet profiling of this tailing loop
+      // found the dominant cost was one unbatched transport write per
+      // record — see StreamFanout::flush()'s own comment for the
+      // brpc-specific numbers this was measured against.
+      constexpr int kMaxBatch = 1024;
+      int gathered = 0;
+      while (gathered < kMaxBatch && reader->contains(seq) && !stopRequested_.load(std::memory_order_relaxed)) {
+        codec_->toOutput(reader->record(seq), *transport_);
+        ++seq;
+        ++gathered;
+        nextSeq_.store(seq, std::memory_order_relaxed);
+      }
+      transport_->flush();
 
       // Persisting the resume position is not free — ResumePosition::
       // store() is a full open/write/close/rename cycle, several real
