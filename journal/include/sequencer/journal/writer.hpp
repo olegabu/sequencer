@@ -20,8 +20,17 @@ struct JournalOptions {
   // one mmap call, sized once, never remapped). Actual disk usage tracks
   // only what is written, not these limits — see mapped_file.hpp's class
   // comment for why a fixed reservation was chosen over a remap strategy.
-  std::uint64_t maxDataFileBytes = std::uint64_t{1} << 30;  // 1 GiB
-  std::uint64_t maxIndexEntries = std::uint64_t{1} << 20;   // ~1M records
+  // Both previously much smaller (1 GiB / ~1M records) — reproduced live,
+  // against a real benchmark load: at any sustained six-figure req/s rate,
+  // ~1M records is minutes, not the hours a real run needs, and append()
+  // throws std::length_error, uncaught, once exhausted (a node crash, not
+  // a clean rejection). NodeImpl currently constructs JournalWriter with
+  // no JournalOptions of its own (node_impl.cpp), so it is these defaults,
+  // not something only a benchmark deployment can hit — raised here rather
+  // than only for bench/ callers. Both remain sparse-file reservations, so
+  // raising them costs nothing until actually written to.
+  std::uint64_t maxDataFileBytes = std::uint64_t{1} << 34;  // 16 GiB
+  std::uint64_t maxIndexEntries = std::uint64_t{1} << 27;   // ~134M records
 };
 
 class JournalWriter {
