@@ -24,6 +24,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -97,6 +98,19 @@ class SubmitRequester : public sequencer::bench::LoadGeneratorRequester {
   static void onRpcDone(Context* rawCtx) {
     std::unique_ptr<Context> ctx(rawCtx);
     const bool ok = !ctx->cntl.Failed();
+    if (!ok) {
+      // A failed request is excluded from the latency histogram
+      // (LoadGenerator::failed_) but that alone doesn't say *why* --
+      // logging the first few makes a systematic failure (wrong
+      // address, connection refused) visible immediately instead of
+      // requiring a second run with more instrumentation to diagnose.
+      // Rate-limited: at scale, thousands of identical failures
+      // logging individually would itself become the problem.
+      static std::atomic<int> loggedFailures{0};
+      if (loggedFailures.fetch_add(1, std::memory_order_relaxed) < 5) {
+        LOG(WARNING) << "load_generator: request failed: " << ctx->cntl.ErrorText();
+      }
+    }
     if (ok && ctx->relayObserver != nullptr) {
       // CounterInputCodec::toOutput's own response shape
       // ({"sequence_number":N,"total":M}) — see counter_input_codec.cpp.
