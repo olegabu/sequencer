@@ -24,6 +24,19 @@ struct OutputGatewayConfig {
   std::filesystem::path dataDir;     // a node's journal directory, colocated (§3)
   std::filesystem::path resumeFile;  // durable resume position
   int listenPort = 0;
+  // 0 (default): never delay a flush to wait for more records —
+  // exactly tailLoop()'s original batching behavior. Nonzero: once at
+  // least one record is available, keep gathering for up to this long
+  // before flushing, even if nothing new has shown up yet in the
+  // meantime. See tailLoop()'s own comment for why this exists: at a
+  // steady, caught-up rate (not a genuine backlog), the "grab whatever
+  // this instant" gather loop measured naturally-small batches even at
+  // 100k req/s — records arrive roughly evenly spaced, not bursty — so
+  // the per-record transport-write syscall count barely dropped versus
+  // unbatched. A small bounded wait trades a little latency for
+  // meaningfully fewer, larger writes, the same tradeoff braft's own
+  // tuned batch parameters (LEADER_BATCH/APPLY_BATCH) already make.
+  std::chrono::microseconds batchWindow{0};
 };
 
 class OutputGatewayImpl {
@@ -101,25 +114,36 @@ class OutputGatewayImpl {
       }
 
       // Gathers everything already available (up to a cap) before
-      // flushing the transport once — never delaying to wait for
-      // more, so a caught-up gateway still flushes after exactly one
-      // record. specification.md §8.3: "in sequence-number order...
-      // in order, exactly once" still holds — one codec call per
-      // record, strictly in order; only the *transport's own* write
-      // round trip is now batched, not the codec invocation. This
-      // exists for the same reason as the relay's own gRPC Subscribe
-      // batching (gateway/relay/README.md's "Batching the gRPC
-      // stream" section): live-fleet profiling of this tailing loop
-      // found the dominant cost was one unbatched transport write per
-      // record — see StreamFanout::flush()'s own comment for the
-      // brpc-specific numbers this was measured against.
+      // flushing the transport once — specification.md §8.3: "in
+      // sequence-number order... in order, exactly once" still holds —
+      // one codec call per record, strictly in order; only the
+      // *transport's own* write round trip is batched, not the codec
+      // invocation. This exists for the same reason as the relay's own
+      // gRPC Subscribe batching (gateway/relay/README.md's "Batching
+      // the gRPC stream" section): live-fleet profiling of this
+      // tailing loop found the dominant cost was one unbatched
+      // transport write per record — see StreamFanout::flush()'s own
+      // comment for the brpc-specific numbers this was measured
+      // against.
       constexpr int kMaxBatch = 1024;
+      const auto batchDeadline = config_.batchWindow.count() > 0
+                                      ? std::chrono::steady_clock::now() + config_.batchWindow
+                                      : std::chrono::steady_clock::time_point{};
       int gathered = 0;
-      while (gathered < kMaxBatch && reader->contains(seq) && !stopRequested_.load(std::memory_order_relaxed)) {
-        codec_->toOutput(reader->record(seq), *transport_);
-        ++seq;
-        ++gathered;
-        nextSeq_.store(seq, std::memory_order_relaxed);
+      while (gathered < kMaxBatch && !stopRequested_.load(std::memory_order_relaxed)) {
+        if (reader->contains(seq)) {
+          codec_->toOutput(reader->record(seq), *transport_);
+          ++seq;
+          ++gathered;
+          nextSeq_.store(seq, std::memory_order_relaxed);
+          continue;
+        }
+        // Caught up for now — config_.batchWindow's own comment covers
+        // why this is worth a short bounded wait rather than flushing
+        // this (possibly tiny) batch immediately.
+        if (config_.batchWindow.count() == 0 || std::chrono::steady_clock::now() >= batchDeadline) {
+          break;
+        }
       }
       transport_->flush();
 
