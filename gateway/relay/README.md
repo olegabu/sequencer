@@ -192,14 +192,62 @@ question:
   data — a real reason to avoid going too small, not a reason to
   believe batch size explains the 115k ceiling.
 
-**The 115k-vs-130k ceiling regression is still unexplained.** Neither
-follow-up found the mechanism. Worth investigating with proper
-profiling (`perf`, gRPC's own internal tracing) rather than further
-guess-and-check tuning if it matters enough to chase further — the
-current default (`--relay_max_batch_records=1024`, the reactor
-rewrite) is the better trade of the options actually measured, but
-it's a trade, not a strict improvement over the synchronous+batched
-version in every dimension.
+**A third follow-up used actual profiling instead of guessing.**
+`perf record -F 999 -g` against the relay process (a RelWithDebInfo
+build — the deployed Release binary is stripped, `-s`, useless for
+symbol resolution) while driving load in the transition zone between
+the relay's healthy 100k and its broken 115k found something real:
+`RelaySubscribeReactor::pumpLoop()` alone accounted for **15.45% of
+all CPU self-time** in the process — nearly 4x every individual gRPC-
+internal function (each under 1.5%), and second only to kernel
+scheduling overhead (`finish_task_switch`/futex wait+wake, ~27%
+combined). The obvious suspect inside `pumpLoop()` is its own idle-wait
+loop: a busy-spin of `kSpinIterations = 20000` iterations before
+falling back to a 200us sleep — a real cost stolen from whatever else
+runs on the same box, which matters specifically here because the
+relay runs colocated with the raft leader (`raft-tests/sequencer/`'s
+own placement choice, for lowest latency) — CPU the spin loop burns is
+CPU the leader's own consensus work doesn't get.
+
+Reduced the default via a new `--relay_idle_spin_iterations` flag
+(20000 → 2000) and re-tested at the exact rate that broke down
+(115000). The result was **not a clean fix**, and not even monotonic:
+
+| `--relay_idle_spin_iterations` | relay p50 @ 115k req/s |
+|---|---|
+| 0 (no spin at all) | 1.27s |
+| 2000 (new default) | 660ms |
+| 20000 (old default) | 769ms |
+
+2000 measured best of the three, a modest real improvement over the
+old default and no regression at the already-healthy 100k (1358us,
+in line with the 1272-1424us range measured before this change) — kept
+as the new default. But every value tested still leaves 115k
+thoroughly broken, and *removing* the spin entirely made things worse,
+not better — consistent with the spin loop cheaply catching brief
+gaps that a sleep/wake cycle's real (and likely much-greater-than-
+200us, given EC2 virtualization and scheduler tick granularity) wake
+latency would otherwise miss, even though it wastes CPU on longer
+gaps. So the profiling finding is real and the fix is a genuine, if
+modest, improvement — but it is not the explanation for the 115k
+ceiling. That still stands open.
+
+**The 115k-vs-130k ceiling regression is still not fully explained**,
+now across three independent investigations (thread hand-off,
+batch size, CPU-theft-via-spin-loop) that each found something true
+without resolving it. Further progress would need more rigorous
+methodology than live-fleet guess-and-check supports well — statistical
+repetition per configuration (single runs on a shared, noisy EC2 box
+are not precise enough to separate a real effect from variance, as the
+non-monotonic spin-iteration result above illustrates), isolating the
+relay onto its own instance rather than colocating it with the raft
+leader (to separate "the relay is slow" from "the relay is stealing
+cycles from something else that's slow"), and likely gRPC's own
+internal tracing (`GRPC_TRACE`) rather than black-box `perf` alone. The
+current defaults (`--relay_max_batch_records=1024`,
+`--relay_idle_spin_iterations=2000`, the reactor rewrite as a whole)
+are the best-measured trade of everything actually tried, not a
+resolved story.
 
 ## Testing
 

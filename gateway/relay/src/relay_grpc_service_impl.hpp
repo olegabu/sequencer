@@ -80,6 +80,18 @@ DEFINE_int32(relay_max_batch_records, 1024,
              "RecordBatch/Write() call when a backlog exists. Never delays a send to "
              "accumulate a batch — caught up, every batch is exactly 1 record.");
 
+// Default lowered from an original 20000 after live-fleet perf profiling
+// (see gateway/relay/README.md's "Batching the gRPC stream" section)
+// showed the busy-spin loop itself as the single largest CPU self-time
+// consumer in the whole process — real cost stolen from the co-located
+// raft leader's own consensus work every time the pump thread has to
+// wait, not free. Tunable per deployment.
+DEFINE_int32(relay_idle_spin_iterations, 2000,
+             "How many times the relay's gRPC Subscribe pump thread busy-spins checking for a "
+             "new journal record before falling back to a short sleep. Higher trades CPU (taken "
+             "from whatever else runs on this box, including a colocated raft leader) for a "
+             "chance at lower latency on the next record to actually arrive.");
+
 namespace sequencer::gateway::relay::detail {
 
 // One instance per active Subscribe() call, owned by gRPC itself once
@@ -146,7 +158,7 @@ class RelaySubscribeReactor final : public ::grpc::ServerWriteReactor<grpc_proto
     const int maxBatch = std::max(1, FLAGS_relay_max_batch_records);
     // Sub-millisecond common case; falls back to a short sleep only
     // once genuinely idle (nothing new has landed in the journal).
-    constexpr int kSpinIterations = 20000;
+    const int kSpinIterations = std::max(0, FLAGS_relay_idle_spin_iterations);
     int spins = 0;
     while (!stopRequested()) {
       if (!reader->contains(nextSeq_)) {
