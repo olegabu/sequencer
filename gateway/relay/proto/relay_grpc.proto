@@ -23,6 +23,16 @@ package sequencer.gateway.relay.grpc_proto;
 // to a gRPC-plugin style" — this is deliberately the one exception).
 // Server reflection is enabled, so `grpcurl` needs no `.proto` of its
 // own either.
+//
+// Delivered as batches, not one record per streamed message: a
+// counter-sized record is ~40-50 bytes on the wire, small enough that
+// a blocking synchronous gRPC Write() call's own fixed per-call
+// overhead — not payload transmission — was the dissemination
+// throughput ceiling (see gateway/relay/README.md's "Batching the
+// gRPC stream" section). Each RecordBatch carries whatever is already
+// available when the server gets a chance to send, from 1 record
+// (caught up — no batching delay is ever imposed) up to a bounded cap
+// (a real backlog).
 
 message SubscribeRequest {
   // 0 means "from the beginning" — matches relay.proto's own
@@ -30,14 +40,15 @@ message SubscribeRequest {
   uint64 from_sequence_number = 1;
 }
 
-// The complete, raw journal record — byte-identical to a colocated
-// reader's own journal::RecordView::rawBytes(), exactly like
-// relay.proto's own delivery. This service carries the journal
-// unmodified; it never interprets these bytes.
-message Record {
-  bytes raw_record = 1;
+// One or more consecutive, complete, raw journal records — each entry
+// byte-identical to a colocated reader's own
+// journal::RecordView::rawBytes(), exactly like relay.proto's own
+// delivery. This service carries the journal unmodified; it never
+// interprets these bytes.
+message RecordBatch {
+  repeated bytes raw_records = 1;
 }
 
 service RelayService {
-  rpc Subscribe(SubscribeRequest) returns (stream Record);
+  rpc Subscribe(SubscribeRequest) returns (stream RecordBatch);
 }

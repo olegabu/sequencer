@@ -92,6 +92,57 @@ isn't going through `startSession`'s brpc-specific session bookkeeping.
 of its own to call this — unlike brpc, which does not implement gRPC's
 reflection service either.
 
+## Batching the gRPC stream — two real throughput bugs, found via live-fleet benchmarking
+
+`RelayGrpcServiceImpl::Subscribe` originally sent exactly one journal
+record per `grpc::ServerWriter<Record>::Write()` call. A live sweep
+against a 3-node fleet (`raft-tests/sequencer/`, phase 3 —
+`bench/load_generator/`'s `RelayObserver`) turned up a severe cliff: p50
+flat at 3-4ms through 25k req/s, then 7.3 **seconds** at 40k. Two
+independent bugs, both fixed:
+
+**1. No batching, at a record size where per-call overhead dominates.**
+A counter-benchmark record is ~40-50 bytes on the wire — small enough
+that a blocking synchronous `Write()` call's own fixed overhead (framing,
+flow-control bookkeeping, completion-queue synchronization), not payload
+transmission, was the real cost per record. Fixed by gathering every
+record already available (up to `--relay_max_batch_records`, default
+1024 — ~50KB, comfortably under gRPC's 4MB message cap) into one
+`RecordBatch` before writing, same "batch what's ready, never delay a
+send to wait for more" discipline this repo already uses for braft's own
+`LEADER_BATCH`/`APPLY_BATCH` tuning. Caught up, this degrades to exactly
+the old one-record-per-`Write()` behavior; behind, it collapses however
+large the backlog is into far fewer `Write()` round trips. `RecordBatch`
+(`proto/relay_grpc.proto`) replaces the old single-`Record` message —
+a wire-protocol change, confirmed safe since the only real gRPC
+consumers in the tree are this repo's own test client and
+`RelayObserver`, both updated alongside it.
+
+**2. The fix's own gather loop introduced a second, much worse bug.**
+The per-record gather loop re-checked `context->IsCancelled()` on every
+iteration, not just once per batch (the outer loop already did that).
+`IsCancelled()` isn't a cheap flag read — it plucks gRPC's own
+completion queue under the hood (confirmed via `gdb` thread backtraces
+on a hung local reproduction: the gather loop was spending nearly all
+its time inside `grpc::CompletionQueue::TryPluck`, not in the actual
+record read). Once per batch this is negligible; once per record it
+dominated everything, measured at roughly **3000x** slower backlog
+catch-up (a 500k-record local backlog test: ~170 records/sec with the
+bug, 3-4 million/sec after removing the redundant per-record check —
+see `gateway/relay/tests/relay_grpc_test.cpp`'s
+`BacklogCatchUpThroughputStaysOffTheGatherLoopFloor`, added as a
+permanent regression guard against a repeat of this exact class of bug).
+
+**Confirmed on the live fleet, both fixes together**
+(`raft-tests/sequencer/seq-relay.csv`): p50 flat at 3.1-5.1ms from 10k
+through 115k req/s, then a real cliff at 130k — landing at essentially
+the *same* rate as phase 1's own knee (submission to synchronous
+consensus ack, no relay involved, flat to ~115k, plateau ~123-126k; see
+`raft-tests/sweep/mkcharts.py`'s `"sequencer"` CFG entry). The relay no
+longer bottlenecks ahead of sequencer's own consensus/journal path —
+what's left above 115k is sequencer's own ceiling, not a separate
+relay-side one.
+
 ## Testing
 
 ```sh

@@ -5,7 +5,7 @@
 // (specification.md §8.9), observed on the *same machine* as the
 // client. Deliberately not a gateway — no codec, no client protocol
 // translation, no application meaning — just a background
-// grpc::ClientReader<Record> loop, the same client code
+// grpc::ClientReader<RecordBatch> loop, the same batch-shaped read
 // relay_grpc_test.cpp's own TestGrpcRelayClient already proves out,
 // correlating each arrival against this same run's own send times by
 // journal sequence number.
@@ -255,26 +255,37 @@ class RelayObserver {
   void readLoop() {
     gateway::relay::grpc_proto::SubscribeRequest request;
     request.set_from_sequence_number(fromSequenceNumber_);
-    std::unique_ptr<grpc::ClientReader<gateway::relay::grpc_proto::Record>> reader(
+    std::unique_ptr<grpc::ClientReader<gateway::relay::grpc_proto::RecordBatch>> reader(
         stub_->Subscribe(&context_, request));
 
-    gateway::relay::grpc_proto::Record record;
-    while (reader->Read(&record)) {
-      // Captured immediately, before this record is even queued —
-      // the eventual recorded latency must reflect when this record
-      // actually arrived, not how long it later waits in the queue or
-      // for a correlator to pick it up.
+    gateway::relay::grpc_proto::RecordBatch batch;
+    while (reader->Read(&batch)) {
+      // Captured once per batch, immediately after Read() returns —
+      // every record a batch carries arrived at effectively the same
+      // instant from this observer's point of view (see
+      // relay_grpc_service_impl.hpp's own "Batching the gRPC stream"
+      // comment), and this must reflect actual arrival, not how long
+      // records later wait in the queue or for a correlator to pick
+      // them up.
       const std::int64_t nowUs = nowMicros();
-      const auto* base = reinterpret_cast<const std::byte*>(record.raw_record().data());
-      const journal::RecordView view(base, static_cast<std::uint32_t>(record.raw_record().size()));
+
+      std::vector<PendingCorrelation> pending;
+      pending.reserve(static_cast<std::size_t>(batch.raw_records_size()));
+      for (const std::string& rawRecord : batch.raw_records()) {
+        const auto* base = reinterpret_cast<const std::byte*>(rawRecord.data());
+        const journal::RecordView view(base, static_cast<std::uint32_t>(rawRecord.size()));
+        pending.push_back(PendingCorrelation{view.sequenceNumber(), nowUs});
+      }
 
       std::size_t queueSize;
       {
         std::lock_guard<std::mutex> lock(queueMutex_);
-        queue_.push_back(PendingCorrelation{view.sequenceNumber(), nowUs});
+        for (const PendingCorrelation& item : pending) {
+          queue_.push_back(item);
+        }
         queueSize = queue_.size();
       }
-      queueCv_.notify_one();
+      queueCv_.notify_all();
       // Relaxed max-tracking, not exact under concurrent updates from
       // multiple correlators draining at once — a diagnostic, not a
       // correctness-load-bearing count; see relay_queue_high_water's

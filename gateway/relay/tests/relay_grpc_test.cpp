@@ -55,13 +55,25 @@ class TestGrpcRelayClient {
     reader_ = stub_->Subscribe(&context_, request);
   }
 
+  // Reads span whatever batch shape the server happened to send them
+  // in (see relay_grpc_service_impl.hpp's adaptive batching) — this
+  // doles out one record at a time regardless, pulling a fresh
+  // RecordBatch off the stream whenever the buffered one is exhausted.
   std::int64_t readOne() {
-    grpc_proto::Record record;
-    if (!reader_->Read(&record)) {
-      throw std::runtime_error("stream ended before a record arrived");
+    if (bufferPos_ >= buffered_.size()) {
+      grpc_proto::RecordBatch batch;
+      if (!reader_->Read(&batch)) {
+        throw std::runtime_error("stream ended before a record arrived");
+      }
+      buffered_.assign(batch.raw_records().begin(), batch.raw_records().end());
+      bufferPos_ = 0;
+      if (buffered_.empty()) {
+        throw std::runtime_error("server sent an empty RecordBatch");
+      }
     }
-    const journal::RecordView view(reinterpret_cast<const std::byte*>(record.raw_record().data()),
-                                    static_cast<std::uint32_t>(record.raw_record().size()));
+    const std::string& rawRecord = buffered_[bufferPos_++];
+    const journal::RecordView view(reinterpret_cast<const std::byte*>(rawRecord.data()),
+                                    static_cast<std::uint32_t>(rawRecord.size()));
     std::int64_t value;
     std::memcpy(&value, view.input().data(), sizeof(value));
     return value;
@@ -70,7 +82,9 @@ class TestGrpcRelayClient {
  private:
   grpc::ClientContext context_;
   std::unique_ptr<grpc_proto::RelayService::Stub> stub_;
-  std::unique_ptr<grpc::ClientReader<grpc_proto::Record>> reader_;
+  std::unique_ptr<grpc::ClientReader<grpc_proto::RecordBatch>> reader_;
+  std::vector<std::string> buffered_;
+  std::size_t bufferPos_ = 0;
 };
 
 TEST(RelayGrpc, SubscribingFromTheBeginningReplaysAlreadyCommittedHistory) {
@@ -98,6 +112,110 @@ TEST(RelayGrpc, SubscribingFromTheBeginningReplaysAlreadyCommittedHistory) {
 
   // requestStop() wakes the in-flight Subscribe() call directly;
   // Shutdown()'s bounded deadline is just a backstop.
+  service.requestStop();
+  server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  server->Wait();
+  gateway.stop();
+  std::filesystem::remove_all(dir);
+}
+
+TEST(RelayGrpc, DeliversRecordsAppendedContinuouslyWhileSubscribed) {
+  const std::filesystem::path dir = makeTempDir();
+  appendRecords(dir, 1, {1});  // seed the journal so a JournalReader can open before appending live
+
+  RelayGatewayConfig config;
+  config.dataDir = dir;
+  config.listenPort = 0;
+  RelayGatewayImpl gateway(std::move(config));
+  gateway.start();
+
+  RelayGrpcServiceImpl service(gateway);
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort("127.0.0.1:29063", grpc::InsecureServerCredentials());
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+
+  TestGrpcRelayClient client(29063, /*fromSequenceNumber=*/0);
+  EXPECT_EQ(client.readOne(), 1);
+
+  // A background writer appends continuously and independently of the
+  // reader — not lockstep — reproducing the shape of live traffic
+  // racing the tailing/gather loop (relay_grpc_service_impl.hpp)
+  // rather than a single batch of pre-existing history the gather
+  // loop finds all at once before Subscribe() even starts reading.
+  constexpr int kAppended = 20000;
+  std::thread writerThread([&dir] {
+    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    for (int i = 0; i < kAppended; ++i) {
+      writer.append(2 + i, payloadOf(1000 + i), {});
+      if (i % 64 == 0) {
+        writer.flush(false);
+      }
+    }
+    writer.flush(false);
+  });
+
+  for (int i = 0; i < kAppended; ++i) {
+    EXPECT_EQ(client.readOne(), 1000 + i) << "at i=" << i;
+  }
+  writerThread.join();
+
+  service.requestStop();
+  server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  server->Wait();
+  gateway.stop();
+  std::filesystem::remove_all(dir);
+}
+
+// A regression guard, not a precise benchmark (raft-tests/ owns real
+// fleet numbers): this specific shape — a large pre-existing backlog,
+// drained as fast as the gather loop and network allow — is exactly
+// what once regressed catastrophically (a stray context->IsCancelled()
+// inside the per-record gather loop, ~3000x slower than the fix; see
+// gateway/relay/README.md's "Batching the gRPC stream" section). A
+// generous bound (two orders of magnitude below what a healthy build
+// achieves locally) catches a repeat of that class of bug without
+// being sensitive to ordinary machine-to-machine variance.
+TEST(RelayGrpc, BacklogCatchUpThroughputStaysOffTheGatherLoopFloor) {
+  const std::filesystem::path dir = makeTempDir();
+  constexpr int kBacklog = 50000;
+  {
+    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    for (int i = 0; i < kBacklog; ++i) {
+      writer.append(1 + i, payloadOf(i), {});
+      if (i % 256 == 0) writer.flush(false);
+    }
+    writer.flush(false);
+  }
+
+  RelayGatewayConfig config;
+  config.dataDir = dir;
+  config.listenPort = 0;
+  RelayGatewayImpl gateway(std::move(config));
+  gateway.start();
+
+  RelayGrpcServiceImpl service(gateway);
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort("127.0.0.1:29064", grpc::InsecureServerCredentials());
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  TestGrpcRelayClient client(29064, /*fromSequenceNumber=*/0);
+  for (int i = 0; i < kBacklog; ++i) {
+    EXPECT_EQ(client.readOne(), i) << "at i=" << i;
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  const double secs = std::chrono::duration<double>(t1 - t0).count();
+  std::fprintf(stderr, "drained %d backlog records in %.3fs (%.0f records/sec)\n", kBacklog, secs, kBacklog / secs);
+  // A healthy debug build drains comfortably over 100k/s locally (a
+  // release build: low millions/s); the old per-record IsCancelled()
+  // bug measured under 200/s. 5s for 50k records (10k/s) is a
+  // generous floor on either build type.
+  EXPECT_LT(secs, 5.0);
+
   service.requestStop();
   server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
   server->Wait();
