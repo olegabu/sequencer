@@ -183,7 +183,7 @@ affected test case. Worth calling out again here since it's now
 recurred three-plus times across this codebase; the fix is always the
 same, and always easy to miss in a one-line test setup.
 
-## Benchmarking the output gateway: four round trips, three real bugs
+## Benchmarking the output gateway: four round trips, three real bugs, one reverted rewrite
 
 `bench/load_generator/`'s harness measures four round trips end to end
 against a live fleet, not just the synchronous ack path: submission to
@@ -265,6 +265,48 @@ delay becomes a real, visible floor under every record, with more
 variance than it saves. Not adopted as a nonzero default; kept as a
 tunable in case a different workload shape benefits more.
 
+**A follow-up round chased the relay's own `<1ms` result harder, with a
+mixed outcome — one real lever paid off, one didn't, honestly reported
+either way:**
+
+- **gRPC: rewriting `GenericOutputServiceImpl::Subscribe` onto
+  `grpc::ServerWriteReactor<OutputRecordBatch>` — the exact change that
+  took the relay from ~4-5ms to 649us-1.3ms — made this transport
+  *worse*, not better** (100k: 4731us reactor vs 4347-4951us sync
+  range across runs; 70k: 4195us reactor vs 4347us sync — marginal at
+  best, a regression at 100k). Root cause, found by comparing the two
+  producers rather than by guessing again: the relay's own win came
+  specifically from unblocking a producer thread that was *also* the
+  writer thread — one thread did journal-polling **and** the blocking
+  `Write()` call, so the reactor rewrite freed that thread to keep
+  polling instead of blocking on the network. The output gateway's
+  producer (`tailLoop()`) was already decoupled from the write call,
+  via the existing queue-based `SessionRegistry::push()` (enqueue and
+  return, never blocks) — so the specific problem the reactor rewrite
+  fixes for a blocking-write producer never existed here. Reverted
+  (`git revert` — history preserved, not squashed away) rather than
+  kept as a strictly-worse alternative.
+- **WebSocket: `WebSocketOutputTransport` had never been touched by any
+  of this round's batching work** — `broadcast()`/`toSession()` called
+  `postWrite()` (one real `net::post()` thread hand-off) per record,
+  unconditionally, and `Fanout::flush()`'s no-op default meant
+  `tailLoop()`'s own batching did nothing for it. Given the same
+  `append()`-then-`flush()` treatment as `StreamFanout` (length-prefixed
+  accumulation per session, one websocket text frame per `flush()`
+  instead of one per record). Confirmed: **~5.0ms → 3879us at 70k**
+  (~23%, a bigger relative win than brpc's own ~11% from the same
+  pattern), and 4331us at 100k — now in line with the other two
+  transports rather than trailing them.
+- **brpc was re-checked at 100k (4187us, matching its earlier 4207us —
+  stable, as expected since nothing in this round touched its own code
+  path) rather than re-profiled with `perf` a second time.** The
+  earlier live profile already pinned its cost on the real TCP/
+  socket-write syscall path and kernel spinlock contention, not
+  application code, and `StreamWrite()`'s own non-blocking API leaves
+  no "stop blocking the producer" lever the way gRPC's sync API did —
+  so a repeat profile would very likely just reconfirm the same
+  finding rather than surface something new to chase.
+
 **Where this leaves the four round trips, all measured at 100k req/s
 against the same live fleet** (braft's own bare consensus latency,
 raft-tests/sweep/knee-sweep.csv, is the floor these are all measured
@@ -275,23 +317,23 @@ against — no sequencer/gateway layer at all):
 | braft, bare consensus (no sequencer layer) | ~749us |
 | sequencer's own synchronous ack | ~1.6ms |
 | relay gateway (gRPC) | ~1.3-1.4ms |
-| output gateway (brpc / gRPC) | ~4.1-4.3ms |
+| output gateway, brpc | ~4.2ms |
+| output gateway, gRPC (batched, sync API) | ~4.9ms |
+| output gateway, WebSocket | ~4.3ms |
 
 Output gateways went from broken (dropped messages, or multi-second
-queueing delay) to correct and reasonably fast, but remain the slowest
-of the four round trips and did not reach sub-millisecond — the
-`<1ms`-at-100k bar the relay gateway (mostly) cleared after its own
-reactor rewrite. Batching alone got the relay from a catastrophic 7.3s
-stall to ~3-5ms; it took moving off a blocking synchronous write API
-entirely (`grpc::ServerWriteReactor`) to get further, to 649us-1.3ms.
-brpc's own `StreamWrite()` was already non-blocking (unlike gRPC's
-synchronous API), so that specific lever isn't available here in the
-same form — the likely next step, if this gap is worth closing
+queueing delay) to correct and reasonably fast, and WebSocket closed
+most of its gap with the other two, but all three remain well above
+sub-millisecond — the `<1ms`-at-100k bar the relay gateway (mostly)
+cleared after its own reactor rewrite. That specific lever doesn't
+transfer here (see above), and brpc's own profiling points at
+syscall/kernel-level cost rather than anything left to batch in
+application code. The likely next step, if this gap is worth closing
 further, is a bigger architectural change to the output gateway's
 single-shared-tailing-thread design itself (closer in spirit to the
 relay's own per-subscriber pull model) rather than more parameter
-tuning along axes already tried. Not attempted here — flagged as
-future work.
+tuning or transport-specific rewrites along axes already tried. Not
+attempted here — flagged as future work.
 
 ## Seeing it in action
 
