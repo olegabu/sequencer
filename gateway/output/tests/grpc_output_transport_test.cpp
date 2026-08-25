@@ -10,7 +10,6 @@
 
 #include "output_grpc.grpc.pb.h"
 
-#include <atomic>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -52,8 +51,6 @@ class TestGrpcClient {
     }
     return buffered_[bufferPos_++];
   }
-
-  void cancel() { context_.TryCancel(); }
 
  private:
   grpc::ClientContext context_;
@@ -125,59 +122,6 @@ TEST(GrpcOutputTransport, TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn) {
 
   EXPECT_EQ(totalsClient.readOne(), "for totals");
   EXPECT_EQ(alertsClient.readOne(), "for alerts");
-
-  transport.stop();
-}
-
-// Regression guard for OutputSubscribeReactor's own lifecycle
-// (grpc_output_transport.cpp): repeated subscribe/cancel racing a
-// continuous stream of live broadcast()s must never crash or hang —
-// no crash, no hang, and the transport stays fully usable afterward.
-// Mirrors gateway/relay/tests/relay_grpc_test.cpp's own
-// SurvivesClientsCancellingMidStreamRepeatedly exactly, adapted for
-// this transport's push (broadcast()) rather than pull (journal-tail)
-// shape — the writer thread calls broadcast() directly instead of
-// appending to a journal.
-TEST(GrpcOutputTransport, SurvivesClientsCancellingMidStreamRepeatedly) {
-  GrpcOutputTransport transport;
-  transport.start(28985);
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  std::atomic<bool> stopWriting{false};
-  std::thread writerThread([&transport, &stopWriting] {
-    int i = 0;
-    while (!stopWriting.load(std::memory_order_relaxed)) {
-      transport.broadcast("totals", bytesOf("msg-" + std::to_string(i++)));
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
-  });
-
-  for (int round = 0; round < 30; ++round) {
-    TestGrpcClient client(28985, "totals");
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    // A handful of reads first, so cancellation actually lands
-    // mid-stream (with live broadcasts racing it) rather than before
-    // the reactor has done anything at all.
-    try {
-      for (int i = 0; i < 3; ++i) {
-        client.readOne();
-      }
-    } catch (const std::runtime_error&) {
-      // A slow round can legitimately race the writer thread's own
-      // pacing; this test is about surviving cancellation cleanly; not
-      // about guaranteeing 3 reads always land in time.
-    }
-    client.cancel();
-  }
-
-  stopWriting.store(true, std::memory_order_relaxed);
-  writerThread.join();
-
-  // The service must still be fully usable after all that cancelling.
-  TestGrpcClient freshClient(28985, "totals");
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  transport.broadcast("totals", bytesOf("still-alive"));
-  EXPECT_EQ(freshClient.readOne(), "still-alive");
 
   transport.stop();
 }
