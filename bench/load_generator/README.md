@@ -73,10 +73,10 @@ working instance: `SubmitRequester` builds `{"delta": N}` JSON and
 submits it over a real `brpc::Channel` to an input gateway's
 `SubmitService`.
 
-## The three round trips, and which this measures
+## The four round trips, and which this measures
 
 specification.md §3's diagram (redrawn this same phase — see its
-own commit) shows three genuinely different things a "how fast is
+own commit) shows several genuinely different things a "how fast is
 this" question could mean for this repository specifically, unlike a
 bare-braft product with no gateway or relay tier at all:
 
@@ -170,3 +170,51 @@ bare-braft product with no gateway or relay tier at all:
    below that floor (`relay_skipped_historical` in the summary),
    rather than paying up to 100ms per backlog record on something that
    was never going to match.
+
+4. **Submission to receipt via an output gateway** — the fourth round
+   trip, and the one place this repository's own architecture offers a
+   *choice* the relay doesn't: an output gateway applies an
+   `OutputCodec` and disseminates over one of three transports
+   (`gateway/output/`'s `BrpcStreamTransport`, `GrpcOutputTransport`, or
+   `WebSocketOutputTransport`), so there are three genuinely different
+   numbers here, not one. `sequence_correlator.hpp`'s
+   `SequenceCorrelator` is (whichever transport is picked between)
+   `RelayObserver`'s own correlation machinery, factored out and reused
+   verbatim — the same ring buffer, the same reader-thread/correlator-
+   pool split (see the wall of caution above this section for why that
+   split exists at all; it applies here identically), the same
+   historical-skip and bounded-wait-and-retry logic. What differs per
+   transport is only *how a record arrives*:
+
+   - **`grpc_output_observer.hpp`** (`GrpcOutputObserver`): a
+     `grpc::ClientReader<OutputRecord>` loop, structurally identical to
+     `RelayObserver::readLoop()`, on its own reader thread.
+   - **`brpc_output_observer.hpp`** (`BrpcOutputObserver`): no reader
+     thread of its own at all — `brpc::StreamInputHandler::
+     on_received_messages()` already fires asynchronously on brpc's own
+     I/O thread pool, so `deliver()` is called directly from that
+     callback.
+   - **`websocket_output_observer.hpp`** (`WebSocketOutputObserver`): a
+     synchronous Boost.Beast `read()` loop, same shape as the gRPC
+     reader, on its own thread.
+
+   Sequence-number extraction is the one thing that can't be shared
+   with `RelayObserver`: the relay hands back raw journal bytes (a
+   fixed, app-agnostic binary format, parsed via
+   `journal::RecordView::sequenceNumber()`), but an output gateway's
+   payload is whatever its `OutputCodec` produced — JSON for counter,
+   arbitrary bytes for any other application. `SequenceCorrelator`
+   takes the extractor as a constructor argument instead
+   (`std::function<std::optional<std::uint64_t>(const std::string&)>`)
+   — `examples/counter/load_generator_main.cpp` supplies
+   `extractJsonIntField(payload, "sequence_number")`, the same helper
+   already used to parse the synchronous ack's own response body.
+
+   Opt in with `--output_observer=grpc|brpc|websocket` plus
+   `--output_gateway_addr` (empty `--output_observer`, the default,
+   disables it and costs nothing) — independent of, and freely
+   combinable with, `--relay_grpc_addr`: a single run can report all
+   four numbers at once. Prints a third summary, namespaced per
+   transport (`output_grpc_p50_us` / `output_brpc_p50_us` /
+   `output_websocket_p50_us`), the same discipline `relay_p50_us`
+   exists for.

@@ -46,9 +46,18 @@ add_executable(counter_output_gateway_main output_gateway_main.cpp)
 target_link_libraries(counter_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output_websocket sequencer::gateway_output)
 set_target_properties(counter_output_gateway_main PROPERTIES OUTPUT_NAME counter_output_gateway)
 
+# The brpc flavor: the chassis's own built-in transport
+# (BrpcStreamTransport), needing no override and so no extra transport
+# library beyond the base sequencer::gateway_output — see
+# brpc_output_gateway_main.cpp's own file comment.
+add_executable(counter_brpc_output_gateway_main brpc_output_gateway_main.cpp)
+target_link_libraries(counter_brpc_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output)
+set_target_properties(counter_brpc_output_gateway_main PROPERTIES OUTPUT_NAME counter_brpc_output_gateway)
+
 add_executable(counter_load_generator_main load_generator_main.cpp)
 target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::bench_load_generator
                                                             sequencer::bench_relay_observer
+                                                            sequencer::bench_output_observer
                                                             unofficial::brpc::brpc-static gflags::gflags_static glog::glog)
 set_target_properties(counter_load_generator_main PROPERTIES OUTPUT_NAME counter_load_generator)
 

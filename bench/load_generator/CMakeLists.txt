@@ -46,3 +46,28 @@ target_link_libraries(sequencer_bench_relay_observer INTERFACE
   $<IF:$<TARGET_EXISTS:hdr_histogram::hdr_histogram>,hdr_histogram::hdr_histogram,hdr_histogram::hdr_histogram_static>
 )
 target_compile_features(sequencer_bench_relay_observer INTERFACE cxx_std_20)
+
+# sequencer_bench_output_observer — the output-gateway counterpart to
+# sequencer_bench_relay_observer above (see include/sequencer/bench/
+# sequence_correlator.hpp's own file comment): one target covering all
+# three transport observers (brpc/gRPC/WebSocket), not three separate
+# opt-in ones — unlike relay_observer's single-transport scoping, an
+# app using this wants all three available behind one runtime flag
+# (examples/counter/load_generator_main.cpp's --output_observer), so
+# splitting the link surface further would help no one.
+find_package(boost_beast CONFIG REQUIRED)
+
+add_library(sequencer_bench_output_observer INTERFACE)
+add_library(sequencer::bench_output_observer ALIAS sequencer_bench_output_observer)
+
+target_include_directories(sequencer_bench_output_observer INTERFACE
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(sequencer_bench_output_observer INTERFACE
+  sequencer::gateway_output
+  sequencer::gateway_output_grpc
+  gRPC::grpc++
+  Boost::beast
+  $<IF:$<TARGET_EXISTS:hdr_histogram::hdr_histogram>,hdr_histogram::hdr_histogram,hdr_histogram::hdr_histogram_static>
+)
+target_compile_features(sequencer_bench_output_observer INTERFACE cxx_std_20)

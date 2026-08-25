@@ -103,6 +103,27 @@ and consumes the running total with
 each broadcast — no `.proto` file needed on either `grpcurl` command
 line, since both services enable server reflection.
 
+### A third output flavor: brpc, needing no override at all
+
+`brpc_output_gateway_main.cpp` completes the set alongside WebSocket
+(`output_gateway_main.cpp`) and gRPC (`grpc_output_gateway_main.cpp`):
+the chassis's own built-in transport (`BrpcStreamTransport`), which
+`RunOutputGateway`'s single-codec-argument overload already defaults to
+— so unlike the other two, this main needed no transport override at
+all, just the same `CounterOutputCodec` handed straight to the chassis.
+Run it exactly like the WebSocket flavor ("By hand" below), on its own
+port, alongside either or both of the others if wanted — nothing about
+the chassis or `CounterOutputCodec` restricts an application to one
+transport at a time.
+
+All three flavors can be observed and benchmarked directly from
+`counter_load_generator` (`--output_observer=grpc|brpc|websocket`,
+`--output_gateway_addr`) — see
+[bench/load_generator/README.md](../../bench/load_generator/README.md)'s
+"four round trips" section for the full design (`SequenceCorrelator`,
+shared across all three, plus what's genuinely different per
+transport).
+
 ## Testing
 
 ```sh
