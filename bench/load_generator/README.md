@@ -155,3 +155,18 @@ bare-braft product with no gateway or relay tier at all:
    warmup/measure/drain window), no slot is ever reused within one run
    at all, so there is no wraparound to reason about, only the
    ring-too-small case the tag check guards against defensively.
+
+   One more case the wait-and-retry above must *not* apply to:
+   `--relay_from_sequence_number` defaults to 0 (from the beginning of
+   the journal), so against any journal with real prior history —
+   every run on a fleet after the first one — the relay delivers a
+   long run of records that predate this process's own requests
+   entirely and can never resolve, no matter how long `waitForTag`
+   waits. Reproduced directly: a mere 110 such records were enough to
+   make an entire run look completely broken
+   (`relay_completed=0`) before this was handled. `recordSend()`
+   tracks the lowest journal sequence number it has ever been called
+   with; `subscribeLoop()` skips `waitForTag` immediately for anything
+   below that floor (`relay_skipped_historical` in the summary),
+   rather than paying up to 100ms per backlog record on something that
+   was never going to match.
