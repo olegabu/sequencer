@@ -79,6 +79,12 @@ class TestGrpcRelayClient {
     return value;
   }
 
+  // Cuts the stream mid-flight from the client side — the server-side
+  // reactor observes this as OnCancel(), possibly racing an in-flight
+  // StartWrite()/OnWriteDone() pair, exactly the highest-risk path in
+  // RelaySubscribeReactor's async lifecycle.
+  void cancel() { context_.TryCancel(); }
+
  private:
   grpc::ClientContext context_;
   std::unique_ptr<grpc_proto::RelayService::Stub> stub_;
@@ -160,6 +166,66 @@ TEST(RelayGrpc, DeliversRecordsAppendedContinuouslyWhileSubscribed) {
     EXPECT_EQ(client.readOne(), 1000 + i) << "at i=" << i;
   }
   writerThread.join();
+
+  service.requestStop();
+  server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  server->Wait();
+  gateway.stop();
+  std::filesystem::remove_all(dir);
+}
+
+// RelaySubscribeReactor's highest-risk path: OnCancel() firing on
+// gRPC's own thread, possibly racing an in-flight StartWrite()/
+// OnWriteDone() pair on the reactor's own pump thread. Cancels several
+// subscribers repeatedly, at various points relative to a continuous
+// writer, then confirms the service is still fully healthy afterward —
+// no crash, no hang, and a fresh subscriber started after all the
+// cancelling still gets correct, in-order data.
+TEST(RelayGrpc, SurvivesClientsCancellingMidStreamRepeatedly) {
+  const std::filesystem::path dir = makeTempDir();
+  appendRecords(dir, 1, {1});
+
+  RelayGatewayConfig config;
+  config.dataDir = dir;
+  config.listenPort = 0;
+  RelayGatewayImpl gateway(std::move(config));
+  gateway.start();
+
+  RelayGrpcServiceImpl service(gateway);
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort("127.0.0.1:29065", grpc::InsecureServerCredentials());
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+
+  std::thread writerThread([&dir] {
+    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    for (int i = 0; i < 20000; ++i) {
+      writer.append(2 + i, payloadOf(1000 + i), {});
+      if (i % 64 == 0) {
+        writer.flush(false);
+      }
+    }
+    writer.flush(false);
+  });
+
+  for (int round = 0; round < 30; ++round) {
+    TestGrpcRelayClient client(29065, /*fromSequenceNumber=*/0);
+    // A handful of reads first, so cancellation actually lands mid-
+    // stream (with live writes racing it) rather than before the
+    // reactor has done anything at all.
+    for (int i = 0; i < 3; ++i) {
+      client.readOne();
+    }
+    client.cancel();
+  }
+  writerThread.join();
+
+  // The service must still be fully usable after all that cancelling.
+  TestGrpcRelayClient freshClient(29065, /*fromSequenceNumber=*/0);
+  EXPECT_EQ(freshClient.readOne(), 1);
+  EXPECT_EQ(freshClient.readOne(), 1000);
+  EXPECT_EQ(freshClient.readOne(), 1001);
 
   service.requestStop();
   server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));

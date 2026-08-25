@@ -133,15 +133,73 @@ see `gateway/relay/tests/relay_grpc_test.cpp`'s
 `BacklogCatchUpThroughputStaysOffTheGatherLoopFloor`, added as a
 permanent regression guard against a repeat of this exact class of bug).
 
-**Confirmed on the live fleet, both fixes together**
-(`raft-tests/sequencer/seq-relay.csv`): p50 flat at 3.1-5.1ms from 10k
-through 115k req/s, then a real cliff at 130k — landing at essentially
-the *same* rate as phase 1's own knee (submission to synchronous
-consensus ack, no relay involved, flat to ~115k, plateau ~123-126k; see
-`raft-tests/sweep/mkcharts.py`'s `"sequencer"` CFG entry). The relay no
-longer bottlenecks ahead of sequencer's own consensus/journal path —
-what's left above 115k is sequencer's own ceiling, not a separate
-relay-side one.
+**Confirmed on the live fleet, both fixes together** (an earlier
+`seq-relay.csv`, since superseded by the reactor rewrite below): p50
+flat at 3.1-5.1ms from 10k through 115k req/s, then a real cliff at
+130k — landing at essentially the *same* rate as phase 1's own knee
+(submission to synchronous consensus ack, no relay involved, flat to
+~115k, plateau ~123-126k; see `raft-tests/sweep/mkcharts.py`'s
+`"sequencer"` CFG entry). The relay no longer bottlenecked ahead of
+sequencer's own consensus/journal path — but 3-5ms of *relay-added*
+latency on top of a ~1-1.5ms ack path was still a lot, prompting the
+next round.
+
+## Rewriting Subscribe onto gRPC's callback/reactor API
+
+Batching fixed throughput; it didn't fix latency the way a blocking
+synchronous `Write()` call still could. Every `Write()` ties up a
+dedicated OS thread for the full completion-queue round trip of that
+one call — the same non-blocking-queue-and-return shape
+`brpc::StreamWrite` already has on the `RelaySession` side, but the
+*sync* gRPC streaming API doesn't. Rewrote `Subscribe` onto
+`grpc::ServerWriteReactor<RecordBatch>` (`RelaySubscribeReactor`,
+`relay_grpc_service_impl.hpp`): a dedicated "pump" thread still waits
+for the journal to become readable and spin-then-backs-off when idle
+(the same idiom `bench/load_generator`'s own
+`RelayObserver::waitForTag` already uses — sub-millisecond common
+case, not a flat 5ms poll interval), but writes now go through
+`StartWrite()`/`OnWriteDone()` instead of a blocking call, and
+`OnCancel()` replaces polling `context->IsCancelled()` entirely (no
+equivalent of bug #2 above is even possible here — there's nothing
+left to poll).
+
+**Result, live fleet, both fixes plus the reactor rewrite**
+(`raft-tests/sequencer/seq-relay.csv`): p50 649us-1.3ms from 10k
+through 100k req/s — comfortably under phase 1's own synchronous-ack
+p50 at the same rates (the relay tails the journal directly; the ack
+path pays an extra hop back through the input gateway the relay
+doesn't). This did *not* reach the sub-1ms-at-100k target exactly
+(measured 1.27-1.4ms at 100k across repeated runs), and it came with a
+real trade-off: the safe throughput ceiling moved from 130k **down**
+to 115k — worse, not better, than the simpler batched-but-synchronous
+version above. Two follow-up experiments, both against that open
+question:
+
+- **Chaining writes directly from `OnWriteDone`, skipping the pump
+  thread's wake-up entirely**, on the theory that the cross-thread
+  condvar wake/schedule round trip between a gRPC callback thread and
+  a parked pump thread was the ceiling's cause. Measured worse, not
+  better: p50 at 100k went from 1272-1383us to 1754us, with no change
+  to the 115k ceiling. Reverted (see git history) — kept the simpler,
+  better-measured pump-thread-driven version instead.
+- **Sweeping `--relay_max_batch_records`** (128 / 1024 / 8192) at
+  100k req/s: p50 barely moved (1438 / 1424 / 1264us) — a mild edge
+  for larger batches, not the multi-hundred-microsecond lever the
+  ceiling would need to explain itself. 128 showed a much worse tail
+  (p99 24.7ms vs ~3-4ms at 1024/8192) and a hugely inflated
+  `RelayObserver` queue depth (253k vs ~1.5k), consistent with smaller
+  batches also costing the *client* more `Read()` calls for the same
+  data — a real reason to avoid going too small, not a reason to
+  believe batch size explains the 115k ceiling.
+
+**The 115k-vs-130k ceiling regression is still unexplained.** Neither
+follow-up found the mechanism. Worth investigating with proper
+profiling (`perf`, gRPC's own internal tracing) rather than further
+guess-and-check tuning if it matters enough to chase further — the
+current default (`--relay_max_batch_records=1024`, the reactor
+rewrite) is the better trade of the options actually measured, but
+it's a trade, not a strict improvement over the synchronous+batched
+version in every dimension.
 
 ## Testing
 
