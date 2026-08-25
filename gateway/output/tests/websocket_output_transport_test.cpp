@@ -2,6 +2,15 @@
 // WebSocket client connects over a real socket, and the test drives
 // Fanout::broadcast/toSession directly, verifying actual network
 // delivery (not just that the code compiles against Beast's API).
+//
+// Every broadcast()/toSession() call here is followed by an explicit
+// flush() — unlike production use (OutputGatewayImpl::tailLoop() calls
+// it once per gathered batch), these tests call the transport directly
+// with nothing else driving that cadence, and broadcast()/toSession()
+// only *accumulate* now (see websocket_output_transport.cpp's own top
+// comment) — without an explicit flush() nothing is ever actually
+// sent, which is exactly the hang this comment exists to prevent
+// re-introducing.
 
 #include <sequencer/websocket_output_transport.hpp>
 
@@ -12,6 +21,8 @@
 #include <boost/beast/websocket.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -40,15 +51,41 @@ class TestWsClient {
     ws_.handshake("127.0.0.1", "/" + topic);
   }
 
+  // Reads span whatever frame shape the server happened to send them
+  // in (see websocket_output_transport.cpp's own batching comment) —
+  // doles out one payload at a time regardless, pulling a fresh frame
+  // off the socket whenever the buffered one is exhausted.
   std::string readOne() {
-    beast::flat_buffer buffer;
-    ws_.read(buffer);
-    return beast::buffers_to_string(buffer.data());
+    if (buffered_.empty()) {
+      beast::flat_buffer buffer;
+      ws_.read(buffer);
+      const std::string frame = beast::buffers_to_string(buffer.data());
+      std::size_t offset = 0;
+      while (offset + 4 <= frame.size()) {
+        const auto length = static_cast<std::uint32_t>(static_cast<unsigned char>(frame[offset]) << 24 |
+                                                          static_cast<unsigned char>(frame[offset + 1]) << 16 |
+                                                          static_cast<unsigned char>(frame[offset + 2]) << 8 |
+                                                          static_cast<unsigned char>(frame[offset + 3]));
+        offset += 4;
+        if (offset + length > frame.size()) {
+          break;  // truncated frame; shouldn't happen, drop rather than misparse
+        }
+        buffered_.push_back(frame.substr(offset, length));
+        offset += length;
+      }
+      if (buffered_.empty()) {
+        throw std::runtime_error("server sent a frame with no decodable payloads");
+      }
+    }
+    std::string payload = std::move(buffered_.front());
+    buffered_.pop_front();
+    return payload;
   }
 
  private:
   net::io_context ioContext_;
   websocket::stream<tcp::socket> ws_;
+  std::deque<std::string> buffered_;
 };
 
 Bytes bytesOf(const std::string& s) {
@@ -80,6 +117,7 @@ TEST(WebSocketOutputTransport, BroadcastDeliversToConnectedClient) {
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
   transport.broadcast("totals", bytesOf(R"({"sequence_number":1,"total":5})"));
+  transport.flush();
 
   const std::string message = client->readOne();
   EXPECT_EQ(message, R"({"sequence_number":1,"total":5})");
@@ -98,6 +136,7 @@ TEST(WebSocketOutputTransport, MultipleMessagesArriveInOrder) {
   transport.broadcast("totals", bytesOf("first"));
   transport.broadcast("totals", bytesOf("second"));
   transport.broadcast("totals", bytesOf("third"));
+  transport.flush();
 
   EXPECT_EQ(client->readOne(), "first");
   EXPECT_EQ(client->readOne(), "second");
@@ -126,6 +165,7 @@ TEST(WebSocketOutputTransport, TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn) {
 
   transport.broadcast("totals", bytesOf("for totals"));
   transport.broadcast("alerts", bytesOf("for alerts"));
+  transport.flush();
 
   EXPECT_EQ(totalsClient->readOne(), "for totals");
   EXPECT_EQ(alertsClient->readOne(), "for alerts");

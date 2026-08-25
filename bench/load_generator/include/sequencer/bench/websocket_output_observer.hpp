@@ -116,10 +116,14 @@ class WebSocketOutputObserver final : public OutputGatewayObserver {
 
   // The only job this thread has: keep calling read() as fast as
   // Beast can deliver, capturing the arrival instant immediately and
-  // handing the frame straight to the correlator — same discipline
+  // handing each payload straight to the correlator — same discipline
   // GrpcOutputObserver::readLoop() and RelayObserver::readLoop() both
   // follow, for the same reason (see sequence_correlator.hpp's own
-  // top comment).
+  // top comment). Each frame may itself be a batch of several
+  // length-prefixed payloads now (WebSocketOutputTransport::flush(),
+  // gateway/output/src/websocket_output_transport.cpp) — see that
+  // file's own top comment for why a raw concatenation wouldn't decode
+  // correctly and what the 4-byte big-endian length prefix is for.
   void readLoop() {
     boost::beast::flat_buffer buffer;
     while (!stopRequested_.load(std::memory_order_relaxed)) {
@@ -129,7 +133,20 @@ class WebSocketOutputObserver final : public OutputGatewayObserver {
         break;  // socket closed (stop()) or a genuine transport error either way
       }
       const std::int64_t nowUs = nowMicros();
-      correlator_.deliver(boost::beast::buffers_to_string(buffer.data()), nowUs);
+      const std::string frame = boost::beast::buffers_to_string(buffer.data());
+      std::size_t offset = 0;
+      while (offset + 4 <= frame.size()) {
+        const auto length = static_cast<std::uint32_t>(static_cast<unsigned char>(frame[offset]) << 24 |
+                                                          static_cast<unsigned char>(frame[offset + 1]) << 16 |
+                                                          static_cast<unsigned char>(frame[offset + 2]) << 8 |
+                                                          static_cast<unsigned char>(frame[offset + 3]));
+        offset += 4;
+        if (offset + length > frame.size()) {
+          break;  // truncated frame; shouldn't happen, drop rather than misparse
+        }
+        correlator_.deliver(frame.substr(offset, length), nowUs);
+        offset += length;
+      }
       buffer.consume(buffer.size());
     }
   }

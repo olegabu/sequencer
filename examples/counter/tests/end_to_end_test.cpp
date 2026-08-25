@@ -26,6 +26,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -68,15 +69,42 @@ class TestWsClient {
     ws_.handshake("127.0.0.1", "/totals");
   }
 
+  // Reads span whatever frame shape the server happened to send them
+  // in (gateway/output/src/websocket_output_transport.cpp's own
+  // batching comment) — doles out one payload at a time regardless,
+  // pulling a fresh frame off the socket whenever the buffered one is
+  // exhausted.
   std::string readOne() {
-    beast::flat_buffer buffer;
-    ws_.read(buffer);
-    return beast::buffers_to_string(buffer.data());
+    if (buffered_.empty()) {
+      beast::flat_buffer buffer;
+      ws_.read(buffer);
+      const std::string frame = beast::buffers_to_string(buffer.data());
+      std::size_t offset = 0;
+      while (offset + 4 <= frame.size()) {
+        const auto length = static_cast<std::uint32_t>(static_cast<unsigned char>(frame[offset]) << 24 |
+                                                          static_cast<unsigned char>(frame[offset + 1]) << 16 |
+                                                          static_cast<unsigned char>(frame[offset + 2]) << 8 |
+                                                          static_cast<unsigned char>(frame[offset + 3]));
+        offset += 4;
+        if (offset + length > frame.size()) {
+          break;  // truncated frame; shouldn't happen, drop rather than misparse
+        }
+        buffered_.push_back(frame.substr(offset, length));
+        offset += length;
+      }
+      if (buffered_.empty()) {
+        throw std::runtime_error("server sent a frame with no decodable payloads");
+      }
+    }
+    std::string payload = std::move(buffered_.front());
+    buffered_.pop_front();
+    return payload;
   }
 
  private:
   net::io_context ioContext_;
   websocket::stream<tcp::socket> ws_;
+  std::deque<std::string> buffered_;
 };
 
 std::unique_ptr<TestWsClient> connectWithRetry(int port, std::chrono::seconds timeout) {

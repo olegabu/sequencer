@@ -8,6 +8,7 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/websocket.hpp>
 
+#include <cstdint>
 #include <deque>
 #include <future>
 #include <mutex>
@@ -26,6 +27,22 @@
 // Beast answer to that: one io_context, one thread running it, and
 // broadcast()/toSession() never touch a stream directly — they
 // boost::asio::post the actual write onto that thread instead.
+//
+// toSession()/broadcast() accumulate into a per-session pending buffer
+// rather than posting immediately — flush() is what actually posts,
+// once per session with anything pending, batching whatever arrived
+// since the last flush into one net::post() + one websocket text
+// frame instead of one of each per payload. Same reasoning as
+// StreamFanout's own append()/flush() (gateway/output/src/
+// stream_fanout.hpp, brpc's transport) and the same framing choice:
+// websocket is message-oriented like brpc's own Stream (one
+// async_write() call is one frame, not raw bytes a receiver must frame
+// itself), so a plain concatenation of several payloads would produce
+// one corrupted, unparseable frame instead of several correct ones —
+// each accumulated payload gets its own 4-byte big-endian length
+// prefix, not a protobuf envelope, for the same reason StreamFanout's
+// own comment gives: this transport's whole point is carrying an
+// OutputCodec's bytes completely unmodified.
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -94,6 +111,7 @@ struct WebSocketOutputTransport::Impl {
   std::mutex registryMutex;
   std::unordered_map<SessionId, std::shared_ptr<Connection>> sessionToConnection;
   std::unordered_map<std::string, std::unordered_set<SessionId>> topicToSessions;
+  std::unordered_map<SessionId, std::string> pending;  // length-prefixed, accumulated by appendPending(), sent by flush()
   std::atomic<SessionId> nextSessionId{1};
 
   void doAccept() {
@@ -121,6 +139,10 @@ struct WebSocketOutputTransport::Impl {
     for (auto& [topic, sessions] : topicToSessions) {
       sessions.erase(sessionId);
     }
+    // A disconnected session's own unflushed bytes (if flush() hasn't
+    // run since its last appendPending()) can never be sent — drop
+    // them rather than let them accumulate in pending forever.
+    pending.erase(sessionId);
   }
 
   void postWrite(SessionId sessionId, std::shared_ptr<std::string> message) {
@@ -134,6 +156,43 @@ struct WebSocketOutputTransport::Impl {
       conn = it->second;
     }
     net::post(ioContext, [conn, message] { conn->enqueueWrite(message); });
+  }
+
+  // Appends this payload's length-prefixed frame to sessionId's
+  // pending buffer. Caller must hold registryMutex. A no-op if the
+  // session isn't currently connected, matching postWrite()'s own
+  // best-effort semantics — otherwise a delivery aimed at a session
+  // that never (re)connects would accumulate in pending forever.
+  void appendPending(SessionId sessionId, const std::shared_ptr<std::string>& message) {
+    if (sessionToConnection.find(sessionId) == sessionToConnection.end()) {
+      return;
+    }
+    std::string& buf = pending[sessionId];
+    const auto length = static_cast<std::uint32_t>(message->size());
+    buf.push_back(static_cast<char>(length >> 24));
+    buf.push_back(static_cast<char>(length >> 16));
+    buf.push_back(static_cast<char>(length >> 8));
+    buf.push_back(static_cast<char>(length));
+    buf.append(*message);
+  }
+
+  // Sends everything accumulated by appendPending() since the last
+  // flush(), one net::post()/websocket text frame per session that
+  // actually has pending data — not one per toSession()/broadcast()
+  // call. See this file's own top comment for the numbers this is
+  // modeled on (StreamFanout's own brpc-specific measurement).
+  void flush() {
+    std::unordered_map<SessionId, std::string> toSend;
+    {
+      std::lock_guard<std::mutex> lock(registryMutex);
+      if (pending.empty()) {
+        return;
+      }
+      toSend.swap(pending);
+    }
+    for (auto& [sessionId, buf] : toSend) {
+      postWrite(sessionId, std::make_shared<std::string>(std::move(buf)));
+    }
   }
 };
 
@@ -232,23 +291,22 @@ void WebSocketOutputTransport::stop() {
 
 void WebSocketOutputTransport::toSession(SessionId owner, Bytes bytes) {
   auto message = std::make_shared<std::string>(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  impl_->postWrite(owner, std::move(message));
+  std::lock_guard<std::mutex> lock(impl_->registryMutex);
+  impl_->appendPending(owner, message);
 }
 
 void WebSocketOutputTransport::broadcast(const std::string& topic, Bytes bytes) {
   auto message = std::make_shared<std::string>(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  std::vector<SessionId> targets;
-  {
-    std::lock_guard<std::mutex> lock(impl_->registryMutex);
-    const auto it = impl_->topicToSessions.find(topic);
-    if (it == impl_->topicToSessions.end()) {
-      return;
-    }
-    targets.assign(it->second.begin(), it->second.end());
+  std::lock_guard<std::mutex> lock(impl_->registryMutex);
+  const auto it = impl_->topicToSessions.find(topic);
+  if (it == impl_->topicToSessions.end()) {
+    return;
   }
-  for (SessionId sessionId : targets) {
-    impl_->postWrite(sessionId, message);
+  for (SessionId sessionId : it->second) {
+    impl_->appendPending(sessionId, message);
   }
 }
+
+void WebSocketOutputTransport::flush() { impl_->flush(); }
 
 }  // namespace sequencer

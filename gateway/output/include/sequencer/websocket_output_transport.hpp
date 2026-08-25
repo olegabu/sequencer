@@ -43,6 +43,7 @@ class WebSocketOutputTransport : public OutputTransport {
 
   void toSession(SessionId owner, Bytes bytes) override;
   void broadcast(const std::string& topic, Bytes bytes) override;
+  void flush() override;
 
   // Public so websocket_output_transport.cpp's free-standing
   // Connection class can hold a reference to it — its full definition
