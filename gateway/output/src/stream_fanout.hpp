@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -109,12 +110,37 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
   void on_closed(brpc::StreamId streamId) override { deregister(streamId); }
 
  private:
+  // Bounded retry on EAGAIN — the remote hasn't drained enough of what
+  // was already sent, expected backpressure under real throughput, not
+  // a failure. A single-shot attempt (this method's own earlier
+  // version) silently and permanently dropped the message whenever
+  // that happened, which turned out to mean *almost every* message
+  // under real load: a benchmark subscriber consuming this same
+  // broadcast at 70k records/sec received nearly none of them before
+  // this fix (bench/load_generator/'s output-gateway observers,
+  // examples/counter/README.md's own "four round trips" section).
+  // Short, not RelaySession::writeRecord()'s up-to-5-second bound
+  // (gateway/relay/src/relay_session.hpp) — deliberately: this call
+  // runs on the one tailing thread this gateway's every subscriber
+  // shares (broadcast() loops over all of them for each record), so a
+  // long retry here head-of-line-blocks every other subscriber behind
+  // one slow one, not just the slow one itself. ~10ms is enough to
+  // absorb ordinary momentary backpressure without meaningfully
+  // stalling the others; a subscriber still EAGAIN after that is
+  // genuinely not keeping up, and dropping (not blocking longer) is
+  // the right tradeoff for a shared fanout.
   void write(brpc::StreamId streamId, const Bytes& bytes) {
     butil::IOBuf buf;
     buf.append(bytes.data(), bytes.size());
-    if (brpc::StreamWrite(streamId, buf) != 0) {
-      // The client is gone; on_closed() will deregister it shortly if
-      // it hasn't already.
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      const int rc = brpc::StreamWrite(streamId, buf);
+      if (rc == 0) {
+        return;
+      }
+      if (errno != EAGAIN) {
+        return;  // the client is gone; on_closed() will deregister it shortly if it hasn't already
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
   }
 
