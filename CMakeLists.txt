@@ -23,6 +23,21 @@ if(_sequencer_ipo_supported AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
+# Strip Release binaries at link time. Every C++ dependency here is
+# linked statically (this repository's vcpkg triplet), and at least one
+# of them — vcpkg's own build of brpc — embeds full DWARF debug info
+# even in its "release" variant (verified directly: the release
+# libbrpc.a archive itself is 650 MB, not something this repository's
+# own build controls); with nothing to strip it back out, a plain
+# Release build of counter_node came to 301 MB against raft-tests/
+# braft's own equivalent (atomic_server, also fully statically linked)
+# at 16 MB, stripped. -s only affects Release — Debug and tsan keep
+# their symbols, needed for exactly the kind of gdb/backtrace debugging
+# this repository's own README accounts document doing.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  add_link_options(-s)
+endif()
+
 if(SEQUENCER_BUILD_TESTS OR SEQUENCER_BUILD_BENCHMARKS)
   enable_testing()
 endif()
