@@ -183,6 +183,116 @@ affected test case. Worth calling out again here since it's now
 recurred three-plus times across this codebase; the fix is always the
 same, and always easy to miss in a one-line test setup.
 
+## Benchmarking the output gateway: four round trips, three real bugs
+
+`bench/load_generator/`'s harness measures four round trips end to end
+against a live fleet, not just the synchronous ack path: submission to
+consensus ack (always on), to the relay gateway's own gRPC stream
+(`RelayObserver`), and — added this round — to each of the three
+output-gateway transports (brpc, real gRPC, WebSocket), via
+`SequenceCorrelator` and three concrete `OutputGatewayObserver`s. The
+missing brpc-flavored counter binary (`counter_brpc_output_gateway`,
+`brpc_output_gateway_main.cpp`) was added alongside it — the transport
+itself already existed as `RunOutputGateway`'s chassis default
+(`BrpcStreamTransport`), just never exposed as its own counter binary
+before. Flag-controlled on the load generator: `--output_observer=grpc
+|brpc|websocket` plus `--output_gateway_addr`.
+
+**This benchmark was the first thing to ever load-test the output
+gateway at real throughput**, and it found three real, pre-existing
+bugs in production code, none specific to the new observer harness:
+
+1. **`StreamFanout::write()` silently dropped messages on `EAGAIN`.**
+   Expected backpressure under real load, treated identically to "the
+   client is gone" — a benchmark subscriber at 70k records/sec received
+   almost none of them. Fixed with a short (~10ms) bounded retry.
+2. **`make clean-data` (raft-tests/) left output-gateway resume files
+   behind.** A resume file surviving while the journal it referenced
+   didn't left a gateway waiting forever for a sequence number the
+   fresh journal would never reach — an entire sweep point silently
+   reporting zero completions with no error anywhere. Fixed by also
+   clearing `output_resume_*` there.
+3. **`ResumePosition::store()` — a full open/write/close/rename
+   filesystem cycle — ran after every single delivered record.** This
+   was the dominant cost of the whole tailing loop: an output gateway
+   couldn't sustain even 10k records/sec, falling permanently behind
+   and never catching up within an entire benchmark run. Fixed by
+   persisting at most every 1000 records or 200ms, with a final,
+   unconditional persist on graceful `stop()` so the existing
+   restart-without-redelivering guarantee stays exactly true.
+
+**Then, with the harness actually working, both real transport
+bottlenecks the relay gateway had already been through this session
+showed up here too** — see [gateway/relay/README.md](../../gateway/relay/README.md)'s
+"Batching the gRPC stream" section for that original story:
+
+- **`GrpcOutputTransport`** sent one `OutputRecord` per `Write()` call
+  — measured **~1.66 seconds** p50 at 70k msg/s despite 100% delivery
+  (no drops, just enormous queueing delay). Fixed by batching into
+  `OutputRecordBatch` — the same wire-protocol change the relay's own
+  gRPC Subscribe got. Confirmed: **~4.3ms** at the same rate afterward.
+- **`OutputGatewayImpl::tailLoop()`** called the transport once per
+  record too, for every transport, not just gRPC — live profiling
+  (brpc and gRPC showing near-identical ~4.7-5ms p50 at 100k req/s
+  despite completely different wire mechanics) pointed at this shared
+  loop rather than either transport specifically: `tailLoop()` itself
+  was barely 1% of CPU self-time in the profile, almost all of it was
+  real TCP/socket-write syscall path plus kernel spinlock contention.
+  Added `Fanout::flush()` (default no-op) and had `tailLoop()` gather
+  a batch before calling it once, instead of once per record.
+  `StreamFanout` (brpc) implements it by accumulating into a
+  length-prefixed per-stream buffer, not a protobuf envelope
+  (deliberately — this transport's whole point is carrying an
+  `OutputCodec`'s bytes completely unmodified) — decoded transparently
+  by the shared test helper and the new observer. Caught immediately
+  by the existing tests: `BrpcStreamTransport` never overrode
+  `flush()`, so nothing accumulated ever actually got sent until that
+  was added too. Confirmed: brpc **4731us → 4207us** at 100k req/s.
+
+**A further experiment — an artificial bounded batching delay — did
+not pay off, honestly reported rather than adopted.** At a steady,
+caught-up 100k req/s (not a genuine backlog), `tailLoop()`'s "grab
+whatever's available this instant" gather naturally forms small
+batches — records arrive roughly evenly spaced, not bursty — so the
+per-record write-syscall count barely drops versus fully unbatched.
+Added `--batch_window_us` (`OutputGatewayConfig::batchWindow`,
+default 0/off) to let the loop keep gathering for up to N microseconds
+once at least one record is available. Measured at 200us: p50 only
+4207us → 4107us (a 100us net gain against a 200us delay budget — most
+of the theoretical syscall savings were consumed by the delay itself),
+and **p99.9 got meaningfully worse** (9439us → 20991us) — the fixed
+delay becomes a real, visible floor under every record, with more
+variance than it saves. Not adopted as a nonzero default; kept as a
+tunable in case a different workload shape benefits more.
+
+**Where this leaves the four round trips, all measured at 100k req/s
+against the same live fleet** (braft's own bare consensus latency,
+raft-tests/sweep/knee-sweep.csv, is the floor these are all measured
+against — no sequencer/gateway layer at all):
+
+| round trip | p50 @ 100k |
+|---|---|
+| braft, bare consensus (no sequencer layer) | ~749us |
+| sequencer's own synchronous ack | ~1.6ms |
+| relay gateway (gRPC) | ~1.3-1.4ms |
+| output gateway (brpc / gRPC) | ~4.1-4.3ms |
+
+Output gateways went from broken (dropped messages, or multi-second
+queueing delay) to correct and reasonably fast, but remain the slowest
+of the four round trips and did not reach sub-millisecond — the
+`<1ms`-at-100k bar the relay gateway (mostly) cleared after its own
+reactor rewrite. Batching alone got the relay from a catastrophic 7.3s
+stall to ~3-5ms; it took moving off a blocking synchronous write API
+entirely (`grpc::ServerWriteReactor`) to get further, to 649us-1.3ms.
+brpc's own `StreamWrite()` was already non-blocking (unlike gRPC's
+synchronous API), so that specific lever isn't available here in the
+same form — the likely next step, if this gap is worth closing
+further, is a bigger architectural change to the output gateway's
+single-shared-tailing-thread design itself (closer in spirit to the
+relay's own per-subscriber pull model) rather than more parameter
+tuning along axes already tried. Not attempted here — flagged as
+future work.
+
 ## Seeing it in action
 
 ### The fastest way: `demo.sh`
