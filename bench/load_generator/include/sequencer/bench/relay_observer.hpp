@@ -145,6 +145,13 @@ class RelayObserver {
     // slot, so a reader that observes this tag is guaranteed to also
     // observe the sendTimeUs store above, not a stale one.
     tags_[slot].store(journalSequenceNumber, std::memory_order_release);
+    // See firstSeenSeq_'s own comment: records this loop as the low
+    // end of "this run's own sequence numbers", the first time it's
+    // called with anything smaller than what's recorded so far.
+    std::uint64_t floor = firstSeenSeq_.load(std::memory_order_relaxed);
+    while ((floor == 0 || journalSequenceNumber < floor) &&
+           !firstSeenSeq_.compare_exchange_weak(floor, journalSequenceNumber, std::memory_order_relaxed)) {
+    }
   }
 
   // Prints the relay-observed round-trip percentile summary. Field
@@ -161,6 +168,8 @@ class RelayObserver {
         " synchronous ack path above; see bench/load_generator/README.md)\n");
     std::printf("relay_completed=%ld\n", static_cast<long>(observed_->total_count));
     std::printf("relay_dropped_races=%ld\n", static_cast<long>(droppedRaces_.load(std::memory_order_relaxed)));
+    std::printf("relay_skipped_historical=%ld\n",
+                 static_cast<long>(skippedHistorical_.load(std::memory_order_relaxed)));
     std::printf("relay_p50_us=%ld\n", static_cast<long>(hdr_value_at_percentile(observed_, 50.0)));
     std::printf("relay_p90_us=%ld\n", static_cast<long>(hdr_value_at_percentile(observed_, 90.0)));
     std::printf("relay_p99_us=%ld\n", static_cast<long>(hdr_value_at_percentile(observed_, 99.0)));
@@ -196,6 +205,24 @@ class RelayObserver {
       const journal::RecordView view(base, static_cast<std::uint32_t>(record.raw_record().size()));
       const std::uint64_t seq = view.sequenceNumber();
       const std::size_t slot = seq & mask_;
+
+      // A record below the lowest sequence number recordSend() has
+      // ever seen cannot possibly belong to this run — it predates
+      // every request this process has made, which only happens when
+      // --relay_from_sequence_number left real prior history ahead of
+      // it (0, the default, always does against a journal that isn't
+      // fresh). Skipping the wait for these specifically, rather than
+      // treating every one as a potential race worth up to 100ms of
+      // patience, is what keeps a long backlog from turning into a
+      // multi-minute stall before this loop ever reaches live traffic
+      // — reproduced directly: 110 backlog records, all correctly
+      // recognized as unrelated, in the time waitForTag's own bound
+      // would have spent on a handful.
+      const std::uint64_t floor = firstSeenSeq_.load(std::memory_order_relaxed);
+      if (floor != 0 && seq < floor) {
+        skippedHistorical_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
 
       if (waitForTag(slot, seq)) {
         const std::int64_t sendTimeUs = sendTimesUs_[slot].load(std::memory_order_relaxed);
@@ -265,6 +292,13 @@ class RelayObserver {
 
   struct hdr_histogram* observed_ = nullptr;
   std::atomic<std::int64_t> droppedRaces_{0};
+  std::atomic<std::int64_t> skippedHistorical_{0};
+  // The lowest journal sequence number recordSend() has ever been
+  // called with — 0 means "none yet". Not the ring's own tags_ (those
+  // get reused within a run by design; this is a floor that, once
+  // set, only ever moves down): subscribeLoop() uses it to recognize
+  // "predates this run entirely" without waiting on it, see there.
+  std::atomic<std::uint64_t> firstSeenSeq_{0};
   std::atomic<bool> stopRequested_{false};
   std::atomic<bool> windowSet_{false};
   std::atomic<std::int64_t> measureStartUs_{0};
