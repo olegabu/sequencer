@@ -1,6 +1,13 @@
 // specification.md §10, §8.7: the counter example's output gateway,
 // over WebSocket via Boost.Beast — "the one place the example depends
 // on something beyond brpc."
+//
+// One of three flavors, each named for its transport:
+// brpc_output_gateway_main.cpp (the chassis's own built-in
+// BrpcStreamTransport), grpc_output_gateway_main.cpp (real gRPC), and
+// this one. They differ only in which OutputTransport they hand to
+// RunOutputGateway — same CounterOutputCodec, same journal, same
+// chassis.
 
 #include <memory>
 

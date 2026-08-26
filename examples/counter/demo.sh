@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 NODE_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_node"
 IG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_input_gateway"
-OG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_output_gateway"
+OG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_websocket_output_gateway"
 
 for bin in "$NODE_BIN" "$IG_BIN" "$OG_BIN"; do
   if [[ ! -x "$bin" ]]; then

@@ -42,9 +42,15 @@ set_target_properties(counter_input_gateway_main PROPERTIES OUTPUT_NAME counter_
 # WebSocket support) now lives in gateway/output/ — see that
 # component's CMakeLists.txt and README.md's "Topic routing" note for
 # why nothing here was actually counter-specific.
-add_executable(counter_output_gateway_main output_gateway_main.cpp)
-target_link_libraries(counter_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output_websocket sequencer::gateway_output)
-set_target_properties(counter_output_gateway_main PROPERTIES OUTPUT_NAME counter_output_gateway)
+#
+# Named for its flavor (websocket_), like the brpc and gRPC ones below:
+# this used to be the unmarked `output_gateway_main.cpp` /
+# `counter_output_gateway` purely because it was the first flavor to
+# exist, which left the one binary whose transport was hardest to guess
+# from its name as the one that didn't say.
+add_executable(counter_websocket_output_gateway_main websocket_output_gateway_main.cpp)
+target_link_libraries(counter_websocket_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output_websocket sequencer::gateway_output)
+set_target_properties(counter_websocket_output_gateway_main PROPERTIES OUTPUT_NAME counter_websocket_output_gateway)
 
 # The brpc flavor: the chassis's own built-in transport
 # (BrpcStreamTransport), needing no override and so no extra transport

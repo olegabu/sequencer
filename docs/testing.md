@@ -33,7 +33,7 @@ layer. Two tiers:
 ### Multi-process: separate OS binaries, real subprocesses
 
 These spawn the actual compiled binaries (`counter_node`,
-`counter_input_gateway`, `counter_output_gateway`) via `fork`/`execv`
+`counter_input_gateway`, `counter_websocket_output_gateway`) via `fork`/`execv`
 (see `examples/counter/tests/child_process.hpp`'s `ChildProcess`), not
 in-process stand-ins — so they exercise each binary's real
 `main()`/gflags/argv path exactly as a deployment would.
@@ -41,7 +41,7 @@ in-process stand-ins — so they exercise each binary's real
 | File | Test case(s) | What's real | What it proves |
 |---|---|---|---|
 | `examples/counter/tests/three_node_smoke_test.cpp` | `ThreeNodeSmoke.ReplicatesIdenticallyAcrossAllThreeJournals` | 3 `counter_node` processes, a real raft group, real `Propose` RPCs, real leader redirects | specification.md §2.1's "replicas lag, never diverge" — all three replicas' journals compared byte-for-byte after several proposals with leader-redirect following. |
-| `examples/counter/tests/end_to_end_test.cpp` | `CounterEndToEnd.SubmitThroughInputGatewayIsObservedThroughOutputGateway` | `counter_node` + `counter_input_gateway` + `counter_output_gateway` (3 processes) + a real WebSocket test client + a real brpc submitter | specification.md §15 item 6's deliverable: the full pipeline, client submit → input gateway → node → journal → output gateway → WebSocket broadcast, with byte-identical JSON on both the synchronous response and the broadcast. |
+| `examples/counter/tests/end_to_end_test.cpp` | `CounterEndToEnd.SubmitThroughInputGatewayIsObservedThroughOutputGateway` | `counter_node` + `counter_input_gateway` + `counter_websocket_output_gateway` (3 processes) + a real WebSocket test client + a real brpc submitter | specification.md §15 item 6's deliverable: the full pipeline, client submit → input gateway → node → journal → output gateway → WebSocket broadcast, with byte-identical JSON on both the synchronous response and the broadcast. |
 | `examples/counter/tests/kill_leader_drill_test.cpp` | both cases (see [Acceptance-checklist tests](#2-a-kill-leader-under-load-drill) below) | 3 `counter_node` processes, `SIGKILL` fault injection | Also an acceptance-checklist test — described in full there. |
 
 `examples/counter/demo.sh` is the non-`gtest` counterpart: the same

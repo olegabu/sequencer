@@ -59,7 +59,7 @@ to `gateway/output/` for any application to reuse rather than
 reimplement. This example now just links
 `sequencer::gateway_output_websocket` and passes
 `WebSocketOutputTransport` to `RunOutputGateway`'s transport-factory
-overload in `output_gateway_main.cpp` — still "the one place the
+overload in `websocket_output_gateway_main.cpp` — still "the one place the
 example depends on something beyond brpc" (§8.7), just via a shared
 dependency now instead of a private one.
 
@@ -106,7 +106,7 @@ line, since both services enable server reflection.
 ### A third output flavor: brpc, needing no override at all
 
 `brpc_output_gateway_main.cpp` completes the set alongside WebSocket
-(`output_gateway_main.cpp`) and gRPC (`grpc_output_gateway_main.cpp`):
+(`websocket_output_gateway_main.cpp`) and gRPC (`grpc_output_gateway_main.cpp`):
 the chassis's own built-in transport (`BrpcStreamTransport`), which
 `RunOutputGateway`'s single-codec-argument overload already defaults to
 — so unlike the other two, this main needed no transport override at
@@ -138,7 +138,7 @@ ctest --preset debug --output-on-failure
 | `three_node_smoke_test.cpp` | **Three real `counter_node` subprocesses** — the actual compiled binary, not a stand-in — forming a real raft group. Proposes several deltas, following leader redirects exactly as a gateway would (§8.1), then reads all three replicas' journal files directly and asserts they are **byte-for-byte identical** — the concrete proof behind §3's "replicas lag, never diverge." |
 | `replay_test.cpp` | Records a journal with the real `CounterStateMachine`, then replays it through a completely fresh instance via `tools/replay` and asserts byte-identical output — specification.md §11's determinism gate for this example, and what `.github/workflows/ci.yml` runs on every push. Complementary to `three_node_smoke_test.cpp`: that proves cross-*replica* determinism, this proves cross-*time* (record now, replay later, possibly after a rebuild) determinism — together, §2.1's full claim: "two replicas — or one replica and a later replay — produce byte-identical journals." |
 | `counter_codec_test.cpp` | Both codecs in isolation, no gateway or process involved: `CounterInputCodec` parsing valid/negative/whitespace-tolerant/missing-field/non-JSON bodies and building its response JSON; `CounterOutputCodec` broadcasting a record's total (and defaulting to `0` for a record with no outputs) to the `"totals"` topic of a recording `Fanout` test double. |
-| `end_to_end_test.cpp` | The full pipeline, four real processes (`counter_node`, `counter_input_gateway`, `counter_output_gateway`, plus a test WebSocket client connecting to the `"totals"` topic) and one real submitting `brpc::Channel`: submits three deltas through the input gateway, asserts each synchronous response and each WebSocket broadcast carry the identical, correctly-accumulating `{"sequence_number":N,"total":M}` JSON — specification.md §15 item 6's deliverable, and the closest thing in this repository to a full deployment. Verified with 10+ consecutive clean runs beyond its first pass, following this session's pattern for anything involving subprocesses and networking. |
+| `end_to_end_test.cpp` | The full pipeline, four real processes (`counter_node`, `counter_input_gateway`, `counter_websocket_output_gateway`, plus a test WebSocket client connecting to the `"totals"` topic) and one real submitting `brpc::Channel`: submits three deltas through the input gateway, asserts each synchronous response and each WebSocket broadcast carry the identical, correctly-accumulating `{"sequence_number":N,"total":M}` JSON — specification.md §15 item 6's deliverable, and the closest thing in this repository to a full deployment. Verified with 10+ consecutive clean runs beyond its first pass, following this session's pattern for anything involving subprocesses and networking. |
 | `kill_leader_drill_test.cpp` | specification.md §14's acceptance-checklist items 2 and 5: a real 3-node cluster, a client proposing continuously exactly as an input gateway would (follow redirects, retry on failure), and an abrupt `SIGKILL` — of the leader in one test, of a follower in the other — while load is in flight. Verifies dense sequence numbers straight through the fault, byte-for-byte agreement between every surviving (and the killed node's own already-committed) journal, and continued commits after the kill. Deliberately never asserts an exact post-kill total — see the file's own header comment for why, given `CounterStateMachine` has no idempotency-key deduplication. |
 
 ## A real bug this test caught
@@ -462,7 +462,7 @@ directory (colocated — see
 ```sh
 ./build/debug/examples/counter/counter_input_gateway \
   --node_peers=127.0.0.1:8100 --listen_port=8200
-./build/debug/examples/counter/counter_output_gateway \
+./build/debug/examples/counter/counter_websocket_output_gateway \
   --data_dir=/tmp/counter-node-0 --resume_file=/tmp/counter-node-0/resume \
   --listen_port=8300
 ```
