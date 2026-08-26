@@ -263,7 +263,9 @@ of the theoretical syscall savings were consumed by the delay itself),
 and **p99.9 got meaningfully worse** (9439us → 20991us) — the fixed
 delay becomes a real, visible floor under every record, with more
 variance than it saves. Not adopted as a nonzero default; kept as a
-tunable in case a different workload shape benefits more.
+tunable at the time, and removed outright in the round below, where
+per-subscriber reader-side draining made batching a consequence of
+the design rather than something to tune.
 
 **A follow-up round chased the relay's own `<1ms` result harder, with a
 mixed outcome — one real lever paid off, one didn't, honestly reported
