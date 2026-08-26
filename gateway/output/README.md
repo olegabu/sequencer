@@ -100,16 +100,39 @@ extension point: `attach(ring, topics, idleSpinIterations)`, then
 `start(port)` / `stop()`. It is deliberately **not** a `Fanout` any
 more — `Fanout` is the codec's interface, and a transport is now on
 the reading side of the ring, not the writing side.
-`RunOutputGateway` takes one via an optional `transportFactory`
-argument; the 3-argument overload (no factory) defaults to the
-chassis's own built-in `BrpcStreamTransport`
-(`src/brpc_stream_transport.hpp`), built on brpc's own full-duplex
-Streaming RPC, specification.md §8.7's zero-additional-dependency
-choice for brpc/gRPC-aware consumers. Clients call
-`OutputSubscribeService.Subscribe` (attaching a stream first, per
-brpc's usual handshake pattern) to join a topic; `Fanout::broadcast`
-reaches every session on that topic, `Fanout::toSession` one specific
-session by id.
+
+**One gateway serves a list of transports, not one.**
+`RunOutputGateway` takes a factory returning
+`OutputTransportBinding`s — a transport plus the port it listens on —
+so a single process can serve brpc, real gRPC and WebSocket
+subscribers at once. The ring is what makes that nearly free: the
+codec runs once per record and publishes once no matter how many
+transports are attached, where N single-transport processes would tail
+the journal N times, run the codec N times and keep N resume
+positions. `examples/counter`'s `counter_output_gateway` does exactly
+this (`--brpc_port` / `--grpc_port` / `--websocket_port`, 0 disabling
+each).
+
+Note this is one process on N ports, not brpc's own trick of several
+protocols on ONE port: brpc can sniff a connection's first bytes
+because it implements those protocols itself, whereas these are three
+independent libraries each owning its own acceptor.
+
+**Ports come from the application, not from a chassis flag.** A port
+belongs to a transport, and there is a second reason too:
+`gateway/input/`'s chassis already defines a `--listen_port` gflag,
+gflags flags are process-global symbols, and a binary linking both
+libraries fails to link outright. Each application main defines
+whatever port flags it wants and passes the values in.
+
+`MakeBrpcStreamTransport()` exposes the chassis's own built-in
+transport (`src/brpc_stream_transport.hpp`) for use in such a list —
+brpc's full-duplex Streaming RPC, specification.md §8.7's
+zero-additional-dependency choice for brpc/gRPC-aware consumers.
+Clients call `OutputSubscribeService.Subscribe` (attaching a stream
+first, per brpc's usual handshake pattern) to join a topic;
+`Fanout::broadcast` reaches every session on that topic,
+`Fanout::toSession` one specific session by id.
 
 **A subscriber's start cursor is captured on the registering thread**,
 not inside its newly-spawned reader. This is worth naming because
@@ -332,6 +355,7 @@ needed — `journal::JournalWriter`, matching
 |---|---|
 | `DeliversLiveRecordsInOrderToAConnectedSubscriber` | A connected subscriber receives newly-appended records, in order, byte-correct. |
 | `ResumesFromDurablePositionAfterRestartWithoutRedelivering` | Stop the gateway mid-stream, append more records, start a fresh instance pointed at the same resume file: a newly-connecting subscriber sees only the new records, never a redelivery of what was already processed before the restart. |
+| `OneGatewayServesTwoTransportsFromOneJournalTail` | A single gateway bound to both a brpc and a WebSocket port: subscribers on each receive the identical record sequence from one journal tail, one codec pass and one ring. Its payloads are raw 8-byte integers on purpose — that is what caught the text-framing bug described above. |
 
 `tests/restart_drill_test.cpp` covers specification.md §14 item 4's
 literal claim — not just "no redelivery" but "identical to an
@@ -351,6 +375,23 @@ A's.
 | `MultipleMessagesArriveInOrder` | Several broadcasts arrive in order. |
 | `BroadcastToUnknownTopicIsANoOp` | Broadcasting to a topic with no subscribers is silent — no crash, no hang. |
 | `TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn` | Two clients connected to different URL paths each receive only their own topic's broadcasts — the path-based topic routing actually works, not just compiles. |
+| `DeliversLargeAndNonUtf8Payloads` | A 300-byte payload and one containing every byte value 0-255 both arrive intact. Regression for the text-vs-binary framing bug below; it hangs against the old behaviour rather than failing an assertion. |
+
+**Frames are binary, and that is load-bearing.** This transport sent
+*text* frames until a chassis test served one journal to a brpc and a
+WebSocket subscriber at once and found the brpc one receiving records
+the WebSocket one never did. RFC 6455 requires a text frame's payload
+to be valid UTF-8; Beast enforces it, the write fails, and because
+fanout delivery is best-effort the payload is then dropped with
+nothing logged. Two things here are routinely not valid UTF-8: any
+payload that simply isn't text (this transport's contract is carrying
+an `OutputCodec`'s bytes unmodified, and nothing says they're text),
+and the 4-byte length prefix itself, which contains a byte >= 0x80 for
+any payload of 128 bytes or more. The counter example's ~40-byte JSON
+happened to dodge both, which is why this survived a full benchmark
+sweep undetected. Consumers now see Blob/ArrayBuffer in a browser
+rather than a string — the correct shape for a length-prefixed batch
+anyway.
 
 `tests/grpc_output_transport_test.cpp` drives `GrpcOutputTransport`
 with a real synchronous gRPC C++ client (`grpc::CreateChannel` +

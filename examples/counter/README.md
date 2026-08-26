@@ -58,8 +58,8 @@ joined, regardless of what it asked for) was generalized, so it moved
 to `gateway/output/` for any application to reuse rather than
 reimplement. This example now just links
 `sequencer::gateway_output_websocket` and passes
-`WebSocketOutputTransport` to `RunOutputGateway`'s transport-factory
-overload in `websocket_output_gateway_main.cpp` — still "the one place the
+`WebSocketOutputTransport` to `RunOutputGateway` in
+`websocket_output_gateway_main.cpp` — still "the one place the
 example depends on something beyond brpc" (§8.7), just via a shared
 dependency now instead of a private one.
 
@@ -103,14 +103,44 @@ and consumes the running total with
 each broadcast — no `.proto` file needed on either `grpcurl` command
 line, since both services enable server reflection.
 
+### All three at once: `counter_output_gateway`
+
+`output_gateway_main.cpp` serves any combination of the three from a
+single process, one port each:
+
+```sh
+./build/debug/examples/counter/counter_output_gateway \
+  --data_dir=... --resume_file=... \
+  --brpc_port=8600 --grpc_port=8601 --websocket_port=8602
+```
+
+A port of 0 (the default) disables that protocol; at least one must be
+set. This is strictly less work than running the single-transport
+binaries side by side: all three share one journal tail, one
+`CounterOutputCodec` pass and one `BroadcastRing`, because the chassis
+publishes each record once no matter how many transports are attached
+(see [gateway/output/README.md](../../gateway/output/README.md)'s
+"Delivery: one ring, one reader per subscriber"). Three separate
+processes would tail the journal three times over and keep three
+resume positions.
+
+It is one process on three ports, not brpc's own one-port
+multi-protocol sniffing — brpc can do that because it implements those
+protocols itself, while these are three independent libraries each
+owning its own acceptor.
+
+The single-transport binaries below still exist, and are the honest
+demonstration that an application wanting exactly one transport links
+only what that transport needs.
+
 ### A third output flavor: brpc, needing no override at all
 
 `brpc_output_gateway_main.cpp` completes the set alongside WebSocket
 (`websocket_output_gateway_main.cpp`) and gRPC (`grpc_output_gateway_main.cpp`):
-the chassis's own built-in transport (`BrpcStreamTransport`), which
-`RunOutputGateway`'s single-codec-argument overload already defaults to
-— so unlike the other two, this main needed no transport override at
-all, just the same `CounterOutputCodec` handed straight to the chassis.
+the chassis's own built-in transport (`BrpcStreamTransport`), reached
+through `sequencer::MakeBrpcStreamTransport()` — so unlike the other
+two, this binary links no transport library beyond the base
+`sequencer::gateway_output`.
 Run it exactly like the WebSocket flavor ("By hand" below), on its own
 port, alongside either or both of the others if wanted — nothing about
 the chassis or `CounterOutputCodec` restricts an application to one
