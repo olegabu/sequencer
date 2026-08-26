@@ -37,8 +37,17 @@
 
 #include "input_gateway.pb.h"
 #include "json_util.hpp"
+#include "node.pb.h"
 
-DEFINE_string(input_gateway_addr, "", "The input gateway's \"ip:port\" to submit to (required)");
+DEFINE_string(input_gateway_addr, "", "The input gateway's \"ip:port\" to submit to (required "
+              "unless --node_addr is set)");
+// The "what does the input gateway hop actually cost?" arm. See
+// ProposeRequester below for exactly what this skips and what that
+// means for reading the two numbers side by side.
+DEFINE_string(node_addr, "",
+              "Bypass the input gateway: call the node's own ProposeService at this \"ip:port\" "
+              "directly. Comma-separated endpoints are allowed; the first one that answers "
+              "without a redirect is used for the whole run.");
 DEFINE_string(mode, "open", "closed: keep thread_num outstanding. open: emit at rate");
 DEFINE_int64(rate, 0, "Target requests per second (open mode)");
 DEFINE_int32(burst, 1, "Requests per scheduled instant, sharing its scheduled time (open mode)");
@@ -77,6 +86,121 @@ namespace {
 // concurrent closed-loop sender threads never share mutable RNG state
 // — the actual value submitted plays no role in the measurement.
 std::int64_t deltaFor(std::int64_t sequence) { return (sequence % 201) - 100; }
+
+// Submits straight to a node's ProposeService, skipping the input
+// gateway entirely — the control arm for "what is that hop worth?".
+//
+// Read the two arms carefully, because this one skips three things at
+// once, not just a network hop:
+//   1. the hop itself (client -> gateway -> node becomes client -> node),
+//   2. CounterInputCodec::toInput's JSON parse — the 8-byte input is
+//      built here directly, since ProposeRequest carries raw bytes, and
+//   3. NodeProposer's per-request brpc::Channel construction (see
+//      gateway/input/src/node_proposer.hpp: it builds and Init()s a
+//      fresh Channel inside propose(), for every request; this class
+//      Init()s one channel for the whole run).
+// A deployment cannot actually skip (1) or (2) — specification.md §3.3
+// is explicit that clients submit through a gateway, and something has
+// to turn a client's wire format into an input. (3) is the one that is
+// simply a cost, not a feature.
+class ProposeRequester : public sequencer::bench::LoadGeneratorRequester {
+ public:
+  ProposeRequester(const std::string& nodeAddrs, sequencer::bench::RelayObserver* relayObserver,
+                    sequencer::bench::OutputGatewayObserver* outputObserver)
+      : relayObserver_(relayObserver), outputObserver_(outputObserver) {
+    std::vector<std::string> endpoints;
+    std::string current;
+    for (const char c : nodeAddrs) {
+      if (c == ',') {
+        if (!current.empty()) endpoints.push_back(current);
+        current.clear();
+      } else {
+        current.push_back(c);
+      }
+    }
+    if (!current.empty()) endpoints.push_back(current);
+    CHECK(!endpoints.empty()) << "--node_addr must name at least one endpoint";
+
+    // Find the leader once, synchronously, before the measured run —
+    // a redirect mid-benchmark would otherwise show up as latency that
+    // belongs to leader discovery rather than to the commit path.
+    for (const std::string& endpoint : endpoints) {
+      brpc::ChannelOptions options;
+      options.timeout_ms = 2000;
+      if (channel_.Init(endpoint.c_str(), &options) != 0) {
+        continue;
+      }
+      sequencer::node::proto::ProposeService_Stub stub(&channel_);
+      sequencer::node::proto::ProposeRequest request;
+      const std::int64_t probe = 0;
+      request.set_input(&probe, sizeof(probe));
+      sequencer::node::proto::ProposeResponse response;
+      brpc::Controller cntl;
+      stub.Propose(&cntl, &request, &response, nullptr);
+      if (!cntl.Failed() && !response.redirect() && response.error_message().empty()) {
+        LOG(INFO) << "load_generator: proposing directly to the node at " << endpoint;
+        return;
+      }
+    }
+    LOG(FATAL) << "load_generator: no endpoint in --node_addr answered as leader";
+  }
+
+  void send(std::int64_t sequence, std::int64_t sendTimeUs, std::function<void(bool ok)> onDone) override {
+    sequencer::node::proto::ProposeService_Stub stub(&channel_);
+    auto* ctx = new Context();
+    ctx->sendTimeUs = sendTimeUs;
+    ctx->relayObserver = relayObserver_;
+    ctx->outputObserver = outputObserver_;
+    ctx->onDone = std::move(onDone);
+    // The same 8-byte little-endian delta CounterInputCodec::toInput
+    // would have produced from {"delta": N}.
+    const std::int64_t delta = deltaFor(sequence);
+    ctx->request.set_input(&delta, sizeof(delta));
+    stub.Propose(&ctx->cntl, &ctx->request, &ctx->response, brpc::NewCallback(&onRpcDone, ctx));
+  }
+
+ private:
+  struct Context {
+    brpc::Controller cntl;
+    sequencer::node::proto::ProposeRequest request;
+    sequencer::node::proto::ProposeResponse response;
+    std::int64_t sendTimeUs = 0;
+    sequencer::bench::RelayObserver* relayObserver = nullptr;
+    sequencer::bench::OutputGatewayObserver* outputObserver = nullptr;
+    std::function<void(bool ok)> onDone;
+  };
+
+  static void onRpcDone(Context* rawCtx) {
+    std::unique_ptr<Context> ctx(rawCtx);
+    const bool ok = !ctx->cntl.Failed() && !ctx->response.redirect() &&
+                    ctx->response.error_message().empty();
+    if (!ok) {
+      static std::atomic<int> loggedFailures{0};
+      if (loggedFailures.fetch_add(1, std::memory_order_relaxed) < 5) {
+        LOG(WARNING) << "load_generator: propose failed: "
+                     << (ctx->cntl.Failed() ? ctx->cntl.ErrorText() : ctx->response.error_message());
+      }
+    }
+    // No JSON to parse here: ProposeResponse carries the assigned
+    // sequence number as a real field, which is exactly what the
+    // observers need to correlate a dissemination against its send.
+    if (ok && (ctx->relayObserver != nullptr || ctx->outputObserver != nullptr) &&
+        ctx->response.has_sequence_number()) {
+      const std::uint64_t seq = ctx->response.sequence_number();
+      if (ctx->relayObserver != nullptr) {
+        ctx->relayObserver->recordSend(seq, ctx->sendTimeUs);
+      }
+      if (ctx->outputObserver != nullptr) {
+        ctx->outputObserver->recordSend(seq, ctx->sendTimeUs);
+      }
+    }
+    ctx->onDone(ok);
+  }
+
+  brpc::Channel channel_;
+  sequencer::bench::RelayObserver* relayObserver_ = nullptr;
+  sequencer::bench::OutputGatewayObserver* outputObserver_ = nullptr;
+};
 
 class SubmitRequester : public sequencer::bench::LoadGeneratorRequester {
  public:
@@ -159,8 +283,8 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  if (FLAGS_input_gateway_addr.empty()) {
-    LOG(ERROR) << "load_generator: --input_gateway_addr is required";
+  if (FLAGS_input_gateway_addr.empty() && FLAGS_node_addr.empty()) {
+    LOG(ERROR) << "load_generator: one of --input_gateway_addr or --node_addr is required";
     return 1;
   }
 
@@ -225,7 +349,19 @@ int main(int argc, char** argv) {
               << FLAGS_output_gateway_addr << " (ring capacity " << ringCapacity << ")";
   }
 
-  SubmitRequester requester(FLAGS_input_gateway_addr, relayObserver.get(), outputObserver.get());
+  // Two arms of the same rig: through the input gateway (the real
+  // deployment path, specification.md §3.3) or straight to a node's
+  // Propose. See ProposeRequester's own comment for what the direct
+  // arm skips beyond the network hop.
+  std::unique_ptr<sequencer::bench::LoadGeneratorRequester> requesterOwner;
+  if (!FLAGS_node_addr.empty()) {
+    requesterOwner = std::make_unique<ProposeRequester>(FLAGS_node_addr, relayObserver.get(),
+                                                          outputObserver.get());
+  } else {
+    requesterOwner = std::make_unique<SubmitRequester>(FLAGS_input_gateway_addr, relayObserver.get(),
+                                                         outputObserver.get());
+  }
+  sequencer::bench::LoadGeneratorRequester& requester = *requesterOwner;
 
   sequencer::bench::LoadGeneratorConfig config;
   config.mode = FLAGS_mode;

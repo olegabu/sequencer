@@ -7,13 +7,31 @@
 // the last-known leader across calls — unlike a one-shot test helper,
 // a real gateway handles many requests and shouldn't rediscover the
 // leader from scratch every time.
+//
+// It caches the *channels* too, one per endpoint. An earlier version
+// cached only the leader's address and built a fresh brpc::Channel
+// inside every propose() call. brpc::Channel is explicitly safe to
+// share across threads and is meant to be long-lived (it pools sockets
+// internally), so building one per request was paying setup cost for
+// nothing.
+//
+// Worth being precise about how much that was worth, because it is
+// less than it looks: measured at 100k req/s, caching moved this
+// gateway's p50 from ~1351-1367us to ~1311-1335us — about 30us, 2-3%.
+// It is a real improvement and simply the correct way to use a
+// Channel, but it is NOT the explanation for the gap against
+// submitting straight to a node (~727us at the same rate). See
+// raft-tests/sequencer/README.md's "What the input gateway costs" for
+// where that gap actually comes from.
 
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <sequencer/payload.hpp>
@@ -42,16 +60,13 @@ class NodeProposer {
     const int maxAttempts = static_cast<int>(endpoints_.size()) + 3;
 
     for (int attempt = 0; attempt < maxAttempts; ++attempt) {
-      brpc::Channel channel;
-      brpc::ChannelOptions channelOptions;
-      channelOptions.timeout_ms = 2000;
-      channelOptions.max_retry = 0;
-      if (channel.Init(target.c_str(), &channelOptions) != 0) {
+      const std::shared_ptr<brpc::Channel> channel = channelFor(target);
+      if (channel == nullptr) {
         target = nextEndpoint(endpointIndex);
         continue;
       }
 
-      sequencer::node::proto::ProposeService_Stub stub(&channel);
+      sequencer::node::proto::ProposeService_Stub stub(channel.get());
       sequencer::node::proto::ProposeRequest request;
       request.set_input(input.data(), input.size());
       sequencer::node::proto::ProposeResponse response;
@@ -117,6 +132,34 @@ class NodeProposer {
     cachedLeader_ = target;
   }
 
+  // One long-lived channel per endpoint, shared by every request —
+  // see this file's own header comment for what building one per
+  // request cost. Returns nullptr if this endpoint can't be
+  // initialized, which the caller treats as "try the next one".
+  std::shared_ptr<brpc::Channel> channelFor(const std::string& target) {
+    {
+      std::lock_guard<std::mutex> lock(channelsMutex_);
+      const auto it = channels_.find(target);
+      if (it != channels_.end()) {
+        return it->second;
+      }
+    }
+    auto channel = std::make_shared<brpc::Channel>();
+    brpc::ChannelOptions channelOptions;
+    channelOptions.timeout_ms = 2000;
+    channelOptions.max_retry = 0;
+    if (channel->Init(target.c_str(), &channelOptions) != 0) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(channelsMutex_);
+    // Another thread may have raced us here; either instance is fine,
+    // so keep whichever landed first and let ours go.
+    const auto [it, inserted] = channels_.emplace(target, std::move(channel));
+    return it->second;
+  }
+
+  std::mutex channelsMutex_;
+  std::unordered_map<std::string, std::shared_ptr<brpc::Channel>> channels_;
   std::vector<std::string> endpoints_;
   std::mutex mutex_;
   std::optional<std::string> cachedLeader_;
