@@ -14,17 +14,34 @@ target_include_directories(counter_state_machine PUBLIC
 target_link_libraries(counter_state_machine PUBLIC sequencer::node)
 target_compile_features(counter_state_machine PUBLIC cxx_std_20)
 
-add_library(counter_codecs STATIC
-  counter_input_codec.cpp
-  counter_output_codec.cpp
-)
-add_library(counter::codecs ALIAS counter_codecs)
-
-target_include_directories(counter_codecs PUBLIC
+# One library per side, not one "codecs" library for both. A combined
+# target made every output-gateway binary link gateway_input too, and
+# both chassis define a --listen_port gflag — process-global symbols,
+# so the two collide the moment a binary pulls in both translation
+# units ("multiple definition of fLI::FLAGS_listen_port"). Splitting
+# them means an output gateway links the output side only, which is
+# also just accurate about what it depends on.
+add_library(counter_input_codec STATIC counter_input_codec.cpp)
+add_library(counter::input_codec ALIAS counter_input_codec)
+target_include_directories(counter_input_codec PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
 )
-target_link_libraries(counter_codecs PUBLIC sequencer::gateway_input sequencer::gateway_output)
-target_compile_features(counter_codecs PUBLIC cxx_std_20)
+target_link_libraries(counter_input_codec PUBLIC sequencer::gateway_input)
+target_compile_features(counter_input_codec PUBLIC cxx_std_20)
+
+add_library(counter_output_codec STATIC counter_output_codec.cpp)
+add_library(counter::output_codec ALIAS counter_output_codec)
+target_include_directories(counter_output_codec PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
+)
+target_link_libraries(counter_output_codec PUBLIC sequencer::gateway_output)
+target_compile_features(counter_output_codec PUBLIC cxx_std_20)
+
+# Convenience for anything that genuinely wants both sides (the codec
+# unit test, the input gateway mains).
+add_library(counter_codecs INTERFACE)
+add_library(counter::codecs ALIAS counter_codecs)
+target_link_libraries(counter_codecs INTERFACE counter::input_codec counter::output_codec)
 
 add_executable(counter_node_main node_main.cpp)
 target_link_libraries(counter_node_main PRIVATE counter::state_machine sequencer::node)
@@ -35,7 +52,7 @@ target_link_libraries(counter_replay_main PRIVATE counter::state_machine sequenc
 set_target_properties(counter_replay_main PROPERTIES OUTPUT_NAME counter_replay)
 
 add_executable(counter_input_gateway_main input_gateway_main.cpp)
-target_link_libraries(counter_input_gateway_main PRIVATE counter::codecs sequencer::gateway_input)
+target_link_libraries(counter_input_gateway_main PRIVATE counter::input_codec sequencer::gateway_input)
 set_target_properties(counter_input_gateway_main PROPERTIES OUTPUT_NAME counter_input_gateway)
 
 # specification.md §8.7's WebSocket OutputTransport (brpc has no native
@@ -49,7 +66,7 @@ set_target_properties(counter_input_gateway_main PROPERTIES OUTPUT_NAME counter_
 # exist, which left the one binary whose transport was hardest to guess
 # from its name as the one that didn't say.
 add_executable(counter_websocket_output_gateway_main websocket_output_gateway_main.cpp)
-target_link_libraries(counter_websocket_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output_websocket sequencer::gateway_output)
+target_link_libraries(counter_websocket_output_gateway_main PRIVATE counter::output_codec sequencer::gateway_output_websocket sequencer::gateway_output gflags::gflags_static)
 set_target_properties(counter_websocket_output_gateway_main PROPERTIES OUTPUT_NAME counter_websocket_output_gateway)
 
 # The brpc flavor: the chassis's own built-in transport
@@ -57,8 +74,22 @@ set_target_properties(counter_websocket_output_gateway_main PROPERTIES OUTPUT_NA
 # library beyond the base sequencer::gateway_output — see
 # brpc_output_gateway_main.cpp's own file comment.
 add_executable(counter_brpc_output_gateway_main brpc_output_gateway_main.cpp)
-target_link_libraries(counter_brpc_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output)
+target_link_libraries(counter_brpc_output_gateway_main PRIVATE counter::output_codec sequencer::gateway_output gflags::gflags_static)
 set_target_properties(counter_brpc_output_gateway_main PROPERTIES OUTPUT_NAME counter_brpc_output_gateway)
+
+# The combined flavor: one process serving any subset of the three
+# transports, each on its own port (output_gateway_main.cpp's own file
+# comment for why that is strictly less work than running the
+# single-transport binaries side by side). Links all three transport
+# libraries, which is exactly what the separate library targets in
+# gateway/output/ exist to make optional for applications that don't.
+add_executable(counter_output_gateway_main output_gateway_main.cpp)
+target_link_libraries(counter_output_gateway_main PRIVATE counter::output_codec
+                                                            sequencer::gateway_output
+                                                            sequencer::gateway_output_grpc
+                                                            sequencer::gateway_output_websocket
+                                                            gflags::gflags_static)
+set_target_properties(counter_output_gateway_main PROPERTIES OUTPUT_NAME counter_output_gateway)
 
 add_executable(counter_load_generator_main load_generator_main.cpp)
 target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::bench_load_generator
@@ -83,7 +114,7 @@ set_property(TARGET gRPC::grpc++ APPEND PROPERTY
 # "just like" the WebSocket output gateway above. No counter-specific
 # proto or codegen needed for this half.
 add_executable(counter_grpc_output_gateway_main grpc_output_gateway_main.cpp)
-target_link_libraries(counter_grpc_output_gateway_main PRIVATE counter::codecs sequencer::gateway_output_grpc sequencer::gateway_output)
+target_link_libraries(counter_grpc_output_gateway_main PRIVATE counter::output_codec sequencer::gateway_output_grpc sequencer::gateway_output gflags::gflags_static)
 set_target_properties(counter_grpc_output_gateway_main PROPERTIES OUTPUT_NAME counter_grpc_output_gateway)
 
 # Input: a fully-typed, counter-specific gRPC service (its own proto),

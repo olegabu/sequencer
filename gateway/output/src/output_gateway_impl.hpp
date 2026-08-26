@@ -22,6 +22,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <sequencer/broadcast_ring.hpp>
 #include <sequencer/journal/reader.hpp>
@@ -35,7 +37,9 @@ namespace sequencer::gateway::output::detail {
 struct OutputGatewayConfig {
   std::filesystem::path dataDir;     // a node's journal directory, colocated (§3)
   std::filesystem::path resumeFile;  // durable resume position
-  int listenPort = 0;
+  // No listen port here: a port belongs to a transport, and this
+  // gateway drives a list of them (see the constructor). One journal
+  // tail, one codec pass, one ring — N protocols on N ports.
   // BroadcastRing sizing. 65536 slots of (up to) 512 bytes = 32MB —
   // ~650ms of headroom at 100k records/sec before a completely stalled
   // reader is overrun and disconnected. A codec output larger than
@@ -53,14 +57,35 @@ struct OutputGatewayConfig {
 
 class OutputGatewayImpl {
  public:
+  // One transport bound to the port it should listen on.
+  struct Binding {
+    std::unique_ptr<sequencer::OutputTransport> transport;
+    int listenPort = 0;
+  };
+
+  // Any number of transports share this gateway's single journal tail,
+  // single codec pass and single ring — the ring publishes each record
+  // once no matter how many transports are attached, so serving three
+  // protocols costs the producer exactly what serving one does. That
+  // is the whole reason this takes a list (see
+  // gateway/output/README.md, "Delivery: one ring, one reader per
+  // subscriber"); under the old push design N transports would have
+  // meant N per-record hand-offs.
   OutputGatewayImpl(OutputGatewayConfig config, std::unique_ptr<sequencer::OutputCodec> codec,
-                     std::unique_ptr<sequencer::OutputTransport> transport)
+                     std::vector<Binding> bindings)
       : config_(std::move(config)),
         codec_(std::move(codec)),
-        transport_(std::move(transport)),
+        bindings_(std::move(bindings)),
         resumePosition_(config_.resumeFile),
         ring_(config_.ringSlots, config_.ringMaxPayload),
         ringFanout_(ring_, topics_) {}
+
+  // Single-transport convenience, for callers (and tests) that only
+  // ever want one.
+  OutputGatewayImpl(OutputGatewayConfig config, std::unique_ptr<sequencer::OutputCodec> codec,
+                     std::unique_ptr<sequencer::OutputTransport> transport, int listenPort)
+      : OutputGatewayImpl(std::move(config), std::move(codec),
+                           makeSingleton(std::move(transport), listenPort)) {}
 
   OutputGatewayImpl(const OutputGatewayImpl&) = delete;
   OutputGatewayImpl& operator=(const OutputGatewayImpl&) = delete;
@@ -75,8 +100,10 @@ class OutputGatewayImpl {
   }
 
   void start() {
-    transport_->attach(ring_, topics_, config_.idleSpinIterations);
-    transport_->start(config_.listenPort);
+    for (Binding& b : bindings_) {
+      b.transport->attach(ring_, topics_, config_.idleSpinIterations);
+      b.transport->start(b.listenPort);
+    }
     tailThread_ = std::thread([this] { tailLoop(); });
     started_ = true;
   }
@@ -93,14 +120,14 @@ class OutputGatewayImpl {
     // stop(), even though a batched write cadence means an ungraceful
     // crash could now redeliver up to one batch's worth of records.
     resumePosition_.store(nextSeq_);
-    // Transport last: its per-subscriber readers drain the ring
+    // Transports last: their per-subscriber readers drain the ring
     // directly, so everything published before this point is still
     // deliverable until stop() disconnects them.
-    transport_->stop();
+    for (Binding& b : bindings_) {
+      b.transport->stop();
+    }
     started_ = false;
   }
-
-  int listenPort() const { return config_.listenPort; }
 
  private:
   // The codec publishes into the ring, never touches a transport —
@@ -189,9 +216,16 @@ class OutputGatewayImpl {
     }
   }
 
+  static std::vector<Binding> makeSingleton(std::unique_ptr<sequencer::OutputTransport> transport,
+                                             int listenPort) {
+    std::vector<Binding> v;
+    v.push_back(Binding{std::move(transport), listenPort});
+    return v;
+  }
+
   OutputGatewayConfig config_;
   std::unique_ptr<sequencer::OutputCodec> codec_;
-  std::unique_ptr<sequencer::OutputTransport> transport_;
+  std::vector<Binding> bindings_;
   ResumePosition resumePosition_;
   sequencer::TopicRegistry topics_;
   sequencer::BroadcastRing ring_;

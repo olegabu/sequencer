@@ -13,14 +13,28 @@
 // alternative pattern on the submission side.
 
 #include <memory>
+#include <vector>
+
+#include <gflags/gflags.h>
 
 #include <sequencer/grpc_output_transport.hpp>
 #include <sequencer/output_gateway.hpp>
 
 #include "counter_output_codec.hpp"
 
+// Defined here rather than by the chassis: a port belongs to a
+// transport, and gateway/input/'s chassis already owns the
+// --listen_port flag name process-wide (see output_gateway.hpp).
+DEFINE_int32(listen_port, 0, "This gateway's own client-facing port (required)");
+
 int main(int argc, char** argv) {
   return sequencer::RunOutputGateway(
-      argc, argv, std::make_unique<sequencer::examples::counter::CounterOutputCodec>(),
-      [] { return std::make_unique<sequencer::GrpcOutputTransport>(); });
+      argc, argv, std::make_unique<sequencer::examples::counter::CounterOutputCodec>(), [] {
+        return std::vector<sequencer::OutputTransportBinding>{
+            {[] {
+               return std::unique_ptr<sequencer::OutputTransport>(
+                   std::make_unique<sequencer::GrpcOutputTransport>());
+             },
+             FLAGS_listen_port}};
+      });
 }

@@ -8,14 +8,22 @@
 #include <chrono>
 #include <csignal>
 #include <functional>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "brpc_stream_transport.hpp"
 #include "output_gateway_impl.hpp"
 
 DEFINE_string(data_dir, "", "A node's journal directory to tail, colocated (required)");
 DEFINE_string(resume_file, "", "Where to durably persist this gateway's resume position (required)");
-DEFINE_int32(listen_port, 0, "This gateway's own client-facing port (required)");
+// No --listen_port here on purpose. A port belongs to a transport, not
+// to the chassis, and this chassis serves a list of them. It also
+// cannot own that flag name: gateway/input/'s own chassis already
+// defines --listen_port, and gflags flags are process-global symbols,
+// so any binary linking both libraries failed to link at all
+// ("multiple definition of fLI::FLAGS_listen_port"). Each application
+// main defines whatever port flags it wants and passes the values in.
 // See OutputGatewayConfig's own comments (output_gateway_impl.hpp) for
 // each of these. (--batch_window_us is gone: an artifact of the old
 // push-through-per-session-queues design, obsoleted by reader-side
@@ -36,27 +44,43 @@ std::atomic<bool> gStopRequested{false};
 void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 int runOutputGatewayCommon(int argc, char** argv, std::unique_ptr<OutputCodec> codec,
-                            const std::function<std::unique_ptr<OutputTransport>()>& transportFactory) {
+                            const std::function<std::vector<OutputTransportBinding>()>& bindingsFactory) {
   google::InitGoogleLogging(argv[0]);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  if (FLAGS_data_dir.empty() || FLAGS_resume_file.empty() || FLAGS_listen_port == 0) {
-    LOG(ERROR) << "RunOutputGateway: --data_dir, --resume_file, and --listen_port are required";
+  if (FLAGS_data_dir.empty() || FLAGS_resume_file.empty()) {
+    LOG(ERROR) << "RunOutputGateway: --data_dir and --resume_file are required";
     return 1;
   }
-
   gateway::output::detail::OutputGatewayConfig config;
   config.dataDir = FLAGS_data_dir;
   config.resumeFile = FLAGS_resume_file;
-  config.listenPort = FLAGS_listen_port;
   config.ringSlots = static_cast<std::size_t>(std::max(2, FLAGS_ring_slots));
   config.ringMaxPayload = static_cast<std::size_t>(std::max(8, FLAGS_ring_max_payload));
   config.idleSpinIterations = std::max(0, FLAGS_idle_spin_iterations);
 
+  // Built after flag parsing on purpose: an application's own port
+  // flags are what decide which transports exist at all.
+  std::vector<OutputTransportBinding> requested = bindingsFactory();
+  if (requested.empty()) {
+    LOG(ERROR) << "RunOutputGateway: no transport enabled — set at least one transport's port";
+    return 1;
+  }
+  std::vector<gateway::output::detail::OutputGatewayImpl::Binding> bindings;
+  std::string ports;
+  for (OutputTransportBinding& b : requested) {
+    if (b.listenPort == 0) {
+      LOG(ERROR) << "RunOutputGateway: a transport was registered with no port";
+      return 1;
+    }
+    bindings.push_back({b.factory(), b.listenPort});
+    ports += (ports.empty() ? "" : ",") + std::to_string(b.listenPort);
+  }
+
   gateway::output::detail::OutputGatewayImpl gateway(std::move(config), std::move(codec),
-                                                       transportFactory());
+                                                       std::move(bindings));
   gateway.start();
-  LOG(INFO) << "output gateway started: listen_port=" << FLAGS_listen_port
+  LOG(INFO) << "output gateway started: listen_ports=" << ports
             << " data_dir=" << FLAGS_data_dir;
 
   std::signal(SIGINT, handleStopSignal);
@@ -72,15 +96,13 @@ int runOutputGatewayCommon(int argc, char** argv, std::unique_ptr<OutputCodec> c
 
 }  // namespace
 
-int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec) {
-  return runOutputGatewayCommon(argc, argv, std::move(codec), [] {
-    return std::make_unique<gateway::output::detail::BrpcStreamTransport>();
-  });
+std::unique_ptr<OutputTransport> MakeBrpcStreamTransport() {
+  return std::make_unique<gateway::output::detail::BrpcStreamTransport>();
 }
 
 int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec,
-                      std::function<std::unique_ptr<OutputTransport>()> transportFactory) {
-  return runOutputGatewayCommon(argc, argv, std::move(codec), transportFactory);
+                      std::function<std::vector<OutputTransportBinding>()> bindingsFactory) {
+  return runOutputGatewayCommon(argc, argv, std::move(codec), bindingsFactory);
 }
 
 }  // namespace sequencer

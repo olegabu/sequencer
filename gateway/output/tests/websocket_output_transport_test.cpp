@@ -157,6 +157,41 @@ TEST(WebSocketOutputTransport, BroadcastToUnknownTopicIsANoOp) {
   transport.stop();
 }
 
+// Regression for the text-vs-binary framing bug (see
+// src/websocket_output_transport.cpp's wire-format comment). Two
+// independent ways a frame stops being valid UTF-8, both of which the
+// old text framing dropped silently:
+//   - a payload of 128 bytes or more puts a byte >= 0x80 into the
+//     4-byte length prefix, and
+//   - a payload that is simply not text.
+TEST(WebSocketOutputTransport, DeliversLargeAndNonUtf8Payloads) {
+  BroadcastRing ring(1024, 4096);
+  TopicRegistry topics;
+  WebSocketOutputTransport transport;
+  transport.attach(ring, topics, 100);
+  transport.start(28975);
+
+  std::unique_ptr<TestWsClient> client = connectWithRetry(28975, "totals", std::chrono::seconds(2));
+  ASSERT_NE(client, nullptr);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // 300 bytes: length prefix is 00 00 01 2C, and 0x2C is fine — but
+  // the payload below is what makes the frame non-text regardless.
+  const std::string large(300, 'x');
+  std::string binary;
+  for (int b = 0; b < 256; ++b) {
+    binary.push_back(static_cast<char>(b));
+  }
+
+  publishBroadcast(ring, topics, "totals", large);
+  publishBroadcast(ring, topics, "totals", binary);
+
+  EXPECT_EQ(client->readOne(), large);
+  EXPECT_EQ(client->readOne(), binary);
+
+  transport.stop();
+}
+
 TEST(WebSocketOutputTransport, TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn) {
   BroadcastRing ring(1024, 512);
   TopicRegistry topics;

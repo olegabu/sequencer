@@ -88,8 +88,8 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
   OutputGatewayConfig configA;
   configA.dataDir = dirA;
   configA.resumeFile = dirA / "resume";
-  configA.listenPort = 28981;
-  OutputGatewayImpl gatewayA(configA, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>());
+  constexpr int portA = 28981;
+  OutputGatewayImpl gatewayA(configA, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>(), portA);
   gatewayA.start();
 
   brpc::Channel channelA;
@@ -109,11 +109,11 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
   OutputGatewayConfig configB;
   configB.dataDir = dirB;
   configB.resumeFile = dirB / "resume";
-  configB.listenPort = 28982;
+  constexpr int portB = 28982;
 
   std::vector<std::int64_t> deliveredByB;
   {
-    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>());
+    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>(), portB);
     gatewayB.start();
     brpc::Channel channel;
     brpc::ChannelOptions channelOptions;
@@ -133,7 +133,7 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
     // from.
   }
   {
-    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>());
+    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>(), portB);
     gatewayB.start();
     brpc::Channel channel;
     brpc::ChannelOptions channelOptions;

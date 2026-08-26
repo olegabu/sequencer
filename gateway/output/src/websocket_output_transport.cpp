@@ -41,8 +41,8 @@
 // strict single-thread stream access (a raw socket close, not a
 // websocket operation).
 //
-// Wire format unchanged: one text frame per drained batch, each
-// payload framed by a 4-byte big-endian length prefix — websocket is
+// Wire format: one **binary** frame per drained batch, each payload
+// framed by a 4-byte big-endian length prefix — websocket is
 // message-oriented like brpc's Stream (one write is one frame), so a
 // raw concatenation would arrive as one corrupted frame; the length
 // prefix is the minimal framing that keeps an OutputCodec's bytes
@@ -50,6 +50,22 @@
 // stream_fanout.hpp's). Decoded by websocket_output_transport_test's
 // client, the counter example's e2e test client, and
 // bench/load_generator's WebSocket observer.
+//
+// Binary, not text, and this is not cosmetic. RFC 6455 requires a text
+// frame's payload to be valid UTF-8, and Beast enforces it: a write
+// that violates it fails, and since a fanout write is best-effort the
+// payload is then dropped with nothing logged. Two things here are
+// routinely not valid UTF-8. The length prefix itself: any payload of
+// 128 bytes or more puts a byte >= 0x80 in it, which is a UTF-8 lead
+// byte with no valid continuation. And the payloads, which are
+// whatever an OutputCodec emits — this transport's whole contract is
+// carrying those bytes unmodified, and nothing says they are text.
+// Sending text frames silently broke both cases; a chassis test
+// serving one journal to a brpc and a WebSocket subscriber at once
+// caught it, because the brpc subscriber received records the
+// WebSocket one never did. Consumers see Blob/ArrayBuffer in a
+// browser rather than a string, which is the correct shape for a
+// length-prefixed batch anyway.
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -170,7 +186,7 @@ struct WebSocketOutputTransport::Impl {
     IdleStrategy idle(idleSpinIterations);
     constexpr int kMaxBatch = 1024;
     std::string frame;
-    session.ws.text(true);
+    session.ws.binary(true);
     while (!session.stop.load(std::memory_order_relaxed)) {
       frame.clear();
       int gathered = 0;
