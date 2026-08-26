@@ -3,6 +3,19 @@
 // The generic chassis loop of specification.md §8.6, concretely: this
 // is `RunInputGateway`'s body. Every line here is generic except the
 // two calls into `codec_` — exactly the split §8.6 argues for.
+//
+// The proposal is issued ASYNCHRONOUSLY and this handler returns
+// immediately; the response is finished from the proposer's callback.
+// That matters because a gateway makes exactly one proposal per
+// client request, so a handler that waits for the node in place holds
+// a brpc worker for a full cross-AZ round trip and the gateway's
+// capacity becomes (workers / RTT) — nothing to do with the raft group
+// behind it. Measured: at 100k req/s the raft group answers in ~727us
+// when a client calls it directly, while the same load through a
+// blocking gateway measured ~1320us, and merely raising the gateway's
+// worker count to 256 moved that to ~891us. Async removes the ceiling
+// rather than raising it. See raft-tests/sequencer/README.md's "What
+// the input gateway costs".
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
@@ -28,6 +41,8 @@ class SubmitServiceImpl : public sequencer::gateway::input::proto::SubmitService
               const sequencer::gateway::input::proto::SubmitRequest* /*request*/,
               sequencer::gateway::input::proto::SubmitResponse* /*response*/,
               ::google::protobuf::Closure* done) override {
+    // Guards only the early-return paths below; once the proposal is
+    // handed off it is released, and the callback owns `done`.
     brpc::ClosureGuard doneGuard(done);
     auto* cntl = static_cast<brpc::Controller*>(controllerBase);
 
@@ -54,20 +69,26 @@ class SubmitServiceImpl : public sequencer::gateway::input::proto::SubmitService
       return;
     }
 
-    // proposeToLeader(input) (generic).
-    const NodeProposer::Outcome outcome = proposer_.propose(input);
-    if (!outcome.ok) {
-      cntl->SetFailed(EIO, "%s", outcome.errorMessage.c_str());
-      return;
-    }
+    // proposeToLeader(input) (generic) — asynchronous, so this
+    // handler's worker is free the moment the RPC is on the wire.
+    doneGuard.release();
+    proposer_.proposeAsync(input, [this, cntl, done](NodeProposer::Outcome outcome) {
+      // Runs on a brpc callback thread once the node answers; taking
+      // the guard here is what actually completes the client's call.
+      brpc::ClosureGuard callbackGuard(done);
+      if (!outcome.ok) {
+        cntl->SetFailed(EIO, "%s", outcome.errorMessage.c_str());
+        return;
+      }
 
-    // codec->toOutput(receipt, designatedOutput) — application
-    // knowledge again.
-    const Payload designated(outcome.designatedOutput.data(), outcome.designatedOutput.size());
-    const Bytes responseBytes = codec_.toOutput(outcome.receipt, designated);
+      // codec->toOutput(receipt, designatedOutput) — application
+      // knowledge again.
+      const Payload designated(outcome.designatedOutput.data(), outcome.designatedOutput.size());
+      const Bytes responseBytes = codec_.toOutput(outcome.receipt, designated);
 
-    // sendClientResponse(response) (generic).
-    cntl->response_attachment().append(responseBytes.data(), responseBytes.size());
+      // sendClientResponse(response) (generic).
+      cntl->response_attachment().append(responseBytes.data(), responseBytes.size());
+    });
   }
 
  private:
