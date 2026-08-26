@@ -1,16 +1,9 @@
 // Tests for WebSocketOutputTransport in isolation — a real Boost.Beast
-// WebSocket client connects over a real socket, and the test drives
-// Fanout::broadcast/toSession directly, verifying actual network
-// delivery (not just that the code compiles against Beast's API).
-//
-// Every broadcast()/toSession() call here is followed by an explicit
-// flush() — unlike production use (OutputGatewayImpl::tailLoop() calls
-// it once per gathered batch), these tests call the transport directly
-// with nothing else driving that cadence, and broadcast()/toSession()
-// only *accumulate* now (see websocket_output_transport.cpp's own top
-// comment) — without an explicit flush() nothing is ever actually
-// sent, which is exactly the hang this comment exists to prevent
-// re-introducing.
+// WebSocket client connects over a real socket, and the test publishes
+// tagged entries into a BroadcastRing the transport is attached to
+// (exactly how the chassis's RingFanout does it), verifying actual
+// network delivery through the per-connection writer-thread path (not
+// just that the code compiles against Beast's API).
 
 #include <sequencer/websocket_output_transport.hpp>
 
@@ -88,8 +81,12 @@ class TestWsClient {
   std::deque<std::string> buffered_;
 };
 
-Bytes bytesOf(const std::string& s) {
-  return Bytes(reinterpret_cast<const std::byte*>(s.data()), reinterpret_cast<const std::byte*>(s.data()) + s.size());
+// Publishes exactly the way OutputGatewayImpl's RingFanout does —
+// tagged with the interned topic id; writer threads filter on it.
+void publishBroadcast(BroadcastRing& ring, TopicRegistry& topics, const std::string& topic,
+                      const std::string& payload) {
+  ring.publish(makeTopicTag(topics.idFor(topic)), reinterpret_cast<const std::byte*>(payload.data()),
+               payload.size());
 }
 
 std::unique_ptr<TestWsClient> connectWithRetry(int port, const std::string& topic, std::chrono::seconds timeout) {
@@ -105,7 +102,10 @@ std::unique_ptr<TestWsClient> connectWithRetry(int port, const std::string& topi
 }
 
 TEST(WebSocketOutputTransport, BroadcastDeliversToConnectedClient) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   WebSocketOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28971);
 
   std::unique_ptr<TestWsClient> client = connectWithRetry(28971, "totals", std::chrono::seconds(2));
@@ -116,8 +116,7 @@ TEST(WebSocketOutputTransport, BroadcastDeliversToConnectedClient) {
   // pause avoids a broadcast landing before the session is registered.
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-  transport.broadcast("totals", bytesOf(R"({"sequence_number":1,"total":5})"));
-  transport.flush();
+  publishBroadcast(ring, topics, "totals", R"({"sequence_number":1,"total":5})");
 
   const std::string message = client->readOne();
   EXPECT_EQ(message, R"({"sequence_number":1,"total":5})");
@@ -126,17 +125,19 @@ TEST(WebSocketOutputTransport, BroadcastDeliversToConnectedClient) {
 }
 
 TEST(WebSocketOutputTransport, MultipleMessagesArriveInOrder) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   WebSocketOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28972);
 
   std::unique_ptr<TestWsClient> client = connectWithRetry(28972, "totals", std::chrono::seconds(2));
   ASSERT_NE(client, nullptr);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-  transport.broadcast("totals", bytesOf("first"));
-  transport.broadcast("totals", bytesOf("second"));
-  transport.broadcast("totals", bytesOf("third"));
-  transport.flush();
+  publishBroadcast(ring, topics, "totals", "first");
+  publishBroadcast(ring, topics, "totals", "second");
+  publishBroadcast(ring, topics, "totals", "third");
 
   EXPECT_EQ(client->readOne(), "first");
   EXPECT_EQ(client->readOne(), "second");
@@ -146,15 +147,21 @@ TEST(WebSocketOutputTransport, MultipleMessagesArriveInOrder) {
 }
 
 TEST(WebSocketOutputTransport, BroadcastToUnknownTopicIsANoOp) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   WebSocketOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28973);
   // No client connected at all; this must not crash or hang.
-  transport.broadcast("nobody-subscribed", bytesOf("hello"));
+  publishBroadcast(ring, topics, "nobody-subscribed", "hello");
   transport.stop();
 }
 
 TEST(WebSocketOutputTransport, TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   WebSocketOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28974);
 
   std::unique_ptr<TestWsClient> totalsClient = connectWithRetry(28974, "totals", std::chrono::seconds(2));
@@ -163,9 +170,8 @@ TEST(WebSocketOutputTransport, TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn) {
   ASSERT_NE(alertsClient, nullptr);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-  transport.broadcast("totals", bytesOf("for totals"));
-  transport.broadcast("alerts", bytesOf("for alerts"));
-  transport.flush();
+  publishBroadcast(ring, topics, "totals", "for totals");
+  publishBroadcast(ring, topics, "alerts", "for alerts");
 
   EXPECT_EQ(totalsClient->readOne(), "for totals");
   EXPECT_EQ(alertsClient->readOne(), "for alerts");

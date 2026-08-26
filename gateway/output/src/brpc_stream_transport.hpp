@@ -24,6 +24,11 @@ class BrpcStreamTransport : public sequencer::OutputTransport {
  public:
   BrpcStreamTransport() : subscribeService_(fanout_) {}
 
+  void attach(sequencer::BroadcastRing& ring, sequencer::TopicRegistry& topics,
+              int idleSpinIterations) override {
+    fanout_.attach(ring, topics, idleSpinIterations);
+  }
+
   void start(int listenPort) override {
     if (server_.AddService(&subscribeService_, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
       throw std::runtime_error("BrpcStreamTransport::start: AddService(OutputSubscribeService) failed");
@@ -43,16 +48,6 @@ class BrpcStreamTransport : public sequencer::OutputTransport {
     server_.Stop(0);
     server_.Join();
   }
-
-  void toSession(sequencer::SessionId owner, Bytes bytes) override { fanout_.toSession(owner, std::move(bytes)); }
-  void broadcast(const std::string& topic, Bytes bytes) override { fanout_.broadcast(topic, std::move(bytes)); }
-  // Must forward explicitly: Fanout::flush()'s own default is a no-op,
-  // and this class doesn't inherit from StreamFanout — without this
-  // override, OutputGatewayImpl::tailLoop()'s transport_->flush() call
-  // (through the OutputTransport/Fanout base pointer it actually holds)
-  // never reaches StreamFanout::flush() at all, so nothing StreamFanout
-  // accumulates via append() ever actually gets sent.
-  void flush() override { fanout_.flush(); }
 
  private:
   StreamFanout fanout_;

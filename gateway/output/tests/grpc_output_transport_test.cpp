@@ -1,8 +1,10 @@
 // Tests for GrpcOutputTransport in isolation — a real gRPC C++ client
-// connects over a real socket, and the test drives
-// Fanout::broadcast/toSession directly, verifying actual network
-// delivery (not just that the code compiles against gRPC's API).
-// Mirrors websocket_output_transport_test.cpp's shape exactly.
+// connects over a real socket, and the test publishes tagged entries
+// into a BroadcastRing the transport is attached to (exactly how the
+// chassis's RingFanout does it), verifying actual network delivery
+// through the per-subscriber reader path (not just that the code
+// compiles against gRPC's API). Mirrors
+// websocket_output_transport_test.cpp's shape exactly.
 
 #include <sequencer/grpc_output_transport.hpp>
 
@@ -60,12 +62,19 @@ class TestGrpcClient {
   std::size_t bufferPos_ = 0;
 };
 
-Bytes bytesOf(const std::string& s) {
-  return Bytes(reinterpret_cast<const std::byte*>(s.data()), reinterpret_cast<const std::byte*>(s.data()) + s.size());
+// Publishes exactly the way OutputGatewayImpl's RingFanout does —
+// tagged with the interned topic id; readers filter on it.
+void publishBroadcast(BroadcastRing& ring, TopicRegistry& topics, const std::string& topic,
+                      const std::string& payload) {
+  ring.publish(makeTopicTag(topics.idFor(topic)), reinterpret_cast<const std::byte*>(payload.data()),
+               payload.size());
 }
 
 TEST(GrpcOutputTransport, BroadcastDeliversToConnectedClient) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   GrpcOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28981);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -75,23 +84,26 @@ TEST(GrpcOutputTransport, BroadcastDeliversToConnectedClient) {
   // same race as WebSocketOutputTransport's tests, same fix.
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-  transport.broadcast("totals", bytesOf(R"({"sequence_number":1,"total":5})"));
+  publishBroadcast(ring, topics, "totals", R"({"sequence_number":1,"total":5})");
   EXPECT_EQ(client.readOne(), R"({"sequence_number":1,"total":5})");
 
   transport.stop();
 }
 
 TEST(GrpcOutputTransport, MultipleMessagesArriveInOrder) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   GrpcOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28982);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   TestGrpcClient client(28982, "totals");
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-  transport.broadcast("totals", bytesOf("first"));
-  transport.broadcast("totals", bytesOf("second"));
-  transport.broadcast("totals", bytesOf("third"));
+  publishBroadcast(ring, topics, "totals", "first");
+  publishBroadcast(ring, topics, "totals", "second");
+  publishBroadcast(ring, topics, "totals", "third");
 
   EXPECT_EQ(client.readOne(), "first");
   EXPECT_EQ(client.readOne(), "second");
@@ -101,15 +113,21 @@ TEST(GrpcOutputTransport, MultipleMessagesArriveInOrder) {
 }
 
 TEST(GrpcOutputTransport, BroadcastToUnknownTopicIsANoOp) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   GrpcOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28983);
   // No client connected at all; this must not crash or hang.
-  transport.broadcast("nobody-subscribed", bytesOf("hello"));
+  publishBroadcast(ring, topics, "nobody-subscribed", "hello");
   transport.stop();
 }
 
 TEST(GrpcOutputTransport, TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn) {
+  BroadcastRing ring(1024, 512);
+  TopicRegistry topics;
   GrpcOutputTransport transport;
+  transport.attach(ring, topics, 100);
   transport.start(28984);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -117,8 +135,8 @@ TEST(GrpcOutputTransport, TwoClientsOnDifferentTopicsOnlyReceiveTheirOwn) {
   TestGrpcClient alertsClient(28984, "alerts");
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-  transport.broadcast("totals", bytesOf("for totals"));
-  transport.broadcast("alerts", bytesOf("for alerts"));
+  publishBroadcast(ring, topics, "totals", "for totals");
+  publishBroadcast(ring, topics, "alerts", "for alerts");
 
   EXPECT_EQ(totalsClient.readOne(), "for totals");
   EXPECT_EQ(alertsClient.readOne(), "for alerts");

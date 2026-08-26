@@ -33,11 +33,9 @@ class GrpcOutputTransport : public OutputTransport {
   GrpcOutputTransport(const GrpcOutputTransport&) = delete;
   GrpcOutputTransport& operator=(const GrpcOutputTransport&) = delete;
 
+  void attach(BroadcastRing& ring, TopicRegistry& topics, int idleSpinIterations) override;
   void start(int listenPort) override;
   void stop() override;
-
-  void toSession(SessionId owner, Bytes bytes) override;
-  void broadcast(const std::string& topic, Bytes bytes) override;
 
   // Public for the same reason as WebSocketOutputTransport's Impl —
   // grpc_output_transport.cpp's free-standing service class needs to

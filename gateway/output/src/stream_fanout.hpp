@@ -1,32 +1,24 @@
 #pragma once
 
-// The concrete, built-in Fanout: delivers to clients connected via
-// OutputSubscribeService over brpc's own Streaming RPC (specification.md
-// §8.7 — the zero-additional-dependency choice for brpc/gRPC-aware
-// consumers). A different Fanout (e.g. WebSocket, via Boost.Beast) can
-// be plugged in elsewhere without touching OutputCodec or the tailing
-// loop — this is just the one this chassis ships with.
+// The brpc-side subscriber registry: accepts Subscribe streams and
+// gives each one its own reader thread draining the chassis's
+// BroadcastRing through a private cursor (see include/sequencer/
+// broadcast_ring.hpp's file comment for the whole delivery design —
+// this replaced a push-based pending-buffer scheme whose per-session
+// queueing was where multi-millisecond delivery latency measurably
+// accumulated; examples/counter/README.md's benchmark section).
 //
-// append()/flush() batch multiple toSession()/broadcast() payloads
-// into one brpc::StreamWrite() call (see flush()'s own comment for
-// why) — but brpc::Stream is message-oriented, not a raw byte stream:
-// on_received_messages() delivers whatever one StreamWrite() call
-// sent as one opaque unit, so simply concatenating several payloads'
-// raw bytes into one buffer would produce one corrupted, unparseable
-// "message" on the receiving end instead of several correct ones.
-// Each append() therefore writes its own 4-byte big-endian length
-// prefix ahead of the payload — the minimal framing that lets a batch
-// of N payloads still decode as N payloads, deliberately not a
-// protobuf envelope (unlike GrpcOutputTransport's own
-// OutputRecordBatch): this transport's whole point, per
-// specification.md §8.7 and this file's own header, is carrying an
-// OutputCodec's bytes completely unmodified, no envelope at all, for
-// consumers with no protobuf dependency of their own — the length
-// prefix is the smallest addition that preserves that while still
-// allowing a batch. gateway/output/include/sequencer/bench (this
-// repo's own benchmark observer) and gateway/output/tests/
-// collecting_stream_client.hpp both decode it; any other brpc client
-// of this transport needs to as well now.
+// Wire format unchanged from that earlier scheme: brpc::Stream is
+// message-oriented, not a raw byte stream — on_received_messages()
+// delivers whatever one StreamWrite() call sent as one opaque unit,
+// so a batch of N payloads is framed as N (4-byte big-endian length,
+// payload) pairs in one message. Deliberately not a protobuf envelope
+// (unlike GrpcOutputTransport's OutputRecordBatch): this transport's
+// whole point, per specification.md §8.7, is carrying an
+// OutputCodec's bytes completely unmodified for consumers with no
+// protobuf dependency of their own. bench/load_generator's brpc
+// observer and gateway/output/tests/collecting_stream_client.hpp both
+// decode it; any other brpc client of this transport needs to as well.
 
 #include <brpc/stream.h>
 #include <butil/iobuf.h>
@@ -35,33 +27,60 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
+#include <sequencer/broadcast_ring.hpp>
 #include <sequencer/output_codec.hpp>
 
 namespace sequencer::gateway::output::detail {
 
-class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
+class StreamFanout : public brpc::StreamInputHandler {
  public:
+  void attach(sequencer::BroadcastRing& ring, sequencer::TopicRegistry& topics, int idleSpinIterations) {
+    ring_ = &ring;
+    topics_ = &topics;
+    idleSpinIterations_ = idleSpinIterations;
+  }
+
   sequencer::SessionId nextSessionId() { return nextSessionId_.fetch_add(1, std::memory_order_relaxed); }
 
   // Registers a newly-accepted stream under `sessionId`, joined to
-  // `topic`. Called by OutputSubscribeServiceImpl right after
-  // brpc::StreamAccept.
+  // `topic`, and starts its reader thread. Called by
+  // OutputSubscribeServiceImpl right after brpc::StreamAccept — i.e.
+  // before the Subscribe RPC's response is sent, which is the ordering
+  // clients rely on: anything published after subscribe() returns must
+  // be delivered. The cursor is therefore captured HERE, on this
+  // thread, not inside the reader thread — a freshly-spawned thread
+  // can be scheduled arbitrarily late, and a head() read that happens
+  // only then would silently skip everything published in between as
+  // pre-subscription history (a real, reproduced test flake).
   void registerStream(brpc::StreamId streamId, sequencer::SessionId sessionId, const std::string& topic) {
+    auto reader = std::make_unique<Reader>();
+    Reader* readerPtr = reader.get();
+    const std::uint64_t topicTag = sequencer::makeTopicTag(topics_->idFor(topic));
+    const std::uint64_t sessionTag = sequencer::makeSessionTag(sessionId);
+    const std::uint64_t initialCursor = ring_->head();
+    // Thread started and map entry inserted under one lock hold: an
+    // on_closed() firing for this very stream must find the entry
+    // complete (thread joinable) or not find it at all — never a
+    // half-registered Reader it would join-skip and then free out
+    // from under this method.
     std::lock_guard<std::mutex> lock(mutex_);
-    sessionToStream_[sessionId] = streamId;
-    streamToSession_[streamId] = sessionId;
-    streamToTopic_[streamId] = topic;
-    topicToStreams_[topic].insert(streamId);
+    readerPtr->thread = std::thread([this, streamId, topicTag, sessionTag, initialCursor, readerPtr] {
+      readLoop(streamId, topicTag, sessionTag, initialCursor, *readerPtr);
+    });
+    readers_[streamId] = std::move(reader);
   }
 
   // Force-closes every currently-registered stream and waits for each
-  // one's on_closed() to actually fire before returning.
+  // one's on_closed() to actually fire — and its reader thread to be
+  // joined — before returning.
   //
   // Both halves matter. brpc::Server::Join() waits for its acceptor to
   // observe every accepted connection fully closed, so a client that
@@ -75,15 +94,15 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
   // exists specifically to close off. The wait (bounded, so a
   // pathological stream can never hang shutdown forever) is what turns
   // "StreamClose() was called" into "it is now safe to destroy this
-  // object." Called by OutputGatewayImpl::stop() before stopping the
+  // object." Called by BrpcStreamTransport::stop() before stopping the
   // server — and, transitively, before anything owning this fanout can
   // be destroyed.
   void closeAll() {
     std::unique_lock<std::mutex> lock(mutex_);
     std::vector<brpc::StreamId> streams;
-    streams.reserve(streamToSession_.size());
-    for (const auto& [streamId, sessionId] : streamToSession_) {
-      (void)sessionId;
+    streams.reserve(readers_.size());
+    for (const auto& [streamId, reader] : readers_) {
+      (void)reader;
       streams.push_back(streamId);
     }
     pendingClose_.insert(streams.begin(), streams.end());
@@ -95,61 +114,19 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
 
     lock.lock();
     closedCv_.wait_for(lock, std::chrono::seconds(5), [this] { return pendingClose_.empty(); });
-  }
-
-  void toSession(sequencer::SessionId owner, Bytes bytes) override {
-    brpc::StreamId streamId = brpc::INVALID_STREAM_ID;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      const auto it = sessionToStream_.find(owner);
-      if (it == sessionToStream_.end()) {
-        return;  // session not currently connected; a fanout delivery is best-effort
-      }
-      streamId = it->second;
+    // Anything still pending after the bounded wait gets its reader
+    // stopped and joined here regardless — the reader threads are
+    // this object's own and must not outlive it even if brpc never
+    // delivers an on_closed().
+    std::vector<std::unique_ptr<Reader>> leftovers;
+    for (auto& [streamId, reader] : readers_) {
+      (void)streamId;
+      leftovers.push_back(std::move(reader));
     }
-    append(streamId, bytes);
-  }
-
-  void broadcast(const std::string& topic, Bytes bytes) override {
-    std::vector<brpc::StreamId> targets;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      const auto it = topicToStreams_.find(topic);
-      if (it == topicToStreams_.end()) {
-        return;
-      }
-      targets.assign(it->second.begin(), it->second.end());
-    }
-    for (brpc::StreamId streamId : targets) {
-      append(streamId, bytes);
-    }
-  }
-
-  // Sends everything accumulated by append() since the last flush(),
-  // one brpc::StreamWrite() per stream that actually has pending data
-  // — not one per toSession()/broadcast() call. Live-fleet perf
-  // profiling of a caller doing the old one-StreamWrite()-per-record
-  // thing found ~100k/sec of individual write()/sendmsg() syscalls
-  // (plus real kernel spinlock contention on top) was the dominant
-  // cost of the whole output-gateway pipeline: measured p50 ~4.7ms at
-  // 100k msg/s despite this gateway's own tailing loop itself
-  // accounting for barely 1% of CPU self-time in that same profile —
-  // almost all of it was TCP/socket-write path, not application code.
-  // See gateway/output/src/output_gateway_impl.hpp's tailLoop() for
-  // where flush() actually gets called (once per gathered batch, not
-  // once per record) and OutputGatewayImpl::stop() for why a graceful
-  // shutdown calls it once more unconditionally.
-  void flush() override {
-    std::unordered_map<brpc::StreamId, butil::IOBuf> toSend;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (pending_.empty()) {
-        return;
-      }
-      toSend.swap(pending_);
-    }
-    for (auto& [streamId, buf] : toSend) {
-      write(streamId, buf);
+    readers_.clear();
+    lock.unlock();
+    for (auto& reader : leftovers) {
+      stopAndJoin(*reader);
     }
   }
 
@@ -160,45 +137,73 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
   void on_closed(brpc::StreamId streamId) override { deregister(streamId); }
 
  private:
-  // Bounded retry on EAGAIN — the remote hasn't drained enough of what
-  // was already sent, expected backpressure under real throughput, not
-  // a failure. A single-shot attempt (this method's own earlier
-  // version) silently and permanently dropped the message whenever
-  // that happened, which turned out to mean *almost every* message
-  // under real load: a benchmark subscriber consuming this same
-  // broadcast at 70k records/sec received nearly none of them before
-  // this fix (bench/load_generator/'s output-gateway observers,
-  // examples/counter/README.md's own "four round trips" section).
-  // Short, not RelaySession::writeRecord()'s up-to-5-second bound
-  // (gateway/relay/src/relay_session.hpp) — deliberately: this call
-  // runs on the one tailing thread this gateway's every subscriber
-  // shares (broadcast() loops over all of them for each record), so a
-  // long retry here head-of-line-blocks every other subscriber behind
-  // one slow one, not just the slow one itself. ~10ms is enough to
-  // absorb ordinary momentary backpressure without meaningfully
-  // stalling the others; a subscriber still EAGAIN after that is
-  // genuinely not keeping up, and dropping (not blocking longer) is
-  // the right tradeoff for a shared fanout.
-  // Appends this payload's length-prefixed frame to the stream's
-  // pending buffer under mutex_ — cheap (IOBuf::append is a
-  // reference-counted block append, not a copy of existing content),
-  // called once per toSession()/broadcast() call, same as write() used
-  // to be. The actual send happens in flush(); see this file's own top
-  // comment for why a length prefix, not a raw concatenation.
-  void append(brpc::StreamId streamId, const Bytes& bytes) {
-    std::uint8_t lengthPrefix[4];
-    const auto length = static_cast<std::uint32_t>(bytes.size());
-    lengthPrefix[0] = static_cast<std::uint8_t>(length >> 24);
-    lengthPrefix[1] = static_cast<std::uint8_t>(length >> 16);
-    lengthPrefix[2] = static_cast<std::uint8_t>(length >> 8);
-    lengthPrefix[3] = static_cast<std::uint8_t>(length);
+  struct Reader {
+    std::thread thread;
+    std::atomic<bool> stop{false};
+  };
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    butil::IOBuf& buf = pending_[streamId];
-    buf.append(lengthPrefix, sizeof(lengthPrefix));
-    buf.append(bytes.data(), bytes.size());
+  // One subscriber's whole delivery path, on its own thread: drain
+  // everything available from a private cursor, filter by tag, frame,
+  // one StreamWrite per drained batch; spin-then-back-off when caught
+  // up. Overrun (lapped by the producer — this reader is genuinely
+  // not keeping up) closes the stream rather than silently skipping:
+  // surfacing the slow consumer is the contract (broadcast_ring.hpp).
+  void readLoop(brpc::StreamId streamId, std::uint64_t topicTag, std::uint64_t sessionTag,
+                std::uint64_t initialCursor, Reader& reader) {
+    std::uint64_t cursor = initialCursor;
+    std::vector<std::byte> payload(ring_->maxPayload());
+    sequencer::IdleStrategy idle(idleSpinIterations_);
+    constexpr int kMaxBatch = 1024;
+    while (!reader.stop.load(std::memory_order_relaxed)) {
+      butil::IOBuf batch;
+      int gathered = 0;
+      bool overrun = false;
+      while (gathered < kMaxBatch) {
+        std::uint64_t tag = 0;
+        std::uint32_t length = 0;
+        const auto result = ring_->readOne(cursor, tag, payload.data(), length);
+        if (result == sequencer::BroadcastRing::ReadResult::Empty) {
+          break;
+        }
+        if (result == sequencer::BroadcastRing::ReadResult::Overrun) {
+          overrun = true;
+          break;
+        }
+        if (tag != topicTag && tag != sessionTag) {
+          continue;  // someone else's entry; not counted against the batch cap
+        }
+        std::uint8_t lengthPrefix[4];
+        lengthPrefix[0] = static_cast<std::uint8_t>(length >> 24);
+        lengthPrefix[1] = static_cast<std::uint8_t>(length >> 16);
+        lengthPrefix[2] = static_cast<std::uint8_t>(length >> 8);
+        lengthPrefix[3] = static_cast<std::uint8_t>(length);
+        batch.append(lengthPrefix, sizeof(lengthPrefix));
+        batch.append(payload.data(), length);
+        ++gathered;
+      }
+      if (!batch.empty()) {
+        write(streamId, batch);
+        idle.reset();
+      }
+      if (overrun) {
+        brpc::StreamClose(streamId);  // on_closed() deregisters and joins
+        return;
+      }
+      if (batch.empty()) {
+        idle.idle();
+      }
+    }
   }
 
+  // Bounded retry on EAGAIN — the remote hasn't drained enough of what
+  // was already sent, expected backpressure under real throughput, not
+  // a failure. A single-shot attempt silently and permanently dropped
+  // the message whenever that happened, which turned out to mean
+  // *almost every* message under real load (examples/counter/
+  // README.md's "four round trips" section). ~10ms total: this now
+  // runs on the one subscriber's OWN reader thread — nobody else is
+  // behind it — but an overrun-disconnect is the design's slow-
+  // consumer answer, so blocking much longer here just delays it.
   void write(brpc::StreamId streamId, const butil::IOBuf& buf) {
     for (int attempt = 0; attempt < 50; ++attempt) {
       const int rc = brpc::StreamWrite(streamId, buf);
@@ -212,40 +217,44 @@ class StreamFanout : public sequencer::Fanout, public brpc::StreamInputHandler {
     }
   }
 
-  void deregister(brpc::StreamId streamId) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto sessionIt = streamToSession_.find(streamId);
-    if (sessionIt != streamToSession_.end()) {
-      sessionToStream_.erase(sessionIt->second);
-      streamToSession_.erase(sessionIt);
-    }
-    const auto topicIt = streamToTopic_.find(streamId);
-    if (topicIt != streamToTopic_.end()) {
-      auto setIt = topicToStreams_.find(topicIt->second);
-      if (setIt != topicToStreams_.end()) {
-        setIt->second.erase(streamId);
-        if (setIt->second.empty()) {
-          topicToStreams_.erase(setIt);
-        }
+  void stopAndJoin(Reader& reader) {
+    reader.stop.store(true, std::memory_order_relaxed);
+    if (reader.thread.joinable()) {
+      // on_closed() (and thus this) can be invoked from the reader's
+      // own StreamClose() call after an overrun — never self-join.
+      if (reader.thread.get_id() == std::this_thread::get_id()) {
+        reader.thread.detach();
+      } else {
+        reader.thread.join();
       }
-      streamToTopic_.erase(topicIt);
-    }
-    // A disconnected stream's own unflushed bytes (if flush() hasn't
-    // run since its last append()) can never be sent — drop them
-    // rather than let them accumulate in pending_ forever.
-    pending_.erase(streamId);
-    if (pendingClose_.erase(streamId) > 0 && pendingClose_.empty()) {
-      closedCv_.notify_all();
     }
   }
 
+  void deregister(brpc::StreamId streamId) {
+    std::unique_ptr<Reader> reader;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto it = readers_.find(streamId);
+      if (it != readers_.end()) {
+        reader = std::move(it->second);
+        readers_.erase(it);
+      }
+      if (pendingClose_.erase(streamId) > 0 && pendingClose_.empty()) {
+        closedCv_.notify_all();
+      }
+    }
+    if (reader) {
+      stopAndJoin(*reader);
+    }
+  }
+
+  sequencer::BroadcastRing* ring_ = nullptr;
+  sequencer::TopicRegistry* topics_ = nullptr;
+  int idleSpinIterations_ = 1000;
+
   std::mutex mutex_;
   std::condition_variable closedCv_;
-  std::unordered_map<sequencer::SessionId, brpc::StreamId> sessionToStream_;
-  std::unordered_map<brpc::StreamId, sequencer::SessionId> streamToSession_;
-  std::unordered_map<brpc::StreamId, std::string> streamToTopic_;
-  std::unordered_map<std::string, std::unordered_set<brpc::StreamId>> topicToStreams_;
-  std::unordered_map<brpc::StreamId, butil::IOBuf> pending_;  // accumulated by append(), sent by flush()
+  std::unordered_map<brpc::StreamId, std::unique_ptr<Reader>> readers_;
   std::unordered_set<brpc::StreamId> pendingClose_;
   std::atomic<sequencer::SessionId> nextSessionId_{1};
 };

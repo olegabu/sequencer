@@ -22,19 +22,6 @@ class Fanout {
   virtual ~Fanout() = default;
   virtual void toSession(SessionId owner, Bytes bytes) = 0;
   virtual void broadcast(const std::string& topic, Bytes bytes) = 0;
-
-  // Signals "no more toSession()/broadcast() calls are coming right
-  // now" — an opportunity for a transport that buffers writes
-  // internally to send everything accumulated as one round trip
-  // instead of one per call. OutputGatewayImpl::tailLoop() calls this
-  // once after processing a batch of consecutive available records
-  // (and once more, unconditionally, from stop() — see there), not
-  // once per record. Default no-op: a transport that already writes
-  // immediately per call, or manages its own batching independently
-  // (GrpcOutputTransport's own consumer-side drain, WebSocketOutput
-  // Transport's own per-connection write queue), has nothing to do
-  // here.
-  virtual void flush() {}
 };
 
 class OutputCodec {

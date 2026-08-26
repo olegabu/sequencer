@@ -1,173 +1,131 @@
 #include <sequencer/grpc_output_transport.hpp>
 
+#include <sequencer/output_codec.hpp>
+
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/grpcpp.h>
 
 #include "output_grpc.grpc.pb.h"
 
+#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <deque>
-#include <mutex>
+#include <cstdint>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-// gRPC's synchronous server-streaming API runs each Subscribe() call on
-// its own dedicated thread for the call's entire lifetime — unlike
-// WebSocketOutputTransport's single-io-thread design, there is no
-// shared-object thread-safety rule to work around here, since each
-// session's grpc::ServerWriter is only ever touched from its own
-// call's thread. What IS shared across threads is the per-session
-// message queue broadcast()/toSession() push onto (from the output
-// gateway's own tailing thread) and each Subscribe() call's thread
-// drains — a plain mutex/condition_variable queue, not gRPC-specific
-// machinery.
+// gRPC's synchronous server-streaming API runs each Subscribe() call
+// on its own dedicated thread for the call's entire lifetime. Under
+// the previous push-based design that thread spent its life draining
+// a mutex/condvar queue the tailing thread fed — the hand-off whose
+// queueing delay the BroadcastRing redesign exists to remove (see
+// include/sequencer/broadcast_ring.hpp's file comment). Under the
+// ring design that same dedicated thread IS the subscriber's reader:
+// it drains the ring through its own private cursor and calls the
+// blocking Write() itself, so the sync API's thread-per-call shape —
+// previously the liability that motivated (and sank: measured no
+// better, see examples/counter/README.md) a reactor rewrite — is now
+// exactly the per-subscriber thread the design wants anyway.
 //
-// Batched, not one payload per Write() call: the original one-message-
-// per-Write() design measured ~1.66s p50 at 70k msg/s on a live fleet
-// (bench/load_generator's new output-gateway observer benchmark) —
-// the identical bottleneck class the relay's own gRPC Subscribe had
-// before its batching fix (see gateway/relay/README.md's "Batching
-// the gRPC stream" section), just reached this time via a per-session
-// push queue instead of a journal-tailing pull loop. Each drain now
-// takes everything already queued (up to a cap), not just the front
-// item — never delaying a send to wait for more to arrive, so a
-// caught-up session still gets exactly one payload per batch.
+// Batched on the wire, as before: each Write() carries an
+// OutputRecordBatch of everything the reader drained this pass —
+// never delaying a send to wait for more, so a caught-up session
+// still gets exactly one payload per batch.
 
 namespace sequencer {
 
 namespace {
 
-struct WriteQueue {
-  std::mutex mutex;
-  std::condition_variable cv;
-  std::deque<std::shared_ptr<std::string>> queue;
-  bool closed = false;
-};
-
-// Registry operations used by GenericOutputServiceImpl below — split
-// out from GrpcOutputTransport::Impl so the service class can be fully
-// defined before Impl (which owns one), while Impl's own definition
-// can still see this type. A plain struct of the shared state, not
-// GrpcOutputTransport::Impl itself, to sidestep the ordering
-// chicken-and-egg between "the service needs Impl" and "Impl owns the
-// service."
-struct SessionRegistry {
-  std::mutex registryMutex;
-  std::unordered_map<SessionId, std::shared_ptr<WriteQueue>> sessionToQueue;
-  std::unordered_map<std::string, std::unordered_set<SessionId>> topicToSessions;
+// Shared attach-time state plus the couple of registry bits Subscribe
+// needs — split out from GrpcOutputTransport::Impl so the service
+// class can be fully defined before Impl (which owns one).
+struct SubscribeShared {
+  BroadcastRing* ring = nullptr;
+  TopicRegistry* topics = nullptr;
+  int idleSpinIterations = 1000;
   std::atomic<SessionId> nextSessionId{1};
-
-  SessionId registerSession(const std::string& topic, const std::shared_ptr<WriteQueue>& queue) {
-    std::lock_guard<std::mutex> lock(registryMutex);
-    const SessionId id = nextSessionId.fetch_add(1, std::memory_order_relaxed);
-    sessionToQueue[id] = queue;
-    topicToSessions[topic].insert(id);
-    return id;
-  }
-
-  void deregisterSession(SessionId id) {
-    std::lock_guard<std::mutex> lock(registryMutex);
-    sessionToQueue.erase(id);
-    for (auto& [topic, ids] : topicToSessions) {
-      ids.erase(id);
-    }
-  }
-
-  void push(SessionId id, const std::shared_ptr<std::string>& message) {
-    std::shared_ptr<WriteQueue> queue;
-    {
-      std::lock_guard<std::mutex> lock(registryMutex);
-      const auto it = sessionToQueue.find(id);
-      if (it == sessionToQueue.end()) {
-        return;
-      }
-      queue = it->second;
-    }
-    {
-      std::lock_guard<std::mutex> lock(queue->mutex);
-      queue->queue.push_back(message);
-    }
-    queue->cv.notify_one();
-  }
-
-  // Wakes every open Subscribe() call's thread so it returns on its
-  // own — called from stop(), belt and suspenders alongside
-  // grpc::Server::Shutdown()'s own in-flight-call cancellation.
-  void closeAll() {
-    std::lock_guard<std::mutex> lock(registryMutex);
-    for (auto& [id, queue] : sessionToQueue) {
-      std::lock_guard<std::mutex> qlock(queue->mutex);
-      queue->closed = true;
-      queue->cv.notify_all();
-    }
-  }
+  std::atomic<bool> stopping{false};
 };
 
 class GenericOutputServiceImpl final : public gateway::output::grpc_proto::GenericOutputService::Service {
  public:
-  explicit GenericOutputServiceImpl(SessionRegistry& registry) : registry_(registry) {}
+  explicit GenericOutputServiceImpl(SubscribeShared& shared) : shared_(shared) {}
 
   ::grpc::Status Subscribe(::grpc::ServerContext* context,
                             const gateway::output::grpc_proto::SubscribeRequest* request,
                             ::grpc::ServerWriter<gateway::output::grpc_proto::OutputRecordBatch>* writer) override {
-    auto queue = std::make_shared<WriteQueue>();
-    const SessionId sessionId = registry_.registerSession(request->topic(), queue);
+    const SessionId sessionId = shared_.nextSessionId.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t topicTag = makeTopicTag(shared_.topics->idFor(request->topic()));
+    const std::uint64_t sessionTag = makeSessionTag(sessionId);
 
-    // ~1024 messages per batch cap, matching the relay's own
+    std::uint64_t cursor = shared_.ring->head();  // live-only, from the moment of subscription
+    std::vector<std::byte> payload(shared_.ring->maxPayload());
+    IdleStrategy idle(shared_.idleSpinIterations);
+
+    // ~1024 payloads per batch cap, matching the relay's own
     // FLAGS_relay_max_batch_records default and reasoning — comfortably
-    // under gRPC's 4MB message cap for counter-sized payloads.
-    constexpr std::size_t kMaxBatch = 1024;
-    while (!context->IsCancelled()) {
-      std::vector<std::shared_ptr<std::string>> batch;
-      {
-        std::unique_lock<std::mutex> lock(queue->mutex);
-        // Bounded wait, not a plain wait(): needs to periodically
-        // recheck context->IsCancelled() too — gRPC gives no direct
-        // "wake me on cancel" primitive for a plain condition_variable.
-        queue->cv.wait_for(lock, std::chrono::milliseconds(200),
-                            [&] { return !queue->queue.empty() || queue->closed; });
-        if (queue->queue.empty()) {
-          if (queue->closed) {
-            break;
-          }
-          continue;
+    // under gRPC's 4MB message cap for counter-sized payloads. The
+    // idle strategy's back-off sleep bounds how stale the IsCancelled
+    // check can get while a caught-up session waits.
+    constexpr int kMaxBatch = 1024;
+    while (!context->IsCancelled() && !shared_.stopping.load(std::memory_order_relaxed)) {
+      gateway::output::grpc_proto::OutputRecordBatch batch;
+      bool overrun = false;
+      while (batch.payloads_size() < kMaxBatch) {
+        std::uint64_t tag = 0;
+        std::uint32_t length = 0;
+        const auto result = shared_.ring->readOne(cursor, tag, payload.data(), length);
+        if (result == BroadcastRing::ReadResult::Empty) {
+          break;
         }
-        while (!queue->queue.empty() && batch.size() < kMaxBatch) {
-          batch.push_back(std::move(queue->queue.front()));
-          queue->queue.pop_front();
+        if (result == BroadcastRing::ReadResult::Overrun) {
+          overrun = true;
+          break;
         }
+        if (tag != topicTag && tag != sessionTag) {
+          continue;  // someone else's entry; not counted against the batch cap
+        }
+        batch.add_payloads(payload.data(), length);
       }
-      gateway::output::grpc_proto::OutputRecordBatch recordBatch;
-      for (const auto& message : batch) {
-        recordBatch.add_payloads(*message);
+      if (batch.payloads_size() > 0) {
+        if (!writer->Write(batch)) {
+          break;  // client gone
+        }
+        idle.reset();
       }
-      if (!writer->Write(recordBatch)) {
-        break;  // client gone
+      if (overrun) {
+        // Lapped by the producer — this subscriber is genuinely not
+        // keeping up. Disconnect rather than silently skip
+        // (broadcast_ring.hpp's slow-consumer contract).
+        return ::grpc::Status(::grpc::StatusCode::DATA_LOSS,
+                               "subscriber overrun: fell more than a full ring behind");
+      }
+      if (batch.payloads_size() == 0) {
+        idle.idle();
       }
     }
-
-    registry_.deregisterSession(sessionId);
     return ::grpc::Status::OK;
   }
 
  private:
-  SessionRegistry& registry_;
+  SubscribeShared& shared_;
 };
 
 }  // namespace
 
 struct GrpcOutputTransport::Impl {
-  SessionRegistry registry;
-  GenericOutputServiceImpl service{registry};
+  SubscribeShared shared;
+  GenericOutputServiceImpl service{shared};
   std::unique_ptr<grpc::Server> server;
 };
 
 GrpcOutputTransport::GrpcOutputTransport() : impl_(std::make_unique<Impl>()) {}
 GrpcOutputTransport::~GrpcOutputTransport() = default;
+
+void GrpcOutputTransport::attach(BroadcastRing& ring, TopicRegistry& topics, int idleSpinIterations) {
+  impl_->shared.ring = &ring;
+  impl_->shared.topics = &topics;
+  impl_->shared.idleSpinIterations = idleSpinIterations;
+}
 
 void GrpcOutputTransport::start(int listenPort) {
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
@@ -178,31 +136,15 @@ void GrpcOutputTransport::start(int listenPort) {
 }
 
 void GrpcOutputTransport::stop() {
-  impl_->registry.closeAll();
+  impl_->shared.stopping.store(true, std::memory_order_relaxed);
   if (impl_->server) {
-    impl_->server->Shutdown();
+    // The deadline cancels in-flight Subscribe calls that don't
+    // notice `stopping` on their own first (each notices within one
+    // idle back-off at worst); Wait() then confirms every handler
+    // thread has actually returned before this object can be torn
+    // down.
+    impl_->server->Shutdown(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
     impl_->server->Wait();
-  }
-}
-
-void GrpcOutputTransport::toSession(SessionId owner, Bytes bytes) {
-  auto message = std::make_shared<std::string>(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  impl_->registry.push(owner, message);
-}
-
-void GrpcOutputTransport::broadcast(const std::string& topic, Bytes bytes) {
-  auto message = std::make_shared<std::string>(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  std::vector<SessionId> targets;
-  {
-    std::lock_guard<std::mutex> lock(impl_->registry.registryMutex);
-    const auto it = impl_->registry.topicToSessions.find(topic);
-    if (it == impl_->registry.topicToSessions.end()) {
-      return;
-    }
-    targets.assign(it->second.begin(), it->second.end());
-  }
-  for (SessionId sessionId : targets) {
-    impl_->registry.push(sessionId, message);
   }
 }
 

@@ -38,17 +38,14 @@ class WebSocketOutputTransport : public OutputTransport {
   WebSocketOutputTransport(const WebSocketOutputTransport&) = delete;
   WebSocketOutputTransport& operator=(const WebSocketOutputTransport&) = delete;
 
+  void attach(BroadcastRing& ring, TopicRegistry& topics, int idleSpinIterations) override;
   void start(int listenPort) override;
   void stop() override;
 
-  void toSession(SessionId owner, Bytes bytes) override;
-  void broadcast(const std::string& topic, Bytes bytes) override;
-  void flush() override;
-
   // Public so websocket_output_transport.cpp's free-standing
-  // Connection class can hold a reference to it — its full definition
-  // lives only in that .cpp regardless, so the forward declaration
-  // being visible here reveals nothing.
+  // pre-handshake connection class can hold a reference to it — its
+  // full definition lives only in that .cpp regardless, so the forward
+  // declaration being visible here reveals nothing.
   struct Impl;
 
  private:
