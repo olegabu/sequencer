@@ -36,6 +36,43 @@ message ProposeResponse {
   optional string error_message = 5;
 }
 
+// Several inputs in one RPC. This batches the *RPC*, not consensus —
+// braft already batches internally (see raft-tests/braft's
+// LEADER_BATCH) — and exists because an input gateway makes exactly
+// one proposal per client request, so at 100k req/s it was making
+// 100k RPCs/s to the leader. Profiling the gateway there found no
+// application symbol near the top and a flat profile of socket
+// syscalls, kernel spinlocks and thread wakeups; fewer, larger wire
+// calls is the same fix that worked for gateway/relay and
+// gateway/output.
+//
+// Each input is applied as its own raft task and gets its own
+// sequence number, exactly as if it had arrived via Propose. Results
+// are positional: results[i] belongs to inputs[i].
+message ProposeBatchRequest {
+  repeated bytes inputs = 1;
+}
+
+// One entry per input, in the same order. Per-input failure is
+// possible in principle (a leadership change partway through a batch),
+// so each carries its own error_message rather than failing the whole
+// batch.
+message ProposeResult {
+  optional uint64 sequence_number = 1;
+  optional bytes designated_output = 2;
+  optional string error_message = 3;
+}
+
+message ProposeBatchResponse {
+  repeated ProposeResult results = 1;
+
+  // Batch-level redirect: the node was not the leader, so nothing in
+  // the batch was applied and the caller should resend all of it.
+  optional bool redirect = 2 [default = false];
+  optional string leader_hint = 3;
+}
+
 service ProposeService {
   rpc Propose(ProposeRequest) returns (ProposeResponse);
+  rpc ProposeBatch(ProposeBatchRequest) returns (ProposeBatchResponse);
 }

@@ -3,6 +3,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -16,6 +17,12 @@
 DEFINE_string(node_peers, "",
               "Comma-separated \"ip:port\" Propose endpoints of the raft group's nodes (required)");
 DEFINE_int32(listen_port, 0, "This gateway's own client-facing port (required)");
+// See gateway/input/src/node_proposer.hpp's proposeAsync comment.
+DEFINE_int32(max_batch_size, 0,
+             "Largest number of client proposals sent to the node in one ProposeBatch; "
+             "0 keeps the built-in default");
+DEFINE_int32(max_inflight_batches, 0,
+             "How many ProposeBatch RPCs may be outstanding at once; 0 keeps the built-in default");
 
 namespace sequencer {
 namespace {
@@ -49,6 +56,8 @@ int RunInputGateway(int argc, char** argv, std::unique_ptr<InputCodec> codec) {
   gateway::input::detail::InputGatewayConfig config;
   config.nodeEndpoints = splitCommaSeparated(FLAGS_node_peers);
   config.listenPort = FLAGS_listen_port;
+  config.maxBatchSize = static_cast<std::size_t>(std::max(0, FLAGS_max_batch_size));
+  config.maxInFlightBatches = std::max(0, FLAGS_max_inflight_batches);
 
   gateway::input::detail::InputGatewayImpl gateway(std::move(config), std::move(codec));
   gateway.start();

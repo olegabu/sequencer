@@ -43,6 +43,49 @@ checked** — pass a real verifier, such as `sdk/`'s, instead. See
 against a real gateway, including a tampered envelope being rejected
 before it ever reaches `Propose`.
 
+## Proposals are batched, and asynchronous
+
+`SubmitServiceImpl::Submit` does not wait for the node. It runs the
+codec, verifies, hands the input to `NodeProposer::proposeAsync` and
+returns; the client's response is completed from the proposer's
+callback. `NodeProposer` then batches proposals onto the wire —
+several client requests per `ProposeBatch` RPC
+(`node/proto/node.proto`) — under the rule every gateway here follows:
+gather whatever is queued right now, send once, never delay to wait
+for more (see [../README.md](../README.md)).
+
+At low rates that means batches of one and unchanged behaviour. Under
+load the in-flight window fills batches for free: at 100k req/s with a
+~600 µs round trip there are tens of requests outstanding at any
+instant, so each batch picks up whatever accumulated during the last
+one. Measured at 100k: **~1.34 ms → ~1.03 ms p50**, throughput
+unchanged.
+
+**Both bounds are load-bearing**, and the first version had neither:
+
+- *One batch in flight* measured **133 ms p50 and throughput down to
+  75k**. A proposal has a round trip, so a single outstanding
+  request-response pair replaced the pipelining that had previously
+  spanned every in-flight client request. This is exactly where the
+  analogy to `gateway/output/` stops — its batched writes are
+  fire-and-forget, so one in flight costs it nothing.
+- *Unbounded batch size* then let each batch swell to ~10k inputs. A
+  batch's latency is its slowest member, so everyone in it waited for
+  all of it. At 256 the effect is still visible (1714 µs against 1009
+  at 64).
+
+`--max_batch_size` (64) and `--max_inflight_batches` (8) expose both;
+a short sweep at 100k put 32/16 and 64/8 within noise of each other
+and 256/8 clearly worse.
+
+**Why the node needed a new RPC.** `ProposeBatch` batches the *RPC*,
+not consensus — braft already batches internally. Each input is still
+applied as its own raft task and gets its own sequence number, so the
+semantics are identical to calling `Propose` once per input. The
+handler applies every task first and only then waits for all of them;
+applying and waiting one at a time would serialize the batch into N
+sequential commits and be strictly worse than N separate RPCs.
+
 ## Testing
 
 ```sh
@@ -59,6 +102,13 @@ successful submit (checking both the sequence number and the designated
 output round-trip correctly), a codec-rejected malformed request (never
 reaches `Propose` — checked by reading the node's journal directly), and
 a signature-verifier rejection (same check).
+
+`ConcurrentSubmitsEachGetTheirOwnSequenceNumber` covers the batching
+above: 24 concurrent submitters, which share `ProposeBatch` RPCs. Each
+must get a distinct sequence number, and together they must cover
+1..24 with no gaps or repeats. Batched results are positional, so this
+is where a mis-ordered or mis-sized batch would hand a client someone
+else's receipt — the journal's own committed count is checked too.
 
 ## Seeing it in action
 

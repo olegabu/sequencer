@@ -24,6 +24,11 @@ namespace sequencer::gateway::input::detail {
 struct InputGatewayConfig {
   std::vector<std::string> nodeEndpoints;  // "ip:port" — the raft group's Propose endpoints
   int listenPort = 0;
+  // Proposal batching bounds; 0 keeps NodeProposer's own defaults.
+  // See node_proposer.hpp's proposeAsync comment for why both exist
+  // and what happened when neither did.
+  std::size_t maxBatchSize = 0;
+  int maxInFlightBatches = 0;
 };
 
 class InputGatewayImpl {
@@ -32,7 +37,7 @@ class InputGatewayImpl {
                     sequencer::SignatureVerifier verifier = sequencer::acceptAllSignatures)
       : config_(std::move(config)),
         codec_(std::move(codec)),
-        proposer_(config_.nodeEndpoints),
+        proposer_(config_.nodeEndpoints, config_.maxBatchSize, config_.maxInFlightBatches),
         service_(*codec_, proposer_, std::move(verifier)) {}
 
   InputGatewayImpl(const InputGatewayImpl&) = delete;

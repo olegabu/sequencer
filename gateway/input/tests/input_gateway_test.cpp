@@ -13,12 +13,15 @@
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -172,6 +175,50 @@ TEST_F(InputGatewayTest, SubmitProposesAndReturnsSequenceNumberAndDesignatedOutp
   std::memcpy(&total2, r2.body.data() + sizeof(seq2), sizeof(total2));
   EXPECT_EQ(seq2, 2u);
   EXPECT_EQ(total2, 3);
+}
+
+// Concurrent submits share ProposeBatch RPCs (see node_proposer.hpp's
+// proposeAsync comment), which is exactly where a batching bug would
+// show up: results are positional, so a mis-ordered or mis-sized batch
+// hands a client someone else's sequence number. Every submitter here
+// must get a distinct sequence number, and together they must cover
+// 1..N with nothing missing and nothing repeated.
+TEST_F(InputGatewayTest, ConcurrentSubmitsEachGetTheirOwnSequenceNumber) {
+  constexpr int kSubmitters = 24;
+  std::vector<std::thread> threads;
+  std::mutex resultsMutex;
+  std::vector<std::uint64_t> sequenceNumbers;
+  std::vector<std::string> failures;
+
+  threads.reserve(kSubmitters);
+  for (int i = 0; i < kSubmitters; ++i) {
+    threads.emplace_back([&, i] {
+      const SubmitResult r = submit(bytesOf(i + 1));
+      std::lock_guard<std::mutex> lock(resultsMutex);
+      if (r.failed) {
+        failures.push_back(r.errorText);
+        return;
+      }
+      std::uint64_t seq;
+      std::memcpy(&seq, r.body.data(), sizeof(seq));
+      sequenceNumbers.push_back(seq);
+    });
+  }
+  for (std::thread& t : threads) {
+    t.join();
+  }
+
+  ASSERT_TRUE(failures.empty()) << failures.front();
+  ASSERT_EQ(sequenceNumbers.size(), static_cast<std::size_t>(kSubmitters));
+  std::sort(sequenceNumbers.begin(), sequenceNumbers.end());
+  for (int i = 0; i < kSubmitters; ++i) {
+    EXPECT_EQ(sequenceNumbers[static_cast<std::size_t>(i)], static_cast<std::uint64_t>(i + 1))
+        << "sequence numbers must be exactly 1.." << kSubmitters << " with no gaps or repeats";
+  }
+
+  // And the journal agrees: one record per submit, no more.
+  journal::JournalReader reader(dir_ / "journal.data", dir_ / "journal.index");
+  EXPECT_EQ(reader.committedCount(), static_cast<std::uint64_t>(kSubmitters));
 }
 
 TEST_F(InputGatewayTest, MalformedRequestIsRejectedByCodecWithoutProposing) {
