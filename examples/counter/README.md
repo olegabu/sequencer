@@ -307,10 +307,10 @@ either way:**
   so a repeat profile would very likely just reconfirm the same
   finding rather than surface something new to chase.
 
-**Where this leaves the four round trips, all measured at 100k req/s
-against the same live fleet** (braft's own bare consensus latency,
-raft-tests/sweep/knee-sweep.csv, is the floor these are all measured
-against — no sequencer/gateway layer at all):
+**Where that round left the four round trips, all measured at 100k
+req/s against the same live fleet** (4x c6i.2xlarge; braft's own bare
+consensus latency, raft-tests/sweep/knee-sweep.csv, is the floor these
+are all measured against — no sequencer/gateway layer at all):
 
 | round trip | p50 @ 100k |
 |---|---|
@@ -323,17 +323,91 @@ against — no sequencer/gateway layer at all):
 
 Output gateways went from broken (dropped messages, or multi-second
 queueing delay) to correct and reasonably fast, and WebSocket closed
-most of its gap with the other two, but all three remain well above
+most of its gap with the other two, but all three remained well above
 sub-millisecond — the `<1ms`-at-100k bar the relay gateway (mostly)
 cleared after its own reactor rewrite. That specific lever doesn't
 transfer here (see above), and brpc's own profiling points at
 syscall/kernel-level cost rather than anything left to batch in
-application code. The likely next step, if this gap is worth closing
-further, is a bigger architectural change to the output gateway's
-single-shared-tailing-thread design itself (closer in spirit to the
-relay's own per-subscriber pull model) rather than more parameter
-tuning or transport-specific rewrites along axes already tried. Not
-attempted here — flagged as future work.
+application code. What the evidence pointed at instead was the
+output gateway's whole single-shared-tailing-thread design — which is
+what the next round actually changed.
+
+## Rebuilding the output gateways on per-subscriber ring readers
+
+The push design had one tailing thread run the codec and then push
+every record into per-session queues, where each transport's own
+writer thread later picked it up — a mutex hand-off plus a
+cross-thread wake before any socket write. Measured queue high-water
+marks of 700-2500 records at 100k (multi-ms of pure queueing) and a
+profile blaming syscalls and kernel locks both pointed there. The
+relay never had this problem because it never had the hand-off: its
+subscribers pull the mmap'd journal directly through private cursors.
+
+The output gateway can't pull the journal directly — unlike the relay
+it must *decode* each record to route it (`Fanout::toSession` exists
+precisely so a codec can address one session, e.g. an execution
+report reaching only the two sides of a trade), and §8.3 requires the
+codec run exactly once per record, in order. So the codec stays on
+one thread and publishes into a new **`BroadcastRing`**
+(`gateway/output/include/sequencer/broadcast_ring.hpp`): a
+single-writer ring where every subscriber holds its own private
+cursor and filters entries by a routing tag. Deliberately not an SPMC
+queue — nobody competes for entries, so no CAS anywhere; each
+producer/reader pair is plain acquire/release, the same discipline
+`node/src/committed_entry_ring.hpp` already uses, extended from one
+consumer to N. The producer never waits on a slow reader (overwrite
+semantics, seqlock-style lap detection); a lapped subscriber is
+disconnected rather than silently corrupted or allowed to accumulate
+unbounded backlog. Payload words are copied as relaxed atomics rather
+than raw `memcpy` so the deliberate tear-then-discard is
+standard-conforming — TSan flags the textbook seqlock, correctly.
+
+Each transport then gives every subscriber its own reader thread
+draining that ring straight to its own socket. For gRPC this finally
+makes the *synchronous* API the right tool: its thread-per-`Subscribe`
+call, the very shape the reverted reactor rewrite was trying to escape,
+is exactly the per-subscriber thread this design wants. WebSocket
+satisfies Beast's "shared objects: unsafe" rule by handing the stream
+to its writer thread outright instead of posting onto a shared io
+thread, which retires the per-connection write queue as well.
+`--batch_window_us` is gone entirely — reader-side draining batches
+naturally, with no artificial delay — and the tailing loop's flat 5ms
+idle poll became spin-then-back-off.
+
+One race is worth naming because it reproduced as a 1-in-4 test flake
+before being pinned down: a subscriber's start cursor must be captured
+on the *registering* thread, not inside the newly-spawned reader. A
+late-scheduled reader that reads `head()` itself silently drops
+everything published between registration and its first scheduling
+slot, treating it as pre-subscription history.
+
+**Result, on 4x c7a.2xlarge (AMD Genoa ~3.7GHz — the fleet was
+upgraded for per-core speed in the same round, so these are not
+directly comparable to the c6i numbers above):**
+
+| round trip | p50 @ 100k | safe ceiling |
+|---|---|---|
+| sequencer's own synchronous ack | ~1.2-1.3ms | — |
+| relay gateway (gRPC) | ~915us | 120k |
+| output gateway, brpc | ~887us | — |
+| output gateway, gRPC | ~894us | — |
+| output gateway, WebSocket | ~871-892us | 120k |
+
+All three output transports now clear the `<1ms` bar and land at or
+slightly below the relay's own number, with the same 120k safe
+ceiling (125k collapses). Isolating architecture from hardware: the
+relay's code did not change this round and moved ~1.3ms → ~915us
+(~1.4x, hardware alone), while the output gateways moved ~4.2-4.9ms →
+~890us (~4.7-5.5x) — so the ring redesign accounts for roughly a
+3.4-4x improvement on top of the faster cores.
+
+The one honest asterisk is on the *ack* path, not the gateways: it
+measures ~1.2-1.3ms standalone but ~910us when an observer runs in
+the same load-generator process — reproducible, with the ack
+histogram computed identically either way (so not a measurement
+artifact), and CPU-idle effects on the node ruled out by experiment.
+Unexplained as of this writing, and worth resolving before the ack
+path is quoted as sub-millisecond.
 
 ## Seeing it in action
 
