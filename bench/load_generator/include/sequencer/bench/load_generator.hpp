@@ -65,6 +65,14 @@ struct LoadGeneratorConfig {
   int measureSeconds = 30;
   int drainTimeoutSeconds = 10;  // grace period for in-flight replies once the window closes
   std::string hdrOut;            // optional: write a full percentile report here
+  // Optional: dump the measured histogram as "value,count" lines, one
+  // per recorded bucket. Unlike hdrOut's percentile report this is
+  // MERGEABLE — summing several clients' counts into one histogram and
+  // reading percentiles off that is the only correct way to get an
+  // aggregate p50/p99 across a split load. Averaging per-client
+  // percentiles is not the percentile of the union and can be wrong in
+  // either direction.
+  std::string hdrRawOut;
 };
 
 // What an application supplies: how to send one request, tagged with a
@@ -375,6 +383,29 @@ class LoadGenerator {
       const double ratio = impliedOutstanding / static_cast<double>(config_.threadNum);
       std::printf("little's law ratio   %.2f%s\n", ratio,
                    (ratio < 0.9 || ratio > 1.1) ? "   WARNING: >10% off, suspect a rig bug" : "");
+    }
+
+    if (!config_.hdrRawOut.empty()) {
+      FILE* f = std::fopen(config_.hdrRawOut.c_str(), "w");
+      if (f != nullptr) {
+        // Bucket midpoints and counts, exactly as recorded: the merge
+        // is a sum, and re-recording a midpoint lands in the same
+        // bucket it came from, so a merged histogram is accurate to
+        // this histogram's own precision (3 significant figures).
+        std::fprintf(f, "value,count\n");
+        hdr_iter iter;
+        hdr_iter_recorded_init(&iter, measured_);
+        while (hdr_iter_next(&iter)) {
+          if (iter.count > 0) {
+            std::fprintf(f, "%lld,%lld\n", static_cast<long long>(iter.value),
+                          static_cast<long long>(iter.count));
+          }
+        }
+        std::fclose(f);
+        std::printf("hdr raw              %s\n", config_.hdrRawOut.c_str());
+      } else {
+        std::fprintf(stderr, "failed to write %s\n", config_.hdrRawOut.c_str());
+      }
     }
 
     if (!config_.hdrOut.empty()) {

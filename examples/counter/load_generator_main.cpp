@@ -58,6 +58,10 @@ DEFINE_int32(measure, 30, "Seconds recorded");
 DEFINE_int32(drain_timeout, 10, "Seconds to wait for in-flight replies after the window closes");
 DEFINE_string(pace, "spin", "open mode wait strategy between sends: spin or park");
 DEFINE_string(hdr_out, "", "Write a percentile report here");
+DEFINE_string(hdr_raw_out, "",
+              "Write the measured histogram as mergeable \"value,count\" lines. Needed to compute a "
+              "correct aggregate p50/p99 when load is split across several clients — averaging their "
+              "reported percentiles is not the percentile of the union.");
 
 // Phase 3 (bench/load_generator/README.md): empty disables it — the
 // default — so a plain phase-1 run pays nothing extra.
@@ -374,6 +378,7 @@ int main(int argc, char** argv) {
   config.drainTimeoutSeconds = FLAGS_drain_timeout;
   config.pace = FLAGS_pace;
   config.hdrOut = FLAGS_hdr_out;
+  config.hdrRawOut = FLAGS_hdr_raw_out;
 
   if (relayObserver) {
     // Mirrors LoadGenerator::run()'s own warmup/measure window
