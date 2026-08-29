@@ -4,6 +4,7 @@
 // Never shared between threads: specification.md §5.1 pins exactly one
 // apply thread per node, and that thread is this writer's only caller.
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -14,6 +15,19 @@
 #include <sequencer/journal/record_view.hpp>
 
 namespace sequencer::journal {
+
+// Thrown by append() when the journal has no room left. Its own type
+// rather than a bare std::length_error so a caller can tell "this
+// journal is full" -- which is terminal for the node but not a bug --
+// apart from the std::logic_error a sequence-number violation raises,
+// which is a bug. Both used to reach the apply thread as an unhandled
+// throw and take the process down through std::terminate, with only
+// "terminate called after throwing an instance of 'std::length_error'"
+// to go on; that cost two benchmark fleets before it was diagnosed.
+class JournalExhausted : public std::length_error {
+ public:
+  using std::length_error::length_error;
+};
 
 struct JournalOptions {
   // Upper bounds reserved as sparse files at creation time (mapped_file.hpp:
@@ -29,8 +43,16 @@ struct JournalOptions {
   // not something only a benchmark deployment can hit — raised here rather
   // than only for bench/ callers. Both remain sparse-file reservations, so
   // raising them costs nothing until actually written to.
+  //
+  // Sizing them is arithmetic an operator can do: a journal holds
+  // min(maxIndexEntries, maxDataFileBytes / bytesPerRecord) records, and
+  // at a sustained R records/sec it lasts that many records over R
+  // seconds. The two want to be balanced against each other -- raising
+  // only one moves the wall without pushing it further away. Watch
+  // journal_fill_percent (below) rather than computing it: it reports
+  // whichever of the two is closer to full.
   std::uint64_t maxDataFileBytes = std::uint64_t{1} << 34;  // 16 GiB
-  std::uint64_t maxIndexEntries = std::uint64_t{1} << 27;   // ~134M records
+  std::uint64_t maxIndexEntries = std::uint64_t{1} << 28;   // ~268M records
 };
 
 class JournalWriter {
@@ -82,12 +104,20 @@ class JournalWriter {
                               std::to_string(sequenceNumber));
     }
     if (committedCount_ >= maxIndexEntries_) {
-      throw std::length_error("JournalWriter::append: index file exhausted (maxIndexEntries)");
+      throw JournalExhausted(
+          "JournalWriter::append: index file exhausted after " + std::to_string(committedCount_) +
+          " records (maxIndexEntries). Raise JournalOptions::maxIndexEntries -- on a node binary, "
+          "--journal_max_index_entries -- or start from a fresh data_dir. Both limits are sparse "
+          "reservations, so raising them costs no disk until written.");
     }
 
     const std::size_t size = recordEncodedSize(input, outputs);
     if (nextDataOffset_ + size > dataFile_.size()) {
-      throw std::length_error("JournalWriter::append: data file exhausted (maxDataFileBytes)");
+      throw JournalExhausted(
+          "JournalWriter::append: data file exhausted after " + std::to_string(committedCount_) +
+          " records / " + std::to_string(nextDataOffset_) +
+          " bytes (maxDataFileBytes). Raise JournalOptions::maxDataFileBytes -- on a node binary, "
+          "--journal_max_data_bytes -- or start from a fresh data_dir.");
     }
 
     // Step 1 (§6.3): write the record's bytes into the data file.
@@ -105,7 +135,33 @@ class JournalWriter {
 
     nextDataOffset_ += size;
     committedCount_ += 1;
+    // For fillPercent() only, which a monitoring thread may call.
+    publishedDataOffset_.store(nextDataOffset_, std::memory_order_relaxed);
   }
+
+  // How full the journal is, as a percentage of whichever limit binds
+  // first. Exposed so a long run can be watched approaching the wall
+  // rather than discovering it; the node publishes it as the bvar
+  // journal_fill_percent.
+  //
+  // THE ONE MEMBER SAFE TO CALL FROM ANOTHER THREAD. Everything else
+  // here belongs to the single apply thread (see this file's header
+  // comment), and a monitoring thread must not touch those. This reads
+  // only atomics: the header's committed count, which append() already
+  // publishes with release semantics, and a mirror of the data offset
+  // that append() stores alongside it. Both may be a record stale,
+  // which is immaterial for a fill gauge.
+  int fillPercent() const noexcept {
+    const std::uint64_t committed = header().committedCount.load(std::memory_order_acquire);
+    const std::uint64_t byIndex = maxIndexEntries_ == 0 ? 100 : committed * 100 / maxIndexEntries_;
+    const std::uint64_t dataSize = dataFile_.size();
+    const std::uint64_t offset = publishedDataOffset_.load(std::memory_order_relaxed);
+    const std::uint64_t byData = dataSize == 0 ? 100 : offset * 100 / dataSize;
+    return static_cast<int>(byIndex > byData ? byIndex : byData);
+  }
+
+  std::uint64_t committedCount() const noexcept { return committedCount_; }
+  std::uint64_t maxIndexEntries() const noexcept { return maxIndexEntries_; }
 
   void flush(bool async = true) {
     dataFile_.flush(async);
@@ -133,6 +189,7 @@ class JournalWriter {
 
     committedCount_ = 0;
     nextDataOffset_ = 0;
+    publishedDataOffset_.store(0, std::memory_order_relaxed);
   }
 
   void openExisting(const std::filesystem::path& dataPath, const std::filesystem::path& indexPath) {
@@ -165,6 +222,7 @@ class JournalWriter {
       const IndexEntry& last = indexEntries()[committedCount_ - 1];
       nextDataOffset_ = last.byteOffset + last.entryLength;
     }
+    publishedDataOffset_.store(nextDataOffset_, std::memory_order_relaxed);
   }
 
   IndexHeader& header() noexcept { return *reinterpret_cast<IndexHeader*>(indexFile_.data()); }
@@ -180,6 +238,9 @@ class JournalWriter {
   std::uint64_t committedCount_ = 0;
   std::uint64_t nextDataOffset_ = 0;
   std::uint64_t maxIndexEntries_ = 0;
+  // See fillPercent(): a cross-thread-readable mirror of
+  // nextDataOffset_, which is otherwise the apply thread's alone.
+  std::atomic<std::uint64_t> publishedDataOffset_{0};
 };
 
 }  // namespace sequencer::journal

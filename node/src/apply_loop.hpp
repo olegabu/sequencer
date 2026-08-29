@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <string>
 #include <thread>
 
 #include <sequencer/journal/writer.hpp>
@@ -59,6 +60,18 @@ class ApplyLoop {
     return true;
   }
 
+  // Set when the journal filled and this loop stopped. A node in this
+  // state cannot apply anything further -- specification.md §5.1 puts
+  // the journal append before acknowledgement, so there is no correct
+  // way to continue without it -- but it can still say so, which is the
+  // entire point: previously the exception escaped the apply thread and
+  // took the process down through std::terminate, leaving a
+  // "terminate called after throwing an instance of 'std::length_error'"
+  // and nothing else. Two benchmark fleets died that way before it was
+  // diagnosed.
+  bool halted() const noexcept { return halted_; }
+  const std::string& haltReason() const noexcept { return haltReason_; }
+
   // The pinned thread's actual body (specification.md §5.4: "the apply
   // thread busy-spins unconditionally — a deliberate decision made once,
   // on every state machine author's behalf"). `stopRequested` is polled
@@ -75,7 +88,21 @@ class ApplyLoop {
   // examples/counter/tests/three_node_smoke_test.cpp — would otherwise
   // each unconditionally peg a core, starving the very raft replication
   // threads leader election depends on.
+  // A full journal ends this loop rather than the process. step() is
+  // left throwing so its callers -- including the unit tests that drive
+  // it one entry at a time -- still see the error directly; it is only
+  // the long-running thread body that has to survive to report it.
   void run(const std::atomic<bool>& stopRequested, bool pureSpin = true) {
+    try {
+      runOrThrow(stopRequested, pureSpin);
+    } catch (const journal::JournalExhausted& e) {
+      halted_ = true;
+      haltReason_ = e.what();
+    }
+  }
+
+ private:
+  void runOrThrow(const std::atomic<bool>& stopRequested, bool pureSpin) {
     while (!stopRequested.load(std::memory_order_relaxed)) {
       if (!step() && !pureSpin) {
         std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -83,12 +110,13 @@ class ApplyLoop {
     }
   }
 
- private:
   StateMachine& stateMachine_;
   journal::JournalWriter& journal_;
   CommittedEntryRing& ring_;
   CompletionCallback onApplied_;
   OutputCollector collector_;
+  bool halted_ = false;
+  std::string haltReason_;
 };
 
 }  // namespace sequencer::node::detail

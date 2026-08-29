@@ -17,6 +17,8 @@
 #include <string>
 #include <thread>
 
+#include <bvar/bvar.h>
+
 #include <sequencer/journal/writer.hpp>
 #include <sequencer/state_machine.hpp>
 
@@ -56,6 +58,14 @@ struct NodeConfig {
   // default) is the production behavior specification.md §5.4
   // mandates; false is strictly a local-development concession.
   bool applyThreadPureSpin = true;
+
+  // How much journal this node reserves. Previously not plumbed at all,
+  // so every deployment silently got JournalOptions' defaults and the
+  // only way past a full journal was a rebuild or a fresh data_dir --
+  // which is how two benchmark fleets came to die mid-sweep. Both are
+  // sparse reservations, so raising them costs no disk until written;
+  // see JournalOptions for the sizing arithmetic.
+  journal::JournalOptions journalOptions{};
 };
 
 class NodeImpl {
@@ -84,6 +94,9 @@ class NodeImpl {
 
   std::unique_ptr<sequencer::StateMachine> stateMachine_;
   std::unique_ptr<journal::JournalWriter> journal_;
+  // Constructed in start(), after journal_ exists: bvar registers the
+  // name on construction and the callback may be sampled immediately.
+  std::unique_ptr<bvar::PassiveStatus<int>> journalFillPercent_;
   std::unique_ptr<CommittedEntryRing> ring_;
   std::unique_ptr<raft::RaftStateMachineAdapter> adapter_;
   std::unique_ptr<::braft::Node> raftNode_;

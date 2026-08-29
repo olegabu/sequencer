@@ -164,5 +164,89 @@ TEST_F(ApplyLoopTest, RunWithParkModeStillDrainsInSequenceOrder) {
   }
 }
 
+// A full journal must stop the apply loop, not the process. Before
+// this, JournalWriter::append threw std::length_error straight out of
+// the apply thread with nothing catching it, so the node died through
+// std::terminate leaving only "terminate called after throwing an
+// instance of 'std::length_error'" -- which cost two benchmark fleets
+// before anyone worked out what it meant.
+//
+// The tiny maxIndexEntries here is the whole trick: it makes
+// exhaustion reachable in a unit test rather than after ~268M records.
+TEST(ApplyLoopExhaustion, AFullJournalHaltsTheLoopInsteadOfKillingTheProcess) {
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / "seq_apply_exhaust_test";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+
+  journal::JournalOptions options;
+  options.maxIndexEntries = 4;
+  journal::JournalWriter writer(dir / "j.data", dir / "j.index", options);
+
+  SumStateMachine stateMachine;
+  CommittedEntryRing ring(64, std::size_t{64} << 10);
+  ApplyLoop loop(stateMachine, writer, ring, &recordCompletion);
+
+  // One more than the journal can hold.
+  const int kCount = 5;
+  std::vector<CompletionCtx> ctxs(kCount);
+  for (int i = 0; i < kCount; ++i) {
+    static thread_local std::int64_t delta;
+    delta = 1;
+    ring.push(payloadOf(delta), &ctxs[i]);
+  }
+
+  std::atomic<bool> stop{false};
+  std::thread applyThread([&] { loop.run(stop, /*pureSpin=*/false); });
+  while (!loop.halted() && !ctxs[3].called.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // Give the fifth entry a chance to be the one that overflows.
+  for (int i = 0; i < 200 && !loop.halted(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  stop.store(true, std::memory_order_relaxed);
+  applyThread.join();
+
+  // Reaching here at all is most of the point: the thread came back
+  // rather than taking the process down with it.
+  EXPECT_TRUE(loop.halted());
+  EXPECT_NE(loop.haltReason().find("maxIndexEntries"), std::string::npos)
+      << "halt reason should name the limit that was hit: " << loop.haltReason();
+  // The records that DID fit are still durable and correctly numbered.
+  EXPECT_EQ(writer.committedCount(), 4u);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_TRUE(ctxs[i].called.load()) << "entry " << i << " should have completed";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// fillPercent reports whichever limit is closer to full, so a long run
+// can watch the wall approach instead of discovering it.
+TEST(ApplyLoopExhaustion, FillPercentTracksTheBindingLimit) {
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / "seq_fill_percent_test";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+
+  journal::JournalOptions options;
+  options.maxIndexEntries = 10;
+  journal::JournalWriter writer(dir / "j.data", dir / "j.index", options);
+  EXPECT_EQ(writer.fillPercent(), 0);
+
+  SumStateMachine stateMachine;
+  OutputCollector collector;
+  const std::int64_t delta = 1;
+  for (int i = 0; i < 5; ++i) {
+    collector.reset();
+    stateMachine.apply(static_cast<std::uint64_t>(i + 1), payloadOf(delta), collector);
+    writer.append(static_cast<std::uint64_t>(i + 1), payloadOf(delta), collector.outputs());
+  }
+  // Five of ten index entries used; the data file is nowhere near full,
+  // so the index is what fillPercent must be reporting.
+  EXPECT_EQ(writer.fillPercent(), 50);
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 }  // namespace sequencer::node::detail

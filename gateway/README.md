@@ -99,6 +99,97 @@ measured flat, for a reason that is not throughput: a handler that
 parks a worker waiting for the node cannot batch, because the worker
 is the thing that would have to wait. It is a prerequisite, not a win.
 
+## Admission control: the in-flight batch bound
+
+`input/`'s proposer holds at most `--max_inflight_batches` batches on
+the wire at once (default 16, `src/node_proposer.hpp`). A proposal
+arriving when every slot is busy waits for one to come back — it is
+*deferred*, and `input_gateway_proposals_deferred` counts it.
+
+**Deferral is the mechanism working, not a queue to tune away.** That
+sentence is here because the opposite was assumed first, and measuring
+proved it wrong.
+
+Instrumenting the path showed deferral climbing steeply with load —
+about 5% of proposals at 100k req/s, about 80% at 300k — while the
+gateway's own queue delay grew 25× (9 µs → 748 µs) and the leader's
+apply wait grew only 1.6× (524 µs → 1037 µs). The gateway was
+increasingly waiting on itself. The obvious reading was that the bound
+was the ceiling, so the obvious fix was to raise it.
+
+Raising it to 64 made **every** rate worse and moved the knee *down*,
+from ~360k to ~330k. Lowering it did the opposite. Five input
+gateways, one leader, end-to-end p50, and where the cluster stops
+keeping up:
+
+| slots | 100k | 300k | 350k | 400k | 450k |
+|---|---|---|---|---|---|
+| 4 | 803 | 1509 | **1654** | **2268** | **3204** |
+| 8 | **680** | **1268** | 1568 | collapsed | — |
+| 16 (default) | 683 | 1324 | 1750 | collapsed | — |
+| 64 | 687 | 2070 | collapsed | — | — |
+
+The reason is that **the bound is per gateway, but the leader feels
+the sum.** Five gateways at 16 apiece put 80 concurrent batches on a
+leader that does its best work near 16–20, and the leader's apply wait
+degrades under that pressure — at 300k it measured 822 µs at 4 slots,
+840 µs at 16, and 1374 µs at 64. Removing the backpressure does not
+remove the queue; it moves the queue onto the leader, where it costs
+more. Throttling at the gateway is what keeps the leader efficient.
+
+### Tuning it
+
+Start from the product, not the per-gateway number:
+
+    slots per gateway  ≈  16 to 20  /  number of gateways feeding one leader
+
+floored at 1. One gateway keeps the default of 16. Five gateways want
+about 4, which is the only setting in the table above that carries
+450k — roughly 25% past what the default reaches.
+
+It is a trade, not a free win. Fewer slots means more proposals wait
+for one, which costs at low rates: 4 slots measures 803 µs at 100k
+against 680 µs at 8. **Tune for the load you must survive, not the
+load you usually see** — the low-rate penalty is ~120 µs, while the
+high-rate penalty for guessing wrong is the cluster falling over.
+
+Batch size (`--max_batch_size`, default 64) is the other half and is
+rarely the binding one: batches grow on their own as load rises (1.0,
+2.0, 3.0, 4.6, 6.0 across 100k→400k at 4 slots) because a completing
+batch immediately takes whatever queued while it was out. Raising the
+cap to 256 measured clearly worse (1714 µs against 1009 µs at 100k),
+since a batch's latency is its slowest member.
+
+### Watching it
+
+Both sides publish bvars, which brpc already exposes on each process's
+`/vars` page — no wiring, no agent:
+
+| bvar | where | says |
+|---|---|---|
+| `input_gateway_proposals_deferred` | gateway | admission control engaging |
+| `input_gateway_batch_queue_delay_us` | gateway | time waiting for a slot |
+| `input_gateway_batch_size` | gateway | whether batches are grouping |
+| `input_gateway_queue_depth{,_max}` | gateway | how deep the wait queue gets |
+| `node_propose_batch_apply_wait_us` | node | time inside the raft group |
+| `node_propose_batch_inputs` | node | batch size as the leader sees it |
+| `journal_fill_percent` | node | how close the journal is to full |
+
+The first and the fifth are the pair that matters: together they split
+a request's life into *waiting for a slot* and *waiting for raft*,
+which end-to-end latency alone cannot separate. If queue delay is
+rising while apply wait is flat, the gateway is throttling — and given
+the table above, that is usually correct behaviour rather than the
+problem.
+
+Two traps worth knowing, both hit while producing the numbers above.
+`bvar::IntRecorder` publishes a **lifetime** average, so under a rising
+sweep it reports the history rather than the rate being measured — the
+batch-size bvars are windowed for that reason. And bvar's windowed
+statistics decay to zero when a bvar goes idle, so a scrape that lands
+after the load stops reports 0 for everything, which is
+indistinguishable from "nothing happened".
+
 ## Testing
 
 Each component's README lists its own cases. Two are worth knowing

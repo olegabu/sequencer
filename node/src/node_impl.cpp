@@ -2,6 +2,7 @@
 
 #include <braft/configuration.h>
 #include <braft/util.h>
+#include <bvar/bvar.h>
 #include <glog/logging.h>
 
 #include <pthread.h>
@@ -36,7 +37,8 @@ void NodeImpl::start() {
   const std::filesystem::path snapshotPath = config_.dataDir / "snapshot";
 
   journal_ = std::make_unique<journal::JournalWriter>(config_.dataDir / "journal.data",
-                                                        config_.dataDir / "journal.index");
+                                                        config_.dataDir / "journal.index",
+                                                        config_.journalOptions);
   ring_ = std::make_unique<CommittedEntryRing>(config_.committedEntryRingCapacity, config_.maxInputSize);
   adapter_ = std::make_unique<raft::RaftStateMachineAdapter>(*ring_, *stateMachine_, kSnapshotFileName);
 
@@ -98,7 +100,34 @@ void NodeImpl::start() {
     }
     // specification.md §5.4: the apply thread busy-spins unconditionally.
     applyLoop_->run(stopRequested_, config_.applyThreadPureSpin);
+
+    // run() returns either because stop was requested, or because the
+    // journal filled. The second case used to be a std::terminate with
+    // one cryptic line of output; say plainly what happened and what to
+    // do about it. The node stays up -- it can still vote and serve
+    // reads of what it already has -- but it applies nothing further,
+    // so raft should be allowed to lead elsewhere.
+    if (applyLoop_->halted()) {
+      LOG(ERROR) << "apply thread stopped: " << applyLoop_->haltReason();
+      LOG(ERROR) << "this node can no longer apply entries; it holds "
+                  << journal_->committedCount() << " records. Restart it against a fresh "
+                  << "data_dir, or with a larger --journal_max_index_entries / "
+                  << "--journal_max_data_bytes (both are sparse reservations).";
+    }
   });
+
+  // Published on the node's own /vars page so a long run can watch the
+  // journal approach its limit instead of discovering it. Reports
+  // whichever of the two reservations is closer to full; see
+  // JournalWriter::fillPercent, which is the one member of that class
+  // safe to read from a thread other than the apply thread.
+  journalFillPercent_ = std::make_unique<bvar::PassiveStatus<int>>(
+      "journal_fill_percent",
+      [](void* self) {
+        auto* impl = static_cast<NodeImpl*>(self);
+        return impl->journal_ == nullptr ? 0 : impl->journal_->fillPercent();
+      },
+      this);
 
   started_ = true;
 }

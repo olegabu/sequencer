@@ -28,6 +28,19 @@ DEFINE_bool(apply_thread_pure_spin, true,
             "small machine, where multiple unconditionally-spinning apply threads would "
             "otherwise starve the raft replication threads leader election depends on — never "
             "set false in production or in any published measurement.");
+DEFINE_uint64(journal_max_index_entries, 0,
+              "Maximum records this node's journal can hold, or 0 for the built-in default "
+              "(~268M). The journal is a fixed reservation made once at creation: it does not "
+              "roll over, and a node that fills it stops applying. Sparse, so raising this "
+              "costs no disk until written. Sizing: the journal holds "
+              "min(this, journal_max_data_bytes / bytes-per-record) records, which at a "
+              "sustained R records/sec lasts that many records over R seconds -- raise both "
+              "together, since raising one alone just moves which limit binds. Only read when "
+              "a journal is first created; reopening an existing one takes its size from the "
+              "file.");
+DEFINE_uint64(journal_max_data_bytes, 0,
+              "Byte capacity of this node's journal data file, or 0 for the built-in default "
+              "(16 GiB). See --journal_max_index_entries for how the two limits interact.");
 
 namespace sequencer {
 namespace {
@@ -58,6 +71,12 @@ int RunNode(int argc, char** argv, std::unique_ptr<StateMachine> stateMachine) {
   config.electionTimeoutMs = FLAGS_election_timeout_ms;
   config.applyThreadCpu = FLAGS_apply_thread_cpu;
   config.applyThreadPureSpin = FLAGS_apply_thread_pure_spin;
+  if (FLAGS_journal_max_index_entries > 0) {
+    config.journalOptions.maxIndexEntries = FLAGS_journal_max_index_entries;
+  }
+  if (FLAGS_journal_max_data_bytes > 0) {
+    config.journalOptions.maxDataFileBytes = FLAGS_journal_max_data_bytes;
+  }
 
   node::detail::NodeImpl nodeImpl(std::move(config), std::move(stateMachine));
   nodeImpl.start();
