@@ -51,8 +51,20 @@ struct JournalOptions {
   // only one moves the wall without pushing it further away. Watch
   // journal_fill_percent (below) rather than computing it: it reports
   // whichever of the two is closer to full.
-  std::uint64_t maxDataFileBytes = std::uint64_t{1} << 34;  // 16 GiB
-  std::uint64_t maxIndexEntries = std::uint64_t{1} << 28;   // ~268M records
+  // Sized for a sustained high-rate run rather than a demo. At the
+  // counter example's 34 data bytes + 16 index bytes per record, these
+  // hold ~1.07B records -- about 40 minutes at 450k records/sec, where
+  // 2^28 was ten and kept ending benchmark runs.
+  //
+  // Raising them further stops helping, which is worth knowing before
+  // trying: 1.07B records is ~54 GB across the two files, and a node
+  // also keeps braft's own log of the same entries, so a 100 GB volume
+  // is the next wall and it is a physical one. Unbounded runtime needs
+  // segment rollover with retention (what braft does for its own log),
+  // not a bigger reservation -- see mapped_file.hpp for why this is one
+  // fixed mapping today.
+  std::uint64_t maxDataFileBytes = std::uint64_t{1} << 36;  // 64 GiB
+  std::uint64_t maxIndexEntries = std::uint64_t{1} << 30;   // ~1.07B records
 };
 
 class JournalWriter {
