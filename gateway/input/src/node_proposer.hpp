@@ -26,8 +26,12 @@
 
 #include <brpc/channel.h>
 #include <brpc/controller.h>
+#include <bvar/bvar.h>
+#include <butil/time.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -43,6 +47,66 @@
 #include "node.pb.h"
 
 namespace sequencer::gateway::input::detail {
+
+// Instrumentation for the batching path, exposed on the gateway's own
+// brpc /vars page (brpc publishes every bvar there automatically, so
+// this needs no wiring beyond declaring them).
+//
+// It exists to answer one question that reasoning could not settle:
+// sweeps found a throughput ceiling near 380k req/s that is not CPU on
+// any box -- the raft leader measured 38.7% busy at 350k on 16 cores,
+// and the client boxes were not saturated either. The batching bounds
+// below are the other candidate, since maxInFlightBatches_ is a hard
+// cap on how many proposals can be on the wire at once, and a proposal
+// arriving when every slot is busy simply waits. `proposals_deferred`
+// counts exactly those. If it stays near zero as the offered rate
+// approaches the ceiling, this cap is not the ceiling and the search
+// moves elsewhere; if it climbs with the ceiling, it is.
+//
+// The gauges are read through free functions rather than members so
+// that bvar's sampling callback never re-enters the singleton's own
+// initialization.
+inline std::atomic<int>& queueDepthGauge() {
+  static std::atomic<int> value{0};
+  return value;
+}
+inline std::atomic<int>& batchesInFlightGauge() {
+  static std::atomic<int> value{0};
+  return value;
+}
+
+struct ProposerMetrics {
+  static ProposerMetrics& instance() {
+    // One set of bvars per process regardless of how many NodeProposers
+    // exist: bvar names are process-global, and tests construct several.
+    static ProposerMetrics metrics;
+    return metrics;
+  }
+
+  // A proposal that arrived with every in-flight slot busy, and so had
+  // to wait for a batch to come back before it could go anywhere.
+  bvar::Adder<std::uint64_t> deferred{"input_gateway_proposals_deferred"};
+  // Enqueue-to-wire, per proposal. Distinguishes "waiting for a slot"
+  // from "waiting for the raft group", which the end-to-end latency
+  // alone cannot separate.
+  bvar::LatencyRecorder queueDelayUs{"input_gateway_batch_queue_delay_us"};
+  // What batch sizes actually go out. The cap is 64; if the typical
+  // batch is far below it under load, batch size is not binding.
+  bvar::IntRecorder batchSize{"input_gateway_batch_size"};
+  bvar::Maxer<int> queueDepthMax{"input_gateway_queue_depth_max"};
+  bvar::PassiveStatus<int> queueDepthNow{"input_gateway_queue_depth", readQueueDepth, nullptr};
+  bvar::PassiveStatus<int> batchesInFlightNow{"input_gateway_batches_in_flight",
+                                               readBatchesInFlight, nullptr};
+
+ private:
+  static int readQueueDepth(void*) {
+    return queueDepthGauge().load(std::memory_order_relaxed);
+  }
+  static int readBatchesInFlight(void*) {
+    return batchesInFlightGauge().load(std::memory_order_relaxed);
+  }
+};
+
 
 class NodeProposer {
  public:
@@ -163,15 +227,22 @@ class NodeProposer {
     auto pending = std::make_shared<Pending>();
     pending->input.assign(input.begin(), input.end());
     pending->onDone = std::move(onDone);
+    pending->enqueuedUs = butil::cpuwide_time_us();
 
     std::vector<std::shared_ptr<Pending>> batch;
     {
       std::lock_guard<std::mutex> lock(batchMutex_);
       queued_.push_back(std::move(pending));
       if (batchesInFlight_ >= maxInFlightBatches_) {
+        // Every slot is busy: this proposal waits for a batch to come
+        // back. Counting these is the whole point of the metrics --
+        // see ProposerMetrics.
+        ProposerMetrics::instance().deferred << 1;
+        publishQueueDepthLocked();
         return;  // a completing batch will pick this up
       }
       ++batchesInFlight_;
+      batchesInFlightGauge().store(batchesInFlight_, std::memory_order_relaxed);
       batch = takeBatchLocked();
     }
     sendBatch(std::move(batch));
@@ -182,6 +253,8 @@ class NodeProposer {
   struct Pending {
     Bytes input;
     std::function<void(Outcome)> onDone;
+    // For input_gateway_batch_queue_delay_us; see ProposerMetrics.
+    std::int64_t enqueuedUs = 0;
   };
 
   struct BatchContext {
@@ -246,6 +319,7 @@ class NodeProposer {
       std::lock_guard<std::mutex> lock(batchMutex_);
       if (queued_.empty()) {
         --batchesInFlight_;
+        batchesInFlightGauge().store(batchesInFlight_, std::memory_order_relaxed);
         return;
       }
       // Keep this slot rather than releasing and re-acquiring it.
@@ -261,7 +335,20 @@ class NodeProposer {
         std::make_move_iterator(queued_.begin()),
         std::make_move_iterator(queued_.begin() + static_cast<std::ptrdiff_t>(take)));
     queued_.erase(queued_.begin(), queued_.begin() + static_cast<std::ptrdiff_t>(take));
+    publishQueueDepthLocked();
+    ProposerMetrics::instance().batchSize << static_cast<int>(batch.size());
+    const std::int64_t nowUs = butil::cpuwide_time_us();
+    for (const std::shared_ptr<Pending>& p : batch) {
+      ProposerMetrics::instance().queueDelayUs << (nowUs - p->enqueuedUs);
+    }
     return batch;
+  }
+
+  // Caller must hold batchMutex_.
+  void publishQueueDepthLocked() {
+    const int depth = static_cast<int>(queued_.size());
+    queueDepthGauge().store(depth, std::memory_order_relaxed);
+    ProposerMetrics::instance().queueDepthMax << depth;
   }
 
   static void onBatchDone(NodeProposer* self, std::shared_ptr<BatchContext> ctx) {
