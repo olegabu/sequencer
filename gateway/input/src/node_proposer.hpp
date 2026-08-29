@@ -92,7 +92,15 @@ struct ProposerMetrics {
   bvar::LatencyRecorder queueDelayUs{"input_gateway_batch_queue_delay_us"};
   // What batch sizes actually go out. The cap is 64; if the typical
   // batch is far below it under load, batch size is not binding.
-  bvar::IntRecorder batchSize{"input_gateway_batch_size"};
+  //
+  // Windowed, NOT a bare IntRecorder: that publishes a LIFETIME
+  // average, so under a rising sweep every reading is dominated by all
+  // the low-rate traffic that came before it. The first run of this
+  // instrumentation reported an average batch size of 1.0 at every rate
+  // up to 300k for exactly that reason, which is not what was happening
+  // -- the same run's own numbers imply batches of 3-4 there.
+  bvar::IntRecorder batchSizeRaw;
+  bvar::Window<bvar::IntRecorder> batchSize{"input_gateway_batch_size", &batchSizeRaw, -1};
   bvar::Maxer<int> queueDepthMax{"input_gateway_queue_depth_max"};
   bvar::PassiveStatus<int> queueDepthNow{"input_gateway_queue_depth", readQueueDepth, nullptr};
   bvar::PassiveStatus<int> batchesInFlightNow{"input_gateway_batches_in_flight",
@@ -336,7 +344,7 @@ class NodeProposer {
         std::make_move_iterator(queued_.begin() + static_cast<std::ptrdiff_t>(take)));
     queued_.erase(queued_.begin(), queued_.begin() + static_cast<std::ptrdiff_t>(take));
     publishQueueDepthLocked();
-    ProposerMetrics::instance().batchSize << static_cast<int>(batch.size());
+    ProposerMetrics::instance().batchSizeRaw << static_cast<int>(batch.size());
     const std::int64_t nowUs = butil::cpuwide_time_us();
     for (const std::shared_ptr<Pending>& p : batch) {
       ProposerMetrics::instance().queueDelayUs << (nowUs - p->enqueuedUs);
@@ -531,6 +539,40 @@ class NodeProposer {
   // where it matters; batch size 256 was clearly worse than 64 (1714
   // against 1009 at 100k), since a batch's latency is its slowest
   // member. Override with --max_batch_size / --max_inflight_batches.
+  //
+  // IMPORTANT, and not visible from a single gateway: that sweep ran
+  // ONE gateway. This bound is per-gateway, but what the leader feels
+  // is the SUM across every gateway proposing to it. Five gateways at
+  // 16 apiece put 80 concurrent batches on a leader that does its best
+  // work near 16-20, and the leader's own apply latency degrades under
+  // that pressure. Re-swept with five gateways -- end-to-end p50, and
+  // where the cluster stops keeping up:
+  //
+  //   slots    100k    300k    350k    400k       450k    500k
+  //       4     803    1509    1654    2268       3204    collapsed
+  //       8     680    1268    1568    collapsed     -        -
+  //      16     683    1324    1750    collapsed     -        -
+  //      64     687    2070    collapsed   -          -        -
+  //
+  // The product (gateways x slots) is what matters, not slots alone:
+  // 5x4 = 20 lands near the total concurrency 1x16 already had, and it
+  // is the only setting here that carries 450k. Raising the bound is
+  // actively harmful -- 64 collapses earliest, because removing the
+  // backpressure just moves the queue onto the leader.
+  //
+  // So the deferral this bound causes is not waste, it is admission
+  // control, and a large input_gateway_proposals_deferred is a sign it
+  // is working rather than something to tune away. That was established
+  // by predicting the opposite and being wrong: the first hypothesis
+  // was that deferral WAS the ceiling, and raising the bound to 64 to
+  // relieve it made every rate worse and moved the knee down from
+  // ~360k to ~330k.
+  //
+  // Rule of thumb: divide roughly 16-20 by the number of input gateways
+  // feeding one leader, floored at 1. Low rates prefer the larger value
+  // (fewer proposals wait for a slot), high rates need the smaller one,
+  // so choose for the load you must survive rather than the load you
+  // usually see.
   static constexpr std::size_t kMaxBatchSize = 64;
   static constexpr int kMaxInFlightBatches = 16;
 

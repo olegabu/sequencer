@@ -53,8 +53,12 @@ struct ProposeMetrics {
   bvar::LatencyRecorder applyWaitUs{"node_propose_batch_apply_wait_us"};
   // How many inputs arrive per batch, as the leader sees them. The
   // gateway caps its own at 64; comparing the two says whether batches
-  // are arriving full.
-  bvar::IntRecorder batchInputs{"node_propose_batch_inputs"};
+  // are arriving full. Windowed for the same reason as the gateway's
+  // own batch-size bvar -- a bare IntRecorder publishes a lifetime
+  // average, which under a rising sweep reports the history rather than
+  // the rate being measured.
+  bvar::IntRecorder batchInputsRaw;
+  bvar::Window<bvar::IntRecorder> batchInputs{"node_propose_batch_inputs", &batchInputsRaw, -1};
   // Single-input Propose, kept separate so the batched and unbatched
   // paths never average together.
   bvar::LatencyRecorder singleApplyWaitUs{"node_propose_apply_wait_us"};
@@ -154,7 +158,7 @@ class ProposeServiceImpl : public sequencer::node::proto::ProposeService {
     }
 
     const int count = request->inputs_size();
-    ProposeMetrics::instance().batchInputs << count;
+    ProposeMetrics::instance().batchInputsRaw << count;
     // deque, not vector: ProposeClosure holds a CountdownEvent and is
     // neither copyable nor movable, and braft is handed a pointer to
     // each one, so the storage must never reallocate.
