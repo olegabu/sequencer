@@ -1,9 +1,9 @@
 // specification.md §10, §8.7: the counter example's output gateway,
 // over brpc's own Streaming RPC — the chassis's built-in transport
-// (BrpcStreamTransport), the same one output_gateway_main.cpp
+// (BrpcOutputTransport), the same one output_gateway_main.cpp
 // (websocket_output_gateway_main.cpp) and gRPC (grpc_output_gateway_main.cpp) each
 // override with something else. It is the minimal single-transport
-// case: MakeBrpcStreamTransport() is the chassis's own built-in
+// case: BrpcOutputTransport is the chassis's own built-in
 // transport, so this binary links no transport library beyond the base
 // sequencer::gateway_output.
 
@@ -12,6 +12,7 @@
 
 #include <gflags/gflags.h>
 
+#include <sequencer/brpc_output_transport.hpp>
 #include <sequencer/output_gateway.hpp>
 
 #include "counter_output_codec.hpp"
@@ -25,6 +26,10 @@ int main(int argc, char** argv) {
   return sequencer::RunOutputGateway(
       argc, argv, std::make_unique<sequencer::examples::counter::CounterOutputCodec>(), [] {
         return std::vector<sequencer::OutputTransportBinding>{
-            {[] { return sequencer::MakeBrpcStreamTransport(); }, FLAGS_listen_port}};
+            {[] {
+               return std::unique_ptr<sequencer::OutputTransport>(
+                   std::make_unique<sequencer::BrpcOutputTransport>());
+             },
+             FLAGS_listen_port}};
       });
 }

@@ -2,7 +2,7 @@
 
 // The client-facing Subscribe handshake — accepts the stream and hands
 // it to RelayGatewayImpl::startSession, which does the actual work.
-// Mirrors gateway/output/src/output_subscribe_service_impl.hpp's shape
+// Mirrors gateway/output/src/brpc_subscribe_service_impl.hpp's shape
 // exactly; the two RPCs differ only in what happens after the
 // handshake (a shared live Fanout there, an independent per-session
 // tailing cursor here).

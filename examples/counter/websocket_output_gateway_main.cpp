@@ -4,7 +4,7 @@
 //
 // One of three flavors, each named for its transport:
 // brpc_output_gateway_main.cpp (the chassis's own built-in
-// BrpcStreamTransport), grpc_output_gateway_main.cpp (real gRPC), and
+// BrpcOutputTransport), grpc_output_gateway_main.cpp (real gRPC), and
 // this one. They differ only in which OutputTransport they hand to
 // RunOutputGateway — same CounterOutputCodec, same journal, same
 // chassis.

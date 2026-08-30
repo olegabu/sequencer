@@ -2,7 +2,7 @@
 
 // One of three output-gateway observers (see sequence_correlator.hpp's
 // own file comment for the shared design) — this one subscribes to
-// BrpcStreamTransport's OutputSubscribeService
+// BrpcOutputTransport's OutputSubscribeService
 // (gateway/output/proto/output_gateway.proto), the same brpc::Stream
 // contract gateway/output/tests/collecting_stream_client.hpp's
 // test-only CollectingStreamHandler already proves out (this mirrors
@@ -106,7 +106,7 @@ class BrpcOutputObserver final : public OutputGatewayObserver, private brpc::Str
   void printSummary() const override {
     std::printf("\n=== output-gateway (brpc) observed summary ===\n");
     std::printf(
-        "(submission to receipt via BrpcStreamTransport's own brpc::Stream -- not\n"
+        "(submission to receipt via BrpcOutputTransport's own brpc::Stream -- not\n"
         " the synchronous ack path above; see bench/load_generator/README.md)\n");
     correlator_.printSummary("output_brpc");
   }
@@ -125,8 +125,8 @@ class BrpcOutputObserver final : public OutputGatewayObserver, private brpc::Str
   // of view, same reasoning RelayObserver's own batch-read loop uses)
   // and hands each payload straight to the correlator, doing nothing
   // else here. Each of the `size` messages may itself be a batch of
-  // several length-prefixed payloads — see StreamFanout::append()'s
-  // own comment (gateway/output/src/stream_fanout.hpp) for why a raw
+  // several length-prefixed payloads — see BrpcStreamFanout::append()'s
+  // own comment (gateway/output/src/brpc_stream_fanout.hpp) for why a raw
   // concatenation wouldn't decode correctly and what the 4-byte
   // big-endian length prefix is for.
   int on_received_messages(brpc::StreamId, butil::IOBuf* const messages[], std::size_t size) override {

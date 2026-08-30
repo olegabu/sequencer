@@ -43,7 +43,7 @@ each way, not worth pulling one in for.
 `gateway/output/`'s chassis is transport-agnostic
 (`sequencer::OutputTransport`); this example plugs in
 `sequencer::WebSocketOutputTransport` instead of the chassis's built-in
-brpc-Streaming `BrpcStreamTransport`, so a browser can subscribe
+brpc-Streaming `BrpcOutputTransport`, so a browser can subscribe
 directly with no brpc client of its own — specification.md §8.7 calls
 out WebSocket as the other zero-additional-dependency choice, this time
 for browser-facing consumers.
@@ -137,8 +137,8 @@ only what that transport needs.
 
 `brpc_output_gateway_main.cpp` completes the set alongside WebSocket
 (`websocket_output_gateway_main.cpp`) and gRPC (`grpc_output_gateway_main.cpp`):
-the chassis's own built-in transport (`BrpcStreamTransport`), reached
-through `sequencer::MakeBrpcStreamTransport()` — so unlike the other
+the chassis's own built-in transport (`BrpcOutputTransport`), reached
+through `sequencer::MakeBrpcOutputTransport()` — so unlike the other
 two, this binary links no transport library beyond the base
 `sequencer::gateway_output`.
 Run it exactly like the WebSocket flavor ("By hand" below), on its own
@@ -224,7 +224,7 @@ output-gateway transports (brpc, real gRPC, WebSocket), via
 missing brpc-flavored counter binary (`counter_brpc_output_gateway`,
 `brpc_output_gateway_main.cpp`) was added alongside it — the transport
 itself already existed as `RunOutputGateway`'s chassis default
-(`BrpcStreamTransport`), just never exposed as its own counter binary
+(`BrpcOutputTransport`), just never exposed as its own counter binary
 before. Flag-controlled on the load generator: `--output_observer=grpc
 |brpc|websocket` plus `--output_gateway_addr`.
 
@@ -232,7 +232,7 @@ before. Flag-controlled on the load generator: `--output_observer=grpc
 gateway at real throughput**, and it found three real, pre-existing
 bugs in production code, none specific to the new observer harness:
 
-1. **`StreamFanout::write()` silently dropped messages on `EAGAIN`.**
+1. **`BrpcStreamFanout::write()` silently dropped messages on `EAGAIN`.**
    Expected backpressure under real load, treated identically to "the
    client is gone" — a benchmark subscriber at 70k records/sec received
    almost none of them. Fixed with a short (~10ms) bounded retry.
@@ -270,12 +270,12 @@ showed up here too** — see [gateway/relay/README.md](../../gateway/relay/READM
   real TCP/socket-write syscall path plus kernel spinlock contention.
   Added `Fanout::flush()` (default no-op) and had `tailLoop()` gather
   a batch before calling it once, instead of once per record.
-  `StreamFanout` (brpc) implements it by accumulating into a
+  `BrpcStreamFanout` (brpc) implements it by accumulating into a
   length-prefixed per-stream buffer, not a protobuf envelope
   (deliberately — this transport's whole point is carrying an
   `OutputCodec`'s bytes completely unmodified) — decoded transparently
   by the shared test helper and the new observer. Caught immediately
-  by the existing tests: `BrpcStreamTransport` never overrode
+  by the existing tests: `BrpcOutputTransport` never overrode
   `flush()`, so nothing accumulated ever actually got sent until that
   was added too. Confirmed: brpc **4731us → 4207us** at 100k req/s.
 
@@ -323,7 +323,7 @@ either way:**
   `postWrite()` (one real `net::post()` thread hand-off) per record,
   unconditionally, and `Fanout::flush()`'s no-op default meant
   `tailLoop()`'s own batching did nothing for it. Given the same
-  `append()`-then-`flush()` treatment as `StreamFanout` (length-prefixed
+  `append()`-then-`flush()` treatment as `BrpcStreamFanout` (length-prefixed
   accumulation per session, one websocket text frame per `flush()`
   instead of one per record). Confirmed: **~5.0ms → 3879us at 70k**
   (~23%, a bigger relative win than brpc's own ~11% from the same

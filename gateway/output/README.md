@@ -125,8 +125,8 @@ gflags flags are process-global symbols, and a binary linking both
 libraries fails to link outright. Each application main defines
 whatever port flags it wants and passes the values in.
 
-`MakeBrpcStreamTransport()` exposes the chassis's own built-in
-transport (`src/brpc_stream_transport.hpp`) for use in such a list —
+`MakeBrpcOutputTransport()` exposes the chassis's own built-in
+transport (`src/brpc_output_transport.hpp`) for use in such a list —
 brpc's full-duplex Streaming RPC, specification.md §8.7's
 zero-additional-dependency choice for brpc/gRPC-aware consumers.
 Clients call `OutputSubscribeService.Subscribe` (attaching a stream
@@ -234,7 +234,7 @@ Only for *unary* calls. brpc does not implement genuine gRPC-protocol
 *streaming* — confirmed against brpc's own upstream repository: ["BRPC
 兼容GRPC stream"](https://github.com/apache/brpc/issues/1589) is an
 open, unresolved feature request, not a shipped capability. brpc's own
-"Streaming RPC" (`brpc::Stream`, what `BrpcStreamTransport` above is
+"Streaming RPC" (`brpc::Stream`, what `BrpcOutputTransport` above is
 built on) is a `baidu_std`-protocol-specific mechanism — not gRPC-wire-
 compatible, and not consumable by a real gRPC client (`grpcurl`,
 `grpc-go`, `grpc-java`, ...) at all. `proto/output_grpc.proto` is
@@ -288,9 +288,9 @@ thread backtraces: `brpc::StreamClose()` does not guarantee its
 stream's `on_closed()` callback has already run by the time it returns
 — that callback can fire asynchronously, shortly afterward, from a
 different thread. `OutputGatewayImpl::stop()` closed every stream and
-then proceeded straight to destroying the `StreamFanout` those
+then proceeded straight to destroying the `BrpcStreamFanout` those
 callbacks touch; on rare, unlucky timing, `on_closed()` landed on
-already-freed memory. Fixed in `StreamFanout::closeAll()`: it now
+already-freed memory. Fixed in `BrpcStreamFanout::closeAll()`: it now
 tracks every stream it asked to close and blocks (with a bounded
 timeout, so a pathological client can never hang shutdown forever)
 until each one's `on_closed()` has actually confirmed. Verified against
@@ -315,7 +315,7 @@ reproduce it found nothing. `tests/collecting_stream_client.hpp` is the
 fix: a shared `Subscription`/`CollectingStreamHandler` (previously
 duplicated, unfixed, in both `output_gateway_test.cpp` and this file)
 whose `Subscription` now closes its stream and blocks — bounded, same
-shape as `StreamFanout::closeAll()` — until `on_closed()` has actually
+shape as `BrpcStreamFanout::closeAll()` — until `on_closed()` has actually
 confirmed, in its own destructor, so correctness never depends on a
 test remembering to do this by hand. Verified against 40 consecutive
 clean full-suite runs after the fix.

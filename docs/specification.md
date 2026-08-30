@@ -1171,7 +1171,7 @@ changes, and both remain opt-in:
 
 **`GrpcOutputTransport`** (`gateway/output/`) is a second, real-gRPC
 implementation of the same `OutputTransport` interface §8.5 already
-defines, alongside the chassis's default `BrpcStreamTransport` and the
+defines, alongside the chassis's default `BrpcOutputTransport` and the
 WebSocket transport §8.7 describes — an application picks one via
 `RunOutputGateway`'s transport-factory argument, unchanged from before.
 Like the WebSocket transport, its wire message is a generic bytes

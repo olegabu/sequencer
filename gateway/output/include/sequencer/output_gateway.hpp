@@ -18,14 +18,6 @@ struct OutputTransportBinding {
   int listenPort = 0;
 };
 
-// The chassis's own built-in transport — brpc Streaming RPC
-// (specification.md §8.7) — as a transport an application can put in a
-// binding list alongside others. It lives in gateway/output/src and is
-// otherwise not reachable from application code; the two overloads
-// below that default to it don't need this, but an application
-// enabling brpc *and* something else does.
-std::unique_ptr<OutputTransport> MakeBrpcStreamTransport();
-
 // Tails a journal from a durably-tracked resume position, calling
 // `codec->toOutput(record, fanout)` once per record in order
 // (specification.md §8.3), and publishing each result into a

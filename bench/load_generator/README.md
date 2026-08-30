@@ -175,7 +175,7 @@ bare-braft product with no gateway or relay tier at all:
    trip, and the one place this repository's own architecture offers a
    *choice* the relay doesn't: an output gateway applies an
    `OutputCodec` and disseminates over one of three transports
-   (`gateway/output/`'s `BrpcStreamTransport`, `GrpcOutputTransport`, or
+   (`gateway/output/`'s `BrpcOutputTransport`, `GrpcOutputTransport`, or
    `WebSocketOutputTransport`), so there are three genuinely different
    numbers here, not one. `sequence_correlator.hpp`'s
    `SequenceCorrelator` is (whichever transport is picked between)

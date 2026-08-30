@@ -6,7 +6,7 @@
 // restart, which is the whole point of the durable resume position
 // (§8.3: "restartable from any sequence number with identical output").
 
-#include "brpc_stream_transport.hpp"
+#include <sequencer/brpc_output_transport.hpp>
 #include "collecting_stream_client.hpp"
 #include "output_gateway_impl.hpp"
 
@@ -79,7 +79,7 @@ TEST(OutputGateway, DeliversLiveRecordsInOrderToAConnectedSubscriber) {
   config.dataDir = dir;
   config.resumeFile = dir / "resume";
   OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>(),
-                            std::make_unique<BrpcStreamTransport>(), 28961);
+                            std::make_unique<BrpcOutputTransport>(), 28961);
   gateway.start();
 
   brpc::Channel channel;
@@ -89,7 +89,7 @@ TEST(OutputGateway, DeliversLiveRecordsInOrderToAConnectedSubscriber) {
 
   // Subscribe before any record exists: Fanout delivers live to
   // currently-connected sessions only (no historical replay for late
-  // joiners in this phase — see StreamFanout's header comment), so a
+  // joiners in this phase — see BrpcStreamFanout's header comment), so a
   // realistic test — and a real deployment — connects first.
   Subscription sub = subscribe(channel, "all");
   appendRecords(dir, 1, {5, -2, 10, -13, 100});
@@ -117,7 +117,7 @@ TEST(OutputGateway, ResumesFromDurablePositionAfterRestartWithoutRedelivering) {
   config.resumeFile = dir / "resume";
   {
     OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>(),
-                            std::make_unique<BrpcStreamTransport>(), 28962);
+                            std::make_unique<BrpcOutputTransport>(), 28962);
     gateway.start();
 
     brpc::Channel channel;
@@ -136,7 +136,7 @@ TEST(OutputGateway, ResumesFromDurablePositionAfterRestartWithoutRedelivering) {
 
   {
     OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>(),
-                            std::make_unique<BrpcStreamTransport>(), 28962);
+                            std::make_unique<BrpcOutputTransport>(), 28962);
     gateway.start();
 
     brpc::Channel channel;
@@ -237,7 +237,7 @@ TEST(OutputGateway, OneGatewayServesTwoTransportsFromOneJournalTail) {
   config.resumeFile = dir / "resume";
 
   std::vector<OutputGatewayImpl::Binding> bindings;
-  bindings.push_back({std::make_unique<BrpcStreamTransport>(), kBrpcPort});
+  bindings.push_back({std::make_unique<BrpcOutputTransport>(), kBrpcPort});
   bindings.push_back({std::make_unique<sequencer::WebSocketOutputTransport>(), kWsPort});
   OutputGatewayImpl gateway(config, std::make_unique<EchoOutputCodec>(), std::move(bindings));
   gateway.start();

@@ -12,7 +12,7 @@
 //
 // Safety note: this stream's on_closed() callback is the same brpc
 // contract gap documented twice already in this repository
-// (gateway/output/README.md's StreamFanout::closeAll(), and
+// (gateway/output/README.md's BrpcStreamFanout::closeAll(), and
 // gateway/output/tests/collecting_stream_client.hpp's client-side
 // mirror of it) — StreamClose() does not guarantee on_closed() has
 // already run by the time it returns. This class's destructor closes

@@ -8,7 +8,7 @@
 // component's tests caught": brpc::StreamClose() does not guarantee
 // its stream's on_closed() callback has already run by the time it
 // returns — that fix was applied on the *server* side
-// (StreamFanout::closeAll(), in src/stream_fanout.hpp). The exact same
+// (BrpcStreamFanout::closeAll(), in src/brpc_stream_fanout.hpp). The exact same
 // gap exists on the *client* side of every test that subscribes: if
 // nothing waits for confirmed closure before a Subscription's
 // unique_ptr<CollectingStreamHandler> is destroyed, an in-flight
@@ -42,8 +42,8 @@ namespace sequencer::gateway::output::detail {
 class CollectingStreamHandler : public brpc::StreamInputHandler {
  public:
   // Each of the `size` messages may itself be a batch of several
-  // length-prefixed payloads now (StreamFanout::append()/flush(),
-  // gateway/output/src/stream_fanout.hpp) — decoded and flattened
+  // length-prefixed payloads now (BrpcStreamFanout::append()/flush(),
+  // gateway/output/src/brpc_stream_fanout.hpp) — decoded and flattened
   // here so every test using this handler keeps seeing one already-
   // unwrapped payload per received_ entry, unchanged.
   int on_received_messages(brpc::StreamId, butil::IOBuf* const messages[], size_t size) override {

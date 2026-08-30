@@ -31,6 +31,7 @@
 #include <gflags/gflags.h>
 
 #include <sequencer/grpc_output_transport.hpp>
+#include <sequencer/brpc_output_transport.hpp>
 #include <sequencer/output_gateway.hpp>
 #include <sequencer/websocket_output_transport.hpp>
 
@@ -51,7 +52,11 @@ int main(int argc, char** argv) {
           // The chassis's own built-in transport is not reachable from
           // here (it lives in gateway/output/src), so the brpc flavor
           // goes through the same factory shape as the other two.
-          bindings.push_back({[] { return sequencer::MakeBrpcStreamTransport(); }, FLAGS_brpc_port});
+          bindings.push_back({[] {
+                                return std::unique_ptr<sequencer::OutputTransport>(
+                                    std::make_unique<sequencer::BrpcOutputTransport>());
+                              },
+                              FLAGS_brpc_port});
         }
         if (FLAGS_grpc_port != 0) {
           bindings.push_back({[] {

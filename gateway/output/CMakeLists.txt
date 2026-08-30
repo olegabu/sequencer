@@ -10,6 +10,7 @@ protobuf_generate(
 )
 
 add_library(sequencer_gateway_output STATIC
+  src/brpc_output_transport.cpp
   src/run_output_gateway.cpp
   ${SEQUENCER_GATEWAY_OUTPUT_PROTO_SOURCES}
 )
@@ -18,7 +19,7 @@ add_library(sequencer::gateway_output ALIAS sequencer_gateway_output)
 target_include_directories(sequencer_gateway_output
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    # src/ (OutputGatewayImpl, StreamFanout) is not part of the
+    # src/ (OutputGatewayImpl, BrpcStreamFanout) is not part of the
     # application-facing interface, but tests need it directly.
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>"

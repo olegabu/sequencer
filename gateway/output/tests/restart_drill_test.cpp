@@ -14,10 +14,10 @@
 // copy of this same handler (in both this file and
 // output_gateway_test.cpp) was almost certainly the cause of a rare,
 // one-off segfault caught while this test was first stress-tested — a
-// client-side counterpart to the server-side StreamFanout::closeAll()
+// client-side counterpart to the server-side BrpcStreamFanout::closeAll()
 // race documented elsewhere in this component's README.
 
-#include "brpc_stream_transport.hpp"
+#include <sequencer/brpc_output_transport.hpp>
 #include "collecting_stream_client.hpp"
 #include "output_gateway_impl.hpp"
 
@@ -89,7 +89,7 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
   configA.dataDir = dirA;
   configA.resumeFile = dirA / "resume";
   constexpr int portA = 28981;
-  OutputGatewayImpl gatewayA(configA, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>(), portA);
+  OutputGatewayImpl gatewayA(configA, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcOutputTransport>(), portA);
   gatewayA.start();
 
   brpc::Channel channelA;
@@ -113,7 +113,7 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
 
   std::vector<std::int64_t> deliveredByB;
   {
-    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>(), portB);
+    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcOutputTransport>(), portB);
     gatewayB.start();
     brpc::Channel channel;
     brpc::ChannelOptions channelOptions;
@@ -133,7 +133,7 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
     // from.
   }
   {
-    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcStreamTransport>(), portB);
+    OutputGatewayImpl gatewayB(configB, std::make_unique<EchoOutputCodec>(), std::make_unique<BrpcOutputTransport>(), portB);
     gatewayB.start();
     brpc::Channel channel;
     brpc::ChannelOptions channelOptions;

@@ -47,7 +47,7 @@
 // raw concatenation would arrive as one corrupted frame; the length
 // prefix is the minimal framing that keeps an OutputCodec's bytes
 // otherwise completely unmodified (same reasoning as
-// stream_fanout.hpp's). Decoded by websocket_output_transport_test's
+// brpc_stream_fanout.hpp's). Decoded by websocket_output_transport_test's
 // client, the counter example's e2e test client, and
 // bench/load_generator's WebSocket observer.
 //
@@ -148,7 +148,7 @@ struct WebSocketOutputTransport::Impl {
     // arbitrarily late, and a head() read that happens only then
     // silently skips everything published in between as
     // pre-subscription history (a real, reproduced flake in the brpc
-    // transport's identical path — see stream_fanout.hpp).
+    // transport's identical path — see brpc_stream_fanout.hpp).
     const std::uint64_t initialCursor = ring->head();
     // Registration and the thread-object assignment both happen under
     // sessionsMutex: the writer's self-deregistration tail (below)
@@ -175,7 +175,7 @@ struct WebSocketOutputTransport::Impl {
     });
   }
 
-  // One subscriber's whole delivery path (see stream_fanout.hpp's
+  // One subscriber's whole delivery path (see brpc_stream_fanout.hpp's
   // readLoop — same shape): drain, filter by tag, one frame per
   // drained batch, spin-then-back-off when caught up, disconnect on
   // overrun.

@@ -40,7 +40,7 @@
 
 namespace sequencer::gateway::output::detail {
 
-class StreamFanout : public brpc::StreamInputHandler {
+class BrpcStreamFanout : public brpc::StreamInputHandler {
  public:
   void attach(sequencer::BroadcastRing& ring, sequencer::TopicRegistry& topics, int idleSpinIterations) {
     ring_ = &ring;
@@ -52,7 +52,7 @@ class StreamFanout : public brpc::StreamInputHandler {
 
   // Registers a newly-accepted stream under `sessionId`, joined to
   // `topic`, and starts its reader thread. Called by
-  // OutputSubscribeServiceImpl right after brpc::StreamAccept — i.e.
+  // BrpcSubscribeServiceImpl right after brpc::StreamAccept — i.e.
   // before the Subscribe RPC's response is sent, which is the ordering
   // clients rely on: anything published after subscribe() returns must
   // be delivered. The cursor is therefore captured HERE, on this
@@ -94,7 +94,7 @@ class StreamFanout : public brpc::StreamInputHandler {
   // exists specifically to close off. The wait (bounded, so a
   // pathological stream can never hang shutdown forever) is what turns
   // "StreamClose() was called" into "it is now safe to destroy this
-  // object." Called by BrpcStreamTransport::stop() before stopping the
+  // object." Called by BrpcOutputTransport::stop() before stopping the
   // server — and, transitively, before anything owning this fanout can
   // be destroyed.
   void closeAll() {

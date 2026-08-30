@@ -70,7 +70,7 @@ target_link_libraries(counter_websocket_output_gateway_main PRIVATE counter::out
 set_target_properties(counter_websocket_output_gateway_main PROPERTIES OUTPUT_NAME counter_websocket_output_gateway)
 
 # The brpc flavor: the chassis's own built-in transport
-# (BrpcStreamTransport), needing no override and so no extra transport
+# (BrpcOutputTransport), needing no override and so no extra transport
 # library beyond the base sequencer::gateway_output — see
 # brpc_output_gateway_main.cpp's own file comment.
 add_executable(counter_brpc_output_gateway_main brpc_output_gateway_main.cpp)

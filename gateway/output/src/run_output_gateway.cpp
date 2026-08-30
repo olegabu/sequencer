@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-#include "brpc_stream_transport.hpp"
+#include <sequencer/brpc_output_transport.hpp>
 #include "output_gateway_impl.hpp"
 
 DEFINE_string(data_dir, "", "A node's journal directory to tail, colocated (required)");
@@ -95,10 +95,6 @@ int runOutputGatewayCommon(int argc, char** argv, std::unique_ptr<OutputCodec> c
 }
 
 }  // namespace
-
-std::unique_ptr<OutputTransport> MakeBrpcStreamTransport() {
-  return std::make_unique<gateway::output::detail::BrpcStreamTransport>();
-}
 
 int RunOutputGateway(int argc, char** argv, std::unique_ptr<OutputCodec> codec,
                       std::function<std::vector<OutputTransportBinding>()> bindingsFactory) {

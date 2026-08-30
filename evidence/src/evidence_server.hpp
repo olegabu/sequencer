@@ -2,7 +2,7 @@
 
 // Wires EvidenceServiceImpl to a real brpc::Server — split out from
 // SigningGatewayImpl (tailing/signing/querying only) the same way
-// gateway/output split BrpcStreamTransport out of OutputGatewayImpl:
+// gateway/output split BrpcOutputTransport out of OutputGatewayImpl:
 // keeps the tailing logic's own header free of brpc::Server plumbing,
 // and lets tests stand up just the tailing/signing half without a
 // listening port when they don't need one.

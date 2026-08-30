@@ -1,7 +1,7 @@
 #pragma once
 
 // The client-facing Subscribe handshake: accepts the stream, registers
-// it with the shared StreamFanout, and returns — publication happens
+// it with the shared BrpcStreamFanout, and returns — publication happens
 // later, entirely from the tailing thread calling codec->toOutput(),
 // never from this handler.
 
@@ -10,13 +10,13 @@
 #include <brpc/stream.h>
 
 #include "output_gateway.pb.h"
-#include "stream_fanout.hpp"
+#include "brpc_stream_fanout.hpp"
 
 namespace sequencer::gateway::output::detail {
 
-class OutputSubscribeServiceImpl : public sequencer::gateway::output::proto::OutputSubscribeService {
+class BrpcSubscribeServiceImpl : public sequencer::gateway::output::proto::OutputSubscribeService {
  public:
-  explicit OutputSubscribeServiceImpl(StreamFanout& fanout) : fanout_(fanout) {}
+  explicit BrpcSubscribeServiceImpl(BrpcStreamFanout& fanout) : fanout_(fanout) {}
 
   void Subscribe(::google::protobuf::RpcController* controllerBase,
                  const sequencer::gateway::output::proto::OutputSubscribeRequest* request,
@@ -46,7 +46,7 @@ class OutputSubscribeServiceImpl : public sequencer::gateway::output::proto::Out
   }
 
  private:
-  StreamFanout& fanout_;
+  BrpcStreamFanout& fanout_;
 };
 
 }  // namespace sequencer::gateway::output::detail
