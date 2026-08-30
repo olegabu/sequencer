@@ -588,6 +588,230 @@ but is not portable to ARM. The reference client library (§9) provides
 this correctly per language rather than leaving every consumer to
 reimplement the protocol.
 
+### 6.5 Segment rollover
+
+Everything above describes **one** data file and **one** index file,
+reserved at their maximum size when the journal is created and never
+remapped. That is a deliberate simplification (it is what makes readers
+lock-free without ever coordinating with the writer), and it has a hard
+consequence: a journal has a finite capacity fixed at creation, and a
+node that reaches it cannot append again. At six-figure rates that
+capacity is minutes to tens of minutes, so it is reached in normal
+operation rather than exceptionally.
+
+Segment rollover removes that ceiling. Instead of one file pair, a
+journal is a **directory of sealed segments plus one active segment**,
+and the writer starts a new segment when the active one is full.
+
+**Segments are not deleted.** Retention is out of scope here: every
+segment a node has ever written stays on its disk, and disk capacity
+becomes the operator's planning problem rather than the journal's. This
+keeps the design substantially simpler — a sealed segment is immutable
+forever, so a reader that has mapped one never has to handle it
+disappearing — at the cost of unbounded growth. Retention may be
+specified later; nothing here forecloses it.
+
+**Geometry: fixed records per segment.** Each segment holds exactly
+`recordsPerSegment` records, except the active one, which is filling.
+This is the single most important choice in the design, because it
+preserves §6.1's O(1) addressing **exactly**:
+
+```
+segment index  =  (K - 1) / recordsPerSegment
+slot in segment =  (K - 1) % recordsPerSegment
+```
+
+Locating record K is still arithmetic — no lookup table, no binary
+search over segment boundaries, no manifest consulted on the read path.
+A design that let segments end at arbitrary record counts (rolling when
+the *data* file filled, say) would force every reader to consult a
+segment table before every read, turning the journal's cheapest
+operation into its most complicated one.
+
+For that arithmetic to hold, the record count must always be what ends a
+segment. A segment's data reservation is therefore sized to
+`recordsPerSegment * maxRecordBytes`, so it cannot fill first. Appending
+a record larger than `maxRecordBytes` is an error, not an early roll —
+the same class of error as exceeding `maxInputSize` (§5.3), and reported
+the same way.
+
+**Files.** A journal becomes a directory, with `recordsPerSegment` of
+200 in this illustration:
+
+```
+<data_dir>/journal/
+  manifest                                       geometry + committed count
+
+  journal_00000000000000000001_00000000000000000200.data    sealed: records 1..200
+  journal_00000000000000000001_00000000000000000200.index
+
+  journal_00000000000000000201_00000000000000000400.data    sealed: records 201..400
+  journal_00000000000000000201_00000000000000000400.index
+
+  journal_inprogress_00000000000000000401.data              active: filling from 401
+  journal_inprogress_00000000000000000401.index
+```
+
+The naming follows braft's own segmented log, deliberately rather than
+coincidentally — a node already keeps one of those beside this journal,
+and two different segment-naming schemes in one data directory would be
+a needless source of confusion. braft uses `log_inprogress_%020ld` while
+a segment is open and `log_%020ld_%020ld` (first and last index) once it
+is sealed; this adopts the same shape, with `journal_` in place of
+`log_`. Zero padding keeps lexical order equal to sequence order, which
+is what makes an `ls` of the directory readable and a glob sufficient
+for tooling.
+
+An open segment cannot name its last record, because that record has not
+been written yet. Sealing therefore renames the file, exactly as braft
+does — the rename is atomic, and the segment is immutable from that
+moment on.
+
+Fixed geometry keeps that rename from costing readers anything. Both
+candidate names for a segment are *derivable*: having computed the
+segment index arithmetically, a reader knows its first record is
+`segment * recordsPerSegment + 1`, so the sealed name is fully
+determined and the open name is the same first number under the
+`inprogress` form. A reader tries the sealed name, then the open one. No
+directory listing, no manifest lookup, and no sorted search — the names
+carry the range for tooling and for a human reading an `ls`, while
+addressing remains the arithmetic §6.1 promises.
+
+A reader may lose a race with the rename and see `ENOENT` on both
+candidates for an instant. It retries; the segment did not go anywhere.
+Readers that already hold the segment open are unaffected, because a
+rename on POSIX does not disturb an open descriptor or an existing
+mapping — which is also why sealing is safe to do underneath live
+readers in the first place.
+
+
+
+A segment's index file holds `recordsPerSegment` `IndexEntry` values in
+the §6.2 format, unchanged, except that `byteOffset` is now relative to
+its own data file rather than to the whole journal.
+
+**Why the index file survives, even though the name carries the range.**
+It is a fair question — braft manages without one, and if a filename
+says which records a segment holds, the index looks redundant. It is
+not, because the two answer different questions: the name says *which
+segment* record K is in, and the index says *where inside that segment
+K's bytes begin*. Records are variable-length, so the second question
+has no arithmetic answer.
+
+braft does not avoid that cost so much as relocate it. Its header states
+the design in one line — "all data in disk, all index in memory" — and
+`Segment::load()` rebuilds the offsets by scanning every record in the
+segment on open, holding them in a `std::vector<std::pair<offset,
+term>>`. That is a good trade for braft, whose log is read by exactly
+one process: the node that wrote it, which can afford to scan once at
+startup and keep the table in its own heap, updating it as it appends.
+
+This journal is built on the opposite premise. §6.1 and §6.4 make
+readers *independent processes*, structurally invisible to the writer,
+with O(1) access to any record. Dropping the on-disk index would push a
+full segment scan into every reader, not once for the system but once
+per reader per segment; it would make `Subscribe(fromSequenceNumber)`
+(§8.3) scan to reach an old sequence number instead of jumping to it;
+and for the active segment it would leave a reader re-scanning as the
+file grows, because no external process can share the writer's in-memory
+table. That last point is the decisive one, and it is the same problem
+§6.1 gives as the reason the index exists at all.
+
+The index is cheap in exchange: 16 bytes per record, ~3 MB per segment
+at 200k records, against data files measured in gigabytes.
+
+**On reusing braft's implementation.** Adopting the naming is worth it;
+adopting the code is not. `Segment` is written against braft's
+`LogEntry`, its `EntryHeader`, its checksum scheme and its
+`ConfigurationManager`, none of which describe a journal record. More to
+the point, it would invert a dependency this specification is careful
+about: the journal is the sequencer's product (§6), while braft is an
+implementation detail of consensus that §1 keeps replaceable. Building
+the product on the detail's storage layer would make it unreplaceable.
+
+The `manifest` is small and fixed-size, and carries:
+
+```
+JournalManifest {
+  magic              u32
+  version            u32
+  recordsPerSegment  u64      fixed at creation, never changes
+  maxRecordBytes     u64      fixed at creation, never changes
+  closedCleanly      u32
+  reserved           u32
+  committedCount     u64      atomic — the publication signal (§6.3)
+}
+```
+
+**The committed count moves out of the index header and into the
+manifest**, and stays exactly what §6.3 says it is: the one
+release-stored value that publishes records, now global across segments
+rather than per file pair. There is still precisely one synchronization
+point in the journal. Segment count is deliberately *not* stored — it is
+`ceil(committedCount / recordsPerSegment)`, so it cannot disagree with
+the count.
+
+**The write protocol, extended.** §6.3's three steps are unchanged for
+any record that fits in the active segment. Rolling adds a step that
+happens **before** them, when `(K - 1) % recordsPerSegment == 0` and K
+is not 1:
+
+0. Create and size the new segment's data and index files, and map
+   them. The new segment contains no published records yet, because
+   the committed count has not moved.
+
+Then steps 1–3 proceed into the new segment as usual.
+
+The ordering that makes this safe is the same release-acquire
+relationship §6.3 already relies on. A reader that acquire-loads a
+committed count of N knows every write the writer made before that store
+— which now includes the *creation* of whichever segment holds record N,
+since step 0 precedes steps 1–3 in the writer's program order. So a
+reader can always open the segment a visible record lives in: by the
+time the record is visible, the segment provably exists.
+
+Crash during a roll needs no repair, for the same reason a crash
+mid-record needs none. A segment created in step 0 but never appended to
+holds no published records, because the committed count never advanced
+past its first slot; on restart the writer derives the active segment
+from the count and reuses or recreates it. A segment file with no
+corresponding published records is not evidence of damage.
+
+**Reading.** §6.4 is unchanged in contract and slightly changed in
+mechanics. A reader:
+
+1. Acquire-loads `committedCount` from the manifest, as before.
+2. Computes the segment and slot for the record it wants, by the
+   arithmetic above.
+3. Maps that segment's file pair if it has not already, keeping a small
+   cache of recently-used segments.
+
+Sealed segments are immutable, which is what makes step 3 free of
+synchronization: a segment that is not the active one can never change,
+so a reader may map it, hold it, and read it without coordinating with
+anyone. Only the active segment is being written, and the committed
+count already governs what is safe to read in it — exactly as it did
+when there was one file.
+
+A reader tailing the journal crosses a segment boundary without a
+special case: the count advances past the boundary, the arithmetic
+yields the next segment, and the reader maps it. **Readers must not
+assume a fixed number of segments, or cache a mapping of sequence number
+to open file beyond what the arithmetic gives them** — the set of
+segments grows without bound while a node runs.
+
+Non-C++ readers (§6.4) implement the same arithmetic and the same
+acquire-load. The reference client libraries (§9) provide it, so that
+segment discovery does not become something every consumer reimplements.
+
+**What this does not change.** Sequence numbers stay dense and gap-free
+across the whole journal (§2.1); segments are an internal storage
+detail, not a namespace. `Subscribe(fromSequenceNumber)` (§8.3) and
+replay (§11) are unaffected in contract — both already address records
+by sequence number, and both keep O(1) access to any record ever
+written. A journal written before rollover exists is a single-segment
+journal by definition, so the formats remain readable.
+
 ## 7. Evidence: blocks, roots, and proofs
 
 Every input carries the submitting client's signature over its exact
