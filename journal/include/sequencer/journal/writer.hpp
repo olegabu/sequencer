@@ -1,14 +1,22 @@
 #pragma once
 
-// JournalWriter — the single writer of one node's journal (§5, §6.3).
-// Never shared between threads: specification.md §5.1 pins exactly one
-// apply thread per node, and that thread is this writer's only caller.
+// JournalWriter — the single writer of one node's journal (§5, §6.3,
+// §6.5). Never shared between threads: specification.md §5.1 pins
+// exactly one apply thread per node, and that thread is this writer's
+// only caller. (fillPercent() is the one deliberate exception; see it.)
+//
+// A journal is a DIRECTORY (§6.5): a small `manifest` holding the
+// geometry and the committed count, plus a series of segment file pairs.
+// The writer appends into the active segment and starts a new one when
+// that segment's record count is reached.
 
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 
 #include <sequencer/journal/format.hpp>
 #include <sequencer/journal/mapped_file.hpp>
@@ -16,80 +24,69 @@
 
 namespace sequencer::journal {
 
-// Thrown by append() when the journal has no room left. Its own type
+// Thrown by append() when a record cannot be written. Its own type
 // rather than a bare std::length_error so a caller can tell "this
-// journal is full" -- which is terminal for the node but not a bug --
-// apart from the std::logic_error a sequence-number violation raises,
-// which is a bug. Both used to reach the apply thread as an unhandled
-// throw and take the process down through std::terminate, with only
-// "terminate called after throwing an instance of 'std::length_error'"
-// to go on; that cost two benchmark fleets before it was diagnosed.
+// journal cannot take this record" -- terminal for the node but not a
+// bug -- apart from the std::logic_error a sequence-number violation
+// raises, which is. Before this existed, both reached the apply thread
+// as an unhandled throw and took the process down through
+// std::terminate, with only "terminate called after throwing an
+// instance of 'std::length_error'" to go on; that cost two benchmark
+// fleets before it was diagnosed.
 class JournalExhausted : public std::length_error {
  public:
   using std::length_error::length_error;
 };
 
 struct JournalOptions {
-  // Upper bounds reserved as sparse files at creation time (mapped_file.hpp:
-  // one mmap call, sized once, never remapped). Actual disk usage tracks
-  // only what is written, not these limits — see mapped_file.hpp's class
-  // comment for why a fixed reservation was chosen over a remap strategy.
-  // Both previously much smaller (1 GiB / ~1M records) — reproduced live,
-  // against a real benchmark load: at any sustained six-figure req/s rate,
-  // ~1M records is minutes, not the hours a real run needs, and append()
-  // throws std::length_error, uncaught, once exhausted (a node crash, not
-  // a clean rejection). NodeImpl currently constructs JournalWriter with
-  // no JournalOptions of its own (node_impl.cpp), so it is these defaults,
-  // not something only a benchmark deployment can hit — raised here rather
-  // than only for bench/ callers. Both remain sparse-file reservations, so
-  // raising them costs nothing until actually written to.
+  // §6.5's geometry, fixed when a journal is created and never changed
+  // afterwards. The two multiply: a segment's data file is reserved at
+  // recordsPerSegment * maxRecordBytes, so that the RECORD COUNT is
+  // always what ends a segment and never the data running out. That is
+  // what keeps addressing a division rather than a table lookup --
+  // segment = (K-1)/recordsPerSegment, slot = (K-1)%recordsPerSegment --
+  // which §6.1 promises and every reader depends on.
   //
-  // Sizing them is arithmetic an operator can do: a journal holds
-  // min(maxIndexEntries, maxDataFileBytes / bytesPerRecord) records, and
-  // at a sustained R records/sec it lasts that many records over R
-  // seconds. The two want to be balanced against each other -- raising
-  // only one moves the wall without pushing it further away. Watch
-  // journal_fill_percent (below) rather than computing it: it reports
-  // whichever of the two is closer to full.
-  // Sized for a sustained high-rate run rather than a demo. At the
-  // counter example's 34 data bytes + 16 index bytes per record, these
-  // hold ~1.07B records -- about 40 minutes at 450k records/sec, where
-  // 2^28 was ten and kept ending benchmark runs.
+  // So raising maxRecordBytes multiplies the per-segment reservation.
+  // The defaults reserve 256 GiB of data and 16 MiB of index per
+  // segment. Neither costs what it looks like: the files are sparse
+  // (mapped_file.hpp), so they use no disk until written, and a reader
+  // maps a SEALED segment at its used length rather than its reserved
+  // one (reader.hpp), so address space tracks data rather than
+  // reservation. 256 KiB also comfortably exceeds a node's own default
+  // maxInputSize of 64 KiB (§5.3), so the journal is not what bounds a
+  // record first.
   //
-  // Raising them further stops helping, which is worth knowing before
-  // trying: 1.07B records is ~54 GB across the two files, and a node
-  // also keeps braft's own log of the same entries, so a 100 GB volume
-  // is the next wall and it is a physical one. Unbounded runtime needs
-  // segment rollover with retention (what braft does for its own log),
-  // not a bigger reservation -- see mapped_file.hpp for why this is one
-  // fixed mapping today.
-  std::uint64_t maxDataFileBytes = std::uint64_t{1} << 36;  // 64 GiB
-  std::uint64_t maxIndexEntries = std::uint64_t{1} << 30;   // ~1.07B records
+  // A record larger than maxRecordBytes is refused, not rolled early --
+  // rolling early would break the arithmetic above. An application with
+  // genuinely larger records raises this and lowers recordsPerSegment to
+  // keep the product sane.
+  std::uint64_t recordsPerSegment = std::uint64_t{1} << 20;   // ~1.05M records
+  std::uint64_t maxRecordBytes = std::uint64_t{1} << 18;      // 256 KiB
 };
 
 class JournalWriter {
  public:
-  JournalWriter(const std::filesystem::path& dataPath, const std::filesystem::path& indexPath,
-                JournalOptions options = {}) {
-    const bool dataExists = std::filesystem::exists(dataPath);
-    const bool indexExists = std::filesystem::exists(indexPath);
-    if (dataExists != indexExists) {
-      throw JournalFormatError("journal file pair is inconsistent: exactly one of " +
-                                dataPath.string() + " / " + indexPath.string() + " exists");
-    }
-
-    if (!dataExists) {
-      createNew(dataPath, indexPath, options);
+  // `dir` is the journal directory. Created along with its first
+  // segment if absent; otherwise reopened, taking its geometry from the
+  // manifest rather than from `options` (geometry is immutable once a
+  // journal exists, since every segment already written depends on it).
+  explicit JournalWriter(const std::filesystem::path& dir, JournalOptions options = {})
+      : dir_(dir) {
+    const std::filesystem::path manifestPath = dir_ / kManifestFileName;
+    if (std::filesystem::exists(manifestPath)) {
+      openExisting(manifestPath);
     } else {
-      openExisting(dataPath, indexPath);
+      createNew(manifestPath, options);
     }
   }
 
   ~JournalWriter() {
-    // Convenience for tooling only (§6.3) — not required for
+    // Convenience for tooling only (§6.3) -- not required for
     // correctness. The committed-count protocol alone makes the journal
     // safe to reopen after an unclean exit.
-    header().closedCleanly.store(1, std::memory_order_relaxed);
+    manifest().closedCleanly.store(1, std::memory_order_relaxed);
+    manifestFile_.flush(/*async=*/false);
     dataFile_.flush(/*async=*/false);
     indexFile_.flush(/*async=*/false);
   }
@@ -99,8 +96,7 @@ class JournalWriter {
 
   // The sequence number append() expects next — on a fresh journal, 1;
   // on a recovered one, one past the last durably committed record
-  // (§6.3). The harness (node/, not yet built) is the sole minter of
-  // sequence numbers and reads this once at startup to resume.
+  // (§6.3).
   std::uint64_t nextSequenceNumber() const noexcept { return committedCount_ + 1; }
 
   // Appends one record for `sequenceNumber` (which must equal
@@ -109,41 +105,48 @@ class JournalWriter {
   // otherwise silently corrupt it) and its outputs, following the
   // three-step protocol of §6.3 exactly: data bytes, then index entry,
   // then the release-store that publishes both.
+  //
+  // §6.5 adds a step 0 before those three, on the record that begins a
+  // new segment: seal the active segment and open the next one. The
+  // ordering is what makes rollover safe for readers — see roll().
   void append(std::uint64_t sequenceNumber, Payload input, std::span<const Payload> outputs) {
     if (sequenceNumber != nextSequenceNumber()) {
       throw std::logic_error("JournalWriter::append: expected sequence number " +
                               std::to_string(nextSequenceNumber()) + ", got " +
                               std::to_string(sequenceNumber));
     }
-    if (committedCount_ >= maxIndexEntries_) {
-      throw JournalExhausted(
-          "JournalWriter::append: index file exhausted after " + std::to_string(committedCount_) +
-          " records (maxIndexEntries). Raise JournalOptions::maxIndexEntries -- on a node binary, "
-          "--journal_max_index_entries -- or start from a fresh data_dir. Both limits are sparse "
-          "reservations, so raising them costs no disk until written.");
-    }
 
     const std::size_t size = recordEncodedSize(input, outputs);
-    if (nextDataOffset_ + size > dataFile_.size()) {
+    if (size > maxRecordBytes_) {
       throw JournalExhausted(
-          "JournalWriter::append: data file exhausted after " + std::to_string(committedCount_) +
-          " records / " + std::to_string(nextDataOffset_) +
-          " bytes (maxDataFileBytes). Raise JournalOptions::maxDataFileBytes -- on a node binary, "
-          "--journal_max_data_bytes -- or start from a fresh data_dir.");
+          "JournalWriter::append: record of " + std::to_string(size) +
+          " bytes exceeds maxRecordBytes (" + std::to_string(maxRecordBytes_) +
+          "). This bound is fixed when a journal is created, because a segment's data file "
+          "is reserved at recordsPerSegment * maxRecordBytes so that the record count "
+          "always ends a segment first (specification.md 6.5). Create the journal with a "
+          "larger JournalOptions::maxRecordBytes -- and a correspondingly smaller "
+          "recordsPerSegment -- rather than raising it on an existing one.");
+    }
+
+    // Step 0 (§6.5): the record that starts a new segment rolls first.
+    if (slotFor(sequenceNumber) == 0 && sequenceNumber != 1) {
+      roll(sequenceNumber);
     }
 
     // Step 1 (§6.3): write the record's bytes into the data file.
     encodeRecord(dataFile_.data() + nextDataOffset_, sequenceNumber, input, outputs);
 
-    // Step 2: write the corresponding IndexEntry.
-    indexEntries()[committedCount_] =
+    // Step 2: write the corresponding IndexEntry, at this record's slot
+    // WITHIN its segment.
+    indexEntries()[slotFor(sequenceNumber)] =
         IndexEntry{.byteOffset = nextDataOffset_, .entryLength = static_cast<std::uint32_t>(size),
                    .reserved = 0};
 
     // Step 3: release-store the new committed count. This is the single
     // synchronization point with every reader (§6.3) — everything above
-    // must be program-order-before it.
-    header().committedCount.store(committedCount_ + 1, std::memory_order_release);
+    // must be program-order-before it, which now includes the segment
+    // creation in step 0.
+    manifest().committedCount.store(committedCount_ + 1, std::memory_order_release);
 
     nextDataOffset_ += size;
     committedCount_ += 1;
@@ -151,21 +154,24 @@ class JournalWriter {
     publishedDataOffset_.store(nextDataOffset_, std::memory_order_relaxed);
   }
 
-  // How full the journal is, as a percentage of whichever limit binds
-  // first. Exposed so a long run can be watched approaching the wall
-  // rather than discovering it; the node publishes it as the bvar
-  // journal_fill_percent.
+  // How full the ACTIVE segment is, as a percentage of whichever of its
+  // two reservations is closer to full. Since §6.5 rolls, this is no
+  // longer a countdown to failure the way it was when a journal was one
+  // fixed pair — it is a sawtooth, resetting on every roll. It is still
+  // worth publishing (the node exposes it as journal_fill_percent),
+  // because a segment whose data never approaches full means the
+  // geometry is reserving far more per segment than it needs.
   //
   // THE ONE MEMBER SAFE TO CALL FROM ANOTHER THREAD. Everything else
   // here belongs to the single apply thread (see this file's header
-  // comment), and a monitoring thread must not touch those. This reads
-  // only atomics: the header's committed count, which append() already
-  // publishes with release semantics, and a mirror of the data offset
-  // that append() stores alongside it. Both may be a record stale,
-  // which is immaterial for a fill gauge.
+  // comment). This reads only atomics: the manifest's committed count,
+  // which append() already publishes with release semantics, and a
+  // mirror of the data offset that append() stores alongside it. Both
+  // may be a record stale, which is immaterial for a fill gauge.
   int fillPercent() const noexcept {
-    const std::uint64_t committed = header().committedCount.load(std::memory_order_acquire);
-    const std::uint64_t byIndex = maxIndexEntries_ == 0 ? 100 : committed * 100 / maxIndexEntries_;
+    const std::uint64_t committed = manifest().committedCount.load(std::memory_order_acquire);
+    const std::uint64_t slot = recordsPerSegment_ == 0 ? 0 : committed % recordsPerSegment_;
+    const std::uint64_t byIndex = recordsPerSegment_ == 0 ? 100 : slot * 100 / recordsPerSegment_;
     const std::uint64_t dataSize = dataFile_.size();
     const std::uint64_t offset = publishedDataOffset_.load(std::memory_order_relaxed);
     const std::uint64_t byData = dataSize == 0 ? 100 : offset * 100 / dataSize;
@@ -173,83 +179,215 @@ class JournalWriter {
   }
 
   std::uint64_t committedCount() const noexcept { return committedCount_; }
-  std::uint64_t maxIndexEntries() const noexcept { return maxIndexEntries_; }
+  std::uint64_t recordsPerSegment() const noexcept { return recordsPerSegment_; }
+  std::uint64_t maxRecordBytes() const noexcept { return maxRecordBytes_; }
+  // How many segments this journal has written, including the active
+  // one. Exposed for tests and tooling that assert rollover happened.
+  std::uint64_t segmentCount() const noexcept { return activeSegment_ + 1; }
 
   void flush(bool async = true) {
     dataFile_.flush(async);
     indexFile_.flush(async);
+    manifestFile_.flush(async);
   }
 
  private:
-  void createNew(const std::filesystem::path& dataPath, const std::filesystem::path& indexPath,
-                  const JournalOptions& options) {
-    maxIndexEntries_ = options.maxIndexEntries;
-    const std::size_t indexBytes =
-        sizeof(IndexHeader) + static_cast<std::size_t>(options.maxIndexEntries) * sizeof(IndexEntry);
+  std::uint64_t slotFor(std::uint64_t sequenceNumber) const noexcept {
+    return (sequenceNumber - 1) % recordsPerSegment_;
+  }
+  std::uint64_t segmentFor(std::uint64_t sequenceNumber) const noexcept {
+    return (sequenceNumber - 1) / recordsPerSegment_;
+  }
+  std::uint64_t firstOfSegment(std::uint64_t segment) const noexcept {
+    return segment * recordsPerSegment_ + 1;
+  }
 
-    dataFile_ = MappedFile::createNew(dataPath, options.maxDataFileBytes);
-    indexFile_ = MappedFile::createNew(indexPath, indexBytes);
+  std::filesystem::path segmentPath(const std::string& stem, const char* suffix) const {
+    return dir_ / (stem + suffix);
+  }
 
-    // Placement-new fully and correctly starts this object's lifetime
-    // for *this* process (see reader.hpp / recovery for the pragmatic
-    // caveat when a different process later reinterprets these same
-    // mapped bytes — the well-understood gap every lock-free
-    // shared-memory format lives with).
-    new (indexFile_.data()) IndexHeader{
-        .magic = kIndexMagic, .version = kIndexVersion, .closedCleanly = 0, .reserved = 0,
-        .committedCount = 0};
+  // Seals the active segment and opens the one `sequenceNumber` belongs
+  // to.
+  //
+  // Sealing is a rename, exactly as braft does it (§6.5). It is safe to
+  // do underneath live readers because a rename on POSIX disturbs
+  // neither an open descriptor nor an existing mapping: a reader
+  // already inside this segment keeps reading it, and a reader opening
+  // it by name either finds the sealed name or retries.
+  //
+  // The new segment is created BEFORE any record in it is published,
+  // which is the ordering §6.5 relies on: a reader that acquire-loads a
+  // committed count reaching into this segment is guaranteed, by the
+  // release-store in append(), to see everything done here first.
+  void roll(std::uint64_t sequenceNumber) {
+    const std::uint64_t sealedFirst = firstOfSegment(activeSegment_);
+    const std::uint64_t sealedLast = sealedFirst + recordsPerSegment_ - 1;
 
-    committedCount_ = 0;
+    // Flush before sealing, so a crash just after the rename leaves the
+    // sealed segment's bytes on disk rather than only in page cache.
+    dataFile_.flush(/*async=*/false);
+    indexFile_.flush(/*async=*/false);
+
+    const std::string openStem = openSegmentStem(sealedFirst);
+    const std::string sealedStem = sealedSegmentStem(sealedFirst, sealedLast);
+    for (const char* suffix : {".data", ".index"}) {
+      std::error_code ec;
+      std::filesystem::rename(segmentPath(openStem, suffix), segmentPath(sealedStem, suffix), ec);
+      if (ec) {
+        throw JournalExhausted("JournalWriter::roll: failed to seal segment " + openStem + suffix +
+                                ": " + ec.message());
+      }
+    }
+
+    openSegment(segmentFor(sequenceNumber), /*create=*/true);
+  }
+
+  // Maps segment `segment`'s file pair as the active one. `create`
+  // asks for files that do not exist yet.
+  //
+  // Recovery of a half-rolled journal is handled here rather than
+  // treated as damage: a crash between creating a segment and
+  // publishing its first record leaves files holding no published
+  // records, which is indistinguishable from -- and as harmless as -- a
+  // crash mid-record (§6.3). If the files are already there, adopt
+  // them; their contents below the committed count are authoritative
+  // and anything above it will simply be overwritten.
+  void openSegment(std::uint64_t segment, bool create) {
+    const std::string stem = openSegmentStem(firstOfSegment(segment));
+    const std::filesystem::path dataPath = segmentPath(stem, ".data");
+    const std::filesystem::path indexPath = segmentPath(stem, ".index");
+
+    const bool dataExists = std::filesystem::exists(dataPath);
+    const bool indexExists = std::filesystem::exists(indexPath);
+    if (dataExists != indexExists) {
+      // Half a segment is not something to guess about: creating the
+      // missing file would silently invent an index for data it has
+      // never seen, and adopting the pair would read garbage offsets.
+      throw JournalFormatError("segment file pair is inconsistent: exactly one of " +
+                                dataPath.string() + " / " + indexPath.string() + " exists");
+    }
+    const bool present = dataExists && indexExists;
+    if (create && !present) {
+      dataFile_ = MappedFile::createNew(dataPath, recordsPerSegment_ * maxRecordBytes_);
+      indexFile_ = MappedFile::createNew(
+          indexPath, sizeof(IndexHeader) +
+                          static_cast<std::size_t>(recordsPerSegment_) * sizeof(IndexEntry));
+      // Placement-new fully and correctly starts this object's lifetime
+      // for *this* process (see reader.hpp for the pragmatic caveat when
+      // a different process later reinterprets these same mapped bytes
+      // — the well-understood gap every lock-free shared-memory format
+      // lives with).
+      //
+      // A segment's own committedCount is NOT the publication signal any
+      // more (§6.5 moved that to the manifest) and stays zero; magic and
+      // version remain so a segment file is still self-identifying.
+      new (indexFile_.data()) IndexHeader{.magic = kIndexMagic,
+                                           .version = kIndexVersion,
+                                           .closedCleanly = 0,
+                                           .reserved = 0,
+                                           .committedCount = 0};
+    } else {
+      dataFile_ = MappedFile::openExisting(dataPath, /*readOnly=*/false);
+      indexFile_ = MappedFile::openExisting(indexPath, /*readOnly=*/false);
+      if (indexFile_.size() < sizeof(IndexHeader)) {
+        throw JournalFormatError("index file smaller than IndexHeader: " + indexPath.string());
+      }
+      const IndexHeader& hdr = *reinterpret_cast<const IndexHeader*>(indexFile_.data());
+      if (hdr.magic != kIndexMagic) {
+        throw JournalFormatError("bad magic in " + indexPath.string());
+      }
+      if (hdr.version != kIndexVersion) {
+        throw JournalFormatError("unsupported index version in " + indexPath.string());
+      }
+    }
+
+    activeSegment_ = segment;
     nextDataOffset_ = 0;
     publishedDataOffset_.store(0, std::memory_order_relaxed);
   }
 
-  void openExisting(const std::filesystem::path& dataPath, const std::filesystem::path& indexPath) {
-    dataFile_ = MappedFile::openExisting(dataPath, /*readOnly=*/false);
-    indexFile_ = MappedFile::openExisting(indexPath, /*readOnly=*/false);
+  void createNew(const std::filesystem::path& manifestPath, const JournalOptions& options) {
+    if (options.recordsPerSegment == 0 || options.maxRecordBytes == 0) {
+      throw std::invalid_argument(
+          "JournalOptions: recordsPerSegment and maxRecordBytes must both be non-zero");
+    }
+    std::filesystem::create_directories(dir_);
 
-    if (indexFile_.size() < sizeof(IndexHeader)) {
-      throw JournalFormatError("index file smaller than IndexHeader: " + indexPath.string());
+    manifestFile_ = MappedFile::createNew(manifestPath, sizeof(JournalManifest));
+    new (manifestFile_.data()) JournalManifest{.magic = kManifestMagic,
+                                                .version = kManifestVersion,
+                                                .recordsPerSegment = options.recordsPerSegment,
+                                                .maxRecordBytes = options.maxRecordBytes,
+                                                .closedCleanly = 0,
+                                                .reserved = 0,
+                                                .committedCount = 0};
+
+    recordsPerSegment_ = options.recordsPerSegment;
+    maxRecordBytes_ = options.maxRecordBytes;
+    committedCount_ = 0;
+    openSegment(0, /*create=*/true);
+  }
+
+  void openExisting(const std::filesystem::path& manifestPath) {
+    manifestFile_ = MappedFile::openExisting(manifestPath, /*readOnly=*/false);
+    if (manifestFile_.size() < sizeof(JournalManifest)) {
+      throw JournalFormatError("manifest smaller than JournalManifest: " + manifestPath.string());
+    }
+    const JournalManifest& m = manifest();
+    if (m.magic != kManifestMagic) {
+      throw JournalFormatError("bad magic in " + manifestPath.string());
+    }
+    if (m.version != kManifestVersion) {
+      throw JournalFormatError("unsupported manifest version in " + manifestPath.string());
     }
 
-    const IndexHeader& hdr = header();
-    if (hdr.magic != kIndexMagic) {
-      throw JournalFormatError("bad magic in " + indexPath.string());
-    }
-    if (hdr.version != kIndexVersion) {
-      throw JournalFormatError("unsupported index version in " + indexPath.string());
-    }
-
-    maxIndexEntries_ = (indexFile_.size() - sizeof(IndexHeader)) / sizeof(IndexEntry);
+    // Geometry comes from the manifest, never from the caller's options:
+    // every segment already on disk was laid out with these numbers, and
+    // changing them would silently misaddress all of them.
+    recordsPerSegment_ = m.recordsPerSegment;
+    maxRecordBytes_ = m.maxRecordBytes;
 
     // §6.3 recovery: the committed count alone is authoritative. A
     // record written but never published (a crash between step 1 and
     // step 3) is simply absent from this count and will be silently
     // overwritten by the next append() — nothing to detect or repair.
-    committedCount_ = hdr.committedCount.load(std::memory_order_acquire);
+    committedCount_ = m.committedCount.load(std::memory_order_acquire);
 
-    if (committedCount_ == 0) {
+    // The active segment is the one the NEXT record goes into.
+    openSegment(segmentFor(committedCount_ + 1), /*create=*/true);
+
+    // Recover the write offset within that segment. A segment holding no
+    // published records starts at zero; otherwise the last published
+    // record in it gives the next free byte directly.
+    const std::uint64_t slot = slotFor(committedCount_ + 1);
+    if (slot == 0) {
       nextDataOffset_ = 0;
     } else {
-      const IndexEntry& last = indexEntries()[committedCount_ - 1];
+      const IndexEntry& last = indexEntries()[slot - 1];
       nextDataOffset_ = last.byteOffset + last.entryLength;
     }
     publishedDataOffset_.store(nextDataOffset_, std::memory_order_relaxed);
   }
 
-  IndexHeader& header() noexcept { return *reinterpret_cast<IndexHeader*>(indexFile_.data()); }
-  const IndexHeader& header() const noexcept {
-    return *reinterpret_cast<const IndexHeader*>(indexFile_.data());
+  JournalManifest& manifest() noexcept {
+    return *reinterpret_cast<JournalManifest*>(manifestFile_.data());
+  }
+  const JournalManifest& manifest() const noexcept {
+    return *reinterpret_cast<const JournalManifest*>(manifestFile_.data());
   }
   IndexEntry* indexEntries() noexcept {
     return reinterpret_cast<IndexEntry*>(indexFile_.data() + sizeof(IndexHeader));
   }
 
+  std::filesystem::path dir_;
+  MappedFile manifestFile_;
   MappedFile dataFile_;
   MappedFile indexFile_;
+  std::uint64_t recordsPerSegment_ = 0;
+  std::uint64_t maxRecordBytes_ = 0;
+  std::uint64_t activeSegment_ = 0;
   std::uint64_t committedCount_ = 0;
   std::uint64_t nextDataOffset_ = 0;
-  std::uint64_t maxIndexEntries_ = 0;
   // See fillPercent(): a cross-thread-readable mirror of
   // nextDataOffset_, which is otherwise the apply thread's alone.
   std::atomic<std::uint64_t> publishedDataOffset_{0};

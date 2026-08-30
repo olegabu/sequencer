@@ -36,8 +36,7 @@ void NodeImpl::start() {
   const std::filesystem::path metaPath = config_.dataDir / "raft_meta";
   const std::filesystem::path snapshotPath = config_.dataDir / "snapshot";
 
-  journal_ = std::make_unique<journal::JournalWriter>(config_.dataDir / "journal.data",
-                                                        config_.dataDir / "journal.index",
+  journal_ = std::make_unique<journal::JournalWriter>(config_.dataDir / "journal",
                                                         config_.journalOptions);
   ring_ = std::make_unique<CommittedEntryRing>(config_.committedEntryRingCapacity, config_.maxInputSize);
   adapter_ = std::make_unique<raft::RaftStateMachineAdapter>(*ring_, *stateMachine_, kSnapshotFileName);

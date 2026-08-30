@@ -47,11 +47,22 @@ class MappedFile {
     return MappedFile(fd, length, /*readOnly=*/false);
   }
 
-  // Opens an existing file at `path` and maps its current on-disk size
-  // (not `length` — the file's own size, established at creation, is
-  // the source of truth for how much address space to reserve). Pass
-  // readOnly=true for a reader that must never write.
-  static MappedFile openExisting(const std::filesystem::path& path, bool readOnly) {
+  // Opens an existing file at `path` and maps it. By default that means
+  // the file's whole on-disk size, which for a journal segment is its
+  // full reservation rather than the bytes actually written.
+  //
+  // `mapAtMost` caps that. It exists for readers of SEALED segments
+  // (§6.5), where the reservation is deliberately far larger than the
+  // data — a segment reserves recordsPerSegment * maxRecordBytes so the
+  // record count always ends it first, and real records are typically
+  // orders of magnitude smaller than maxRecordBytes. A reader that
+  // mapped every sealed segment's full reservation would consume
+  // address space proportional to the reservation rather than to the
+  // data, and run out long before disk did. A sealed segment's used
+  // length is exactly known from its last index entry, so it can be
+  // mapped at that instead. Zero means "no cap".
+  static MappedFile openExisting(const std::filesystem::path& path, bool readOnly,
+                                  std::size_t mapAtMost = 0) {
     int fd = ::open(path.c_str(), readOnly ? O_RDONLY : O_RDWR);
     if (fd < 0) {
       throw std::system_error(errno, std::generic_category(), "open failed: " + path.string());
@@ -62,7 +73,11 @@ class MappedFile {
       ::close(fd);
       throw std::system_error(err, std::generic_category(), "fstat failed: " + path.string());
     }
-    return MappedFile(fd, static_cast<std::size_t>(st.st_size), readOnly);
+    std::size_t length = static_cast<std::size_t>(st.st_size);
+    if (mapAtMost > 0 && mapAtMost < length) {
+      length = mapAtMost;
+    }
+    return MappedFile(fd, length, readOnly);
   }
 
   MappedFile(const MappedFile&) = delete;

@@ -140,7 +140,7 @@ TEST_F(NodeIntegrationTest, ProposedInputsAreDurablyJournaled) {
   ASSERT_TRUE(propose(2).has_value());
   ASSERT_TRUE(propose(3).has_value());
 
-  journal::JournalReader reader(dir_ / "journal.data", dir_ / "journal.index");
+  journal::JournalReader reader(dir_ / "journal");
   ASSERT_EQ(reader.committedCount(), 3u);
   for (std::uint64_t seq = 1; seq <= 3; ++seq) {
     journal::RecordView r = reader.record(seq);

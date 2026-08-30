@@ -26,20 +26,21 @@ std::filesystem::path makeTempDir() {
   return tmpl;
 }
 
-// Sized generously enough to cover Google Benchmark's auto-selected
-// iteration count for a sub-microsecond operation without exhausting
-// the reservation mid-run (mapped_file.hpp: fixed reservation, never
-// remapped).
+// A segment large enough that Google Benchmark's auto-selected
+// iteration count for a sub-microsecond operation does not spend the
+// run rolling: rollover is cheap but not free (it flushes, renames and
+// maps), and BM_Append is meant to measure the append path rather than
+// the roll path. Records here are tiny, so 256 bytes is ample.
 JournalOptions benchmarkOptions() {
   JournalOptions options;
-  options.maxDataFileBytes = std::uint64_t{4} << 30;  // 4 GiB
-  options.maxIndexEntries = std::uint64_t{10} << 20;  // ~10M records
+  options.recordsPerSegment = std::uint64_t{10} << 20;  // ~10M records per segment
+  options.maxRecordBytes = 256;
   return options;
 }
 
 void BM_Append(benchmark::State& state) {
   const std::filesystem::path dir = makeTempDir();
-  JournalWriter writer(dir / "journal.data", dir / "journal.index", benchmarkOptions());
+  JournalWriter writer(dir / "journal", benchmarkOptions());
 
   const std::string inputStr(64, 'i');
   const std::string outputStr(64, 'o');
@@ -61,7 +62,7 @@ BENCHMARK(BM_Append);
 void BM_RecordViewRead(benchmark::State& state) {
   const std::filesystem::path dir = makeTempDir();
   {
-    JournalWriter writer(dir / "journal.data", dir / "journal.index", benchmarkOptions());
+    JournalWriter writer(dir / "journal", benchmarkOptions());
     const std::string inputStr(64, 'i');
     const std::string outputStr(64, 'o');
     const Payload input(reinterpret_cast<const std::byte*>(inputStr.data()), inputStr.size());
@@ -73,7 +74,7 @@ void BM_RecordViewRead(benchmark::State& state) {
     writer.flush(false);
   }
 
-  JournalReader reader(dir / "journal.data", dir / "journal.index");
+  JournalReader reader(dir / "journal");
   std::uint64_t seq = 1;
   for (auto _ : state) {
     RecordView view = reader.record(seq);

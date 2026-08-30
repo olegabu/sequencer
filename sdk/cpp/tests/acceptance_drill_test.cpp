@@ -90,7 +90,7 @@ bool waitUntil(std::chrono::seconds timeout, const std::function<bool()>& predic
 TEST(AcceptanceDrills, ProofReconstructionFromThePublishedJournalAloneSucceeds) {
   const std::filesystem::path dir = makeTempDir();
   {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     for (std::uint64_t seq = 1; seq <= evidence::kBlockSize; ++seq) {
       writer.append(seq, payloadOf(static_cast<std::int64_t>(seq)), {});
     }
@@ -142,7 +142,7 @@ TEST(AcceptanceDrills, ProofReconstructionFromThePublishedJournalAloneSucceeds) 
   // published journal" is the alarm's own prescribed recovery action)
   // — never anything this test already held from writing the journal
   // above.
-  journal::JournalReader freshReader(dir / "journal.data", dir / "journal.index");
+  journal::JournalReader freshReader(dir / "journal");
   const Payload reconstructedRawBytes = freshReader.record(provenSeq).rawBytes();
 
   EXPECT_TRUE(evidence::verifyInclusionProof(proof, publicKey, reconstructedRawBytes))
@@ -163,7 +163,7 @@ TEST(AcceptanceDrills, ProofTimeoutAlarmFiresWhenTheSigningGatewayIsDeliberately
     // gateway can never make progress on this journal, by
     // construction, standing in for "the signing gateway is
     // deliberately stalled."
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     for (std::uint64_t seq = 1; seq <= 10; ++seq) {
       writer.append(seq, payloadOf(static_cast<std::int64_t>(seq)), {});
     }

@@ -30,9 +30,8 @@ std::string toString(Payload p) {
 std::string expectedInput(std::uint64_t seq) { return "record-" + std::to_string(seq); }
 std::string expectedOutput(std::uint64_t seq) { return "output-" + std::to_string(seq); }
 
-void tailAndVerify(const std::filesystem::path& dataPath, const std::filesystem::path& indexPath,
-                    std::uint64_t count, bool pureSpin) {
-  JournalReader reader(dataPath, indexPath);
+void tailAndVerify(const std::filesystem::path& dir, std::uint64_t count, bool pureSpin) {
+  JournalReader reader(dir);
   for (std::uint64_t seq = 1; seq <= count; ++seq) {
     RecordView r = reader.waitForRecord(seq, pureSpin);
     ASSERT_EQ(r.sequenceNumber(), seq);
@@ -42,16 +41,54 @@ void tailAndVerify(const std::filesystem::path& dataPath, const std::filesystem:
   }
 }
 
+// The rollover race (§6.5), which the test below does NOT reach because
+// it uses the default geometry and never crosses a segment boundary.
+//
+// Two things are racing here that do not race in a single-segment
+// journal: the writer seals a segment by renaming it while readers may
+// be opening it by name, and several reader threads may simultaneously
+// discover the same brand-new segment and try to map it. The first is
+// why openSegment() tries the sealed name, then the open one, and
+// retries; the second is why the segment cache installs with a CAS and
+// the loser drops its own mapping. Both are the kind of thing that
+// works in casual testing and fails under load, so this is the test to
+// run under ThreadSanitizer.
+TEST(Concurrency, ReadersFollowTheWriterAcrossSegmentBoundaries) {
+  testing::TempDir dir;
+  constexpr std::uint64_t kCount = 5000;
+
+  JournalOptions options;
+  options.recordsPerSegment = 64;  // ~78 rolls over the run
+  options.maxRecordBytes = 256;
+  JournalWriter writer(dir.path(), options);
+
+  // Both readers are constructed while only segment zero exists, so
+  // every later segment is discovered from the committed count alone.
+  std::thread readerA([&] { tailAndVerify(dir.path(), kCount, /*pureSpin=*/false); });
+  std::thread readerB([&] { tailAndVerify(dir.path(), kCount, /*pureSpin=*/true); });
+
+  for (std::uint64_t seq = 1; seq <= kCount; ++seq) {
+    const std::string in = expectedInput(seq);
+    const std::string out = expectedOutput(seq);
+    std::vector<Payload> outputs = {bytesOf(out)};
+    writer.append(seq, bytesOf(in), outputs);
+  }
+
+  readerA.join();
+  readerB.join();
+  EXPECT_GT(writer.segmentCount(), 1u) << "this test is pointless if it never rolled";
+}
+
 TEST(Concurrency, ReadersNeverObserveATornRecordWhileWriterAppends) {
   testing::TempDir dir;
   constexpr std::uint64_t kCount = 20000;
 
   // Created up front, single-threaded: file creation itself is not the
   // protocol under test.
-  JournalWriter writer(dir.dataPath(), dir.indexPath());
+  JournalWriter writer(dir.path());
 
-  std::thread readerA([&] { tailAndVerify(dir.dataPath(), dir.indexPath(), kCount, /*pureSpin=*/false); });
-  std::thread readerB([&] { tailAndVerify(dir.dataPath(), dir.indexPath(), kCount, /*pureSpin=*/true); });
+  std::thread readerA([&] { tailAndVerify(dir.path(), kCount, /*pureSpin=*/false); });
+  std::thread readerB([&] { tailAndVerify(dir.path(), kCount, /*pureSpin=*/true); });
 
   for (std::uint64_t seq = 1; seq <= kCount; ++seq) {
     const std::string in = expectedInput(seq);

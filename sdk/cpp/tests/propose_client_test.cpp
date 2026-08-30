@@ -230,7 +230,7 @@ TEST_F(ProposeClientTest, SignedEnvelopeIsAcceptedAndATamperedOneIsRejectedAtThe
   ASSERT_TRUE(accepted.ok) << accepted.errorMessage;
   EXPECT_EQ(accepted.receipt.sequenceNumber, 1u);
 
-  journal::JournalReader reader(dir_ / "journal.data", dir_ / "journal.index");
+  journal::JournalReader reader(dir_ / "journal");
   EXPECT_EQ(reader.committedCount(), 1u);
   EXPECT_TRUE(verifyEnvelopeSignature(reader.record(1).input(), publicKey))
       << "the signature must be persisted inside the journaled input (specification.md §7), "
@@ -253,7 +253,7 @@ TEST_F(ProposeClientTest, SignedEnvelopeIsAcceptedAndATamperedOneIsRejectedAtThe
   stub.Submit(&cntl, &request, &response, nullptr);
   EXPECT_TRUE(cntl.Failed()) << "a tampered signature must be rejected, never proposed";
 
-  journal::JournalReader reader2(dir_ / "journal.data", dir_ / "journal.index");
+  journal::JournalReader reader2(dir_ / "journal");
   EXPECT_EQ(reader2.committedCount(), 1u) << "the tampered submission must never reach Propose";
 }
 

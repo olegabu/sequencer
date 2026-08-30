@@ -110,7 +110,7 @@ bool waitForCommittedCount(const std::filesystem::path& dataDir, std::uint64_t t
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     try {
-      journal::JournalReader reader(dataDir / "journal.data", dataDir / "journal.index");
+      journal::JournalReader reader(dataDir / "journal");
       if (reader.committedCount() >= target) {
         return true;
       }
@@ -169,9 +169,9 @@ TEST(ThreeNodeSmoke, ReplicatesIdenticallyAcrossAllThreeJournals) {
   ASSERT_TRUE(waitForCommittedCount(dir1, total, std::chrono::seconds(5)));
   ASSERT_TRUE(waitForCommittedCount(dir2, total, std::chrono::seconds(5)));
 
-  journal::JournalReader reader0(dir0 / "journal.data", dir0 / "journal.index");
-  journal::JournalReader reader1(dir1 / "journal.data", dir1 / "journal.index");
-  journal::JournalReader reader2(dir2 / "journal.data", dir2 / "journal.index");
+  journal::JournalReader reader0(dir0 / "journal");
+  journal::JournalReader reader1(dir1 / "journal");
+  journal::JournalReader reader2(dir2 / "journal");
 
   for (std::uint64_t seq = 1; seq <= total; ++seq) {
     const Payload r0 = reader0.record(seq).rawBytes();

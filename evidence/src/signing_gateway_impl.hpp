@@ -132,8 +132,7 @@ class SigningGatewayImpl {
       std::shared_ptr<journal::JournalReader> reader = currentReader();
       if (!reader) {
         try {
-          reader = std::make_shared<journal::JournalReader>(config_.dataDir / "journal.data",
-                                                              config_.dataDir / "journal.index");
+          reader = std::make_shared<journal::JournalReader>(config_.dataDir / "journal");
           std::lock_guard<std::mutex> lock(mutex_);
           reader_ = reader;
         } catch (const std::exception&) {

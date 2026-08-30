@@ -161,8 +161,7 @@ class OutputGatewayImpl {
     while (!stopRequested_.load(std::memory_order_relaxed)) {
       if (!reader) {
         try {
-          reader = std::make_unique<journal::JournalReader>(config_.dataDir / "journal.data",
-                                                              config_.dataDir / "journal.index");
+          reader = std::make_unique<journal::JournalReader>(config_.dataDir / "journal");
         } catch (const std::exception&) {
           // The journal file pair may not exist yet — retry.
           std::this_thread::sleep_for(std::chrono::milliseconds(50));

@@ -42,7 +42,7 @@ Payload payloadOf(const std::int64_t& v) {
 }
 
 void appendRecords(const std::filesystem::path& dataDir, std::uint64_t count) {
-  journal::JournalWriter writer(dataDir / "journal.data", dataDir / "journal.index");
+  journal::JournalWriter writer(dataDir / "journal");
   for (std::uint64_t i = 0; i < count; ++i) {
     const std::int64_t value = static_cast<std::int64_t>(i);
     writer.append(i + 1, payloadOf(value), {});

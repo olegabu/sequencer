@@ -24,7 +24,7 @@ std::filesystem::path makeTempDir() {
 ReplayResult runReplayCheck(const ReplayConfig& config, StateMachine& stateMachine) {
   ReplayResult result;
 
-  journal::JournalReader original(config.dataDir / "journal.data", config.dataDir / "journal.index");
+  journal::JournalReader original(config.dataDir / "journal");
   const std::uint64_t total = original.committedCount();
 
   const bool autoCreatedOutputDir = config.replayOutputDir.empty();
@@ -33,19 +33,19 @@ ReplayResult runReplayCheck(const ReplayConfig& config, StateMachine& stateMachi
     std::filesystem::create_directories(result.replayOutputDir);
   }
 
-  // Size the replay journal from the original's own footprint, rather
-  // than trusting some unrelated default (specification.md §5.3-style
-  // defaults are a node's concern, not this tool's).
+  // Match the original journal's geometry rather than trusting some
+  // unrelated default (specification.md §5.3-style defaults are a
+  // node's concern, not this tool's). Since §6.5 the geometry is a
+  // property of the journal being replayed and is readable from it, so
+  // this no longer has to infer sizes from file footprints: replaying
+  // into the same shape keeps the comparison honest and keeps a replay
+  // rolling at exactly the points the original did.
   journal::JournalOptions options;
-  options.maxIndexEntries = std::max<std::uint64_t>(total, 1) * 2;
-  const std::uint64_t originalDataBytes = std::filesystem::exists(config.dataDir / "journal.data")
-                                               ? std::filesystem::file_size(config.dataDir / "journal.data")
-                                               : 0;
-  options.maxDataFileBytes = std::max<std::uint64_t>(originalDataBytes * 2, std::uint64_t{1} << 20);
+  options.recordsPerSegment = original.recordsPerSegment();
+  options.maxRecordBytes = original.maxRecordBytes();
 
   {
-    journal::JournalWriter replayWriter(result.replayOutputDir / "journal.data",
-                                         result.replayOutputDir / "journal.index", options);
+    journal::JournalWriter replayWriter(result.replayOutputDir / "journal", options);
     OutputCollector collector;
     for (std::uint64_t seq = 1; seq <= total; ++seq) {
       const journal::RecordView originalRecord = original.record(seq);
@@ -60,8 +60,7 @@ ReplayResult runReplayCheck(const ReplayConfig& config, StateMachine& stateMachi
     replayWriter.flush(/*async=*/false);
   }
 
-  journal::JournalReader replayed(result.replayOutputDir / "journal.data",
-                                   result.replayOutputDir / "journal.index");
+  journal::JournalReader replayed(result.replayOutputDir / "journal");
   if (replayed.committedCount() != total) {
     result.ok = false;
     std::ostringstream msg;

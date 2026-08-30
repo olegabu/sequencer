@@ -28,19 +28,18 @@ DEFINE_bool(apply_thread_pure_spin, true,
             "small machine, where multiple unconditionally-spinning apply threads would "
             "otherwise starve the raft replication threads leader election depends on — never "
             "set false in production or in any published measurement.");
-DEFINE_uint64(journal_max_index_entries, 0,
-              "Maximum records this node's journal can hold, or 0 for the built-in default "
-              "(~268M). The journal is a fixed reservation made once at creation: it does not "
-              "roll over, and a node that fills it stops applying. Sparse, so raising this "
-              "costs no disk until written. Sizing: the journal holds "
-              "min(this, journal_max_data_bytes / bytes-per-record) records, which at a "
-              "sustained R records/sec lasts that many records over R seconds -- raise both "
-              "together, since raising one alone just moves which limit binds. Only read when "
-              "a journal is first created; reopening an existing one takes its size from the "
-              "file.");
-DEFINE_uint64(journal_max_data_bytes, 0,
-              "Byte capacity of this node's journal data file, or 0 for the built-in default "
-              "(16 GiB). See --journal_max_index_entries for how the two limits interact.");
+DEFINE_uint64(journal_records_per_segment, 0,
+              "Records per journal segment, or 0 for the built-in default (~1.05M). The journal "
+              "rolls to a new segment every this many records (specification.md 6.5), and the "
+              "count is fixed when a journal is created because addressing divides by it. "
+              "Only read when a journal is first created; reopening one takes its geometry from "
+              "the manifest.");
+DEFINE_uint64(journal_max_record_bytes, 0,
+              "Largest single journal record, or 0 for the built-in default (4096). A segment's "
+              "data file is reserved at records_per_segment * this, so that the record count "
+              "always ends a segment first -- raising it multiplies the per-segment reservation, "
+              "and an application with larger records should lower records_per_segment to match. "
+              "The reservation is sparse, so it costs no disk until written.");
 
 namespace sequencer {
 namespace {
@@ -71,11 +70,11 @@ int RunNode(int argc, char** argv, std::unique_ptr<StateMachine> stateMachine) {
   config.electionTimeoutMs = FLAGS_election_timeout_ms;
   config.applyThreadCpu = FLAGS_apply_thread_cpu;
   config.applyThreadPureSpin = FLAGS_apply_thread_pure_spin;
-  if (FLAGS_journal_max_index_entries > 0) {
-    config.journalOptions.maxIndexEntries = FLAGS_journal_max_index_entries;
+  if (FLAGS_journal_records_per_segment > 0) {
+    config.journalOptions.recordsPerSegment = FLAGS_journal_records_per_segment;
   }
-  if (FLAGS_journal_max_data_bytes > 0) {
-    config.journalOptions.maxDataFileBytes = FLAGS_journal_max_data_bytes;
+  if (FLAGS_journal_max_record_bytes > 0) {
+    config.journalOptions.maxRecordBytes = FLAGS_journal_max_record_bytes;
   }
 
   node::detail::NodeImpl nodeImpl(std::move(config), std::move(stateMachine));

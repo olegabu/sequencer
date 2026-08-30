@@ -26,7 +26,7 @@ std::string toString(Payload p) {
 
 TEST(WriterReader, SingleRecordRoundTripVaryingOutputCounts) {
   testing::TempDir dir;
-  JournalWriter writer(dir.dataPath(), dir.indexPath());
+  JournalWriter writer(dir.path());
 
   writer.append(1, bytesOf("in-zero-outputs"), {});
 
@@ -46,7 +46,7 @@ TEST(WriterReader, SingleRecordRoundTripVaryingOutputCounts) {
 
   writer.flush(/*async=*/false);
 
-  JournalReader reader(dir.dataPath(), dir.indexPath());
+  JournalReader reader(dir.path());
   ASSERT_EQ(reader.committedCount(), 3u);
 
   {
@@ -73,7 +73,7 @@ TEST(WriterReader, SingleRecordRoundTripVaryingOutputCounts) {
 
 TEST(WriterReader, ManyRecordsSupportO1RandomAccess) {
   testing::TempDir dir;
-  JournalWriter writer(dir.dataPath(), dir.indexPath());
+  JournalWriter writer(dir.path());
 
   constexpr int kCount = 500;
   for (int i = 1; i <= kCount; ++i) {
@@ -84,7 +84,7 @@ TEST(WriterReader, ManyRecordsSupportO1RandomAccess) {
   }
   writer.flush(false);
 
-  JournalReader reader(dir.dataPath(), dir.indexPath());
+  JournalReader reader(dir.path());
   ASSERT_EQ(reader.committedCount(), static_cast<std::uint64_t>(kCount));
 
   // Access out of monotonic order to exercise real random access, not
@@ -98,9 +98,69 @@ TEST(WriterReader, ManyRecordsSupportO1RandomAccess) {
   }
 }
 
+// The other side of that bound: a record too large is refused with an
+// error naming the limit, rather than corrupting the segment geometry
+// by being written anyway.
+TEST(WriterReader, ARecordLargerThanMaxRecordBytesIsRefused) {
+  testing::TempDir dir;
+  JournalOptions options;
+  options.recordsPerSegment = 16;
+  options.maxRecordBytes = 128;
+  JournalWriter writer(dir.path(), options);
+
+  writer.append(1, bytesOf("small"), {});
+  const std::string big(200, 'x');
+  try {
+    writer.append(2, bytesOf(big), {});
+    FAIL() << "expected JournalExhausted";
+  } catch (const JournalExhausted& e) {
+    EXPECT_NE(std::string(e.what()).find("maxRecordBytes"), std::string::npos) << e.what();
+  }
+  // The refusal leaves the journal exactly as it was: the rejected
+  // record consumed no sequence number and no bytes.
+  EXPECT_EQ(writer.nextSequenceNumber(), 2u);
+  writer.append(2, bytesOf("still-fine"), {});
+  EXPECT_EQ(writer.committedCount(), 2u);
+}
+
+// Rollover, from the journal's own tests rather than the node's: cross
+// several segment boundaries and read every record back through one
+// reader constructed before most of those segments existed.
+TEST(WriterReader, RecordsRoundTripAcrossSegmentBoundaries) {
+  testing::TempDir dir;
+  JournalOptions options;
+  options.recordsPerSegment = 4;
+  options.maxRecordBytes = 256;
+  JournalWriter writer(dir.path(), options);
+
+  JournalReader reader(dir.path());  // constructed when only segment 0 exists
+
+  constexpr std::uint64_t kCount = 19;
+  for (std::uint64_t seq = 1; seq <= kCount; ++seq) {
+    writer.append(seq, bytesOf("record-" + std::to_string(seq)), {});
+  }
+  writer.flush(false);
+  EXPECT_EQ(writer.segmentCount(), 5u) << "19 records at 4 per segment spans five segments";
+
+  ASSERT_EQ(reader.committedCount(), kCount);
+  for (std::uint64_t seq = 1; seq <= kCount; ++seq) {
+    RecordView r = reader.record(seq);
+    EXPECT_EQ(r.sequenceNumber(), seq);
+    EXPECT_EQ(toString(r.input()), "record-" + std::to_string(seq));
+  }
+}
+
 TEST(WriterReader, LargeInputRoundTrips) {
   testing::TempDir dir;
-  JournalWriter writer(dir.dataPath(), dir.indexPath());
+  // A 2 MiB record needs the journal created to expect them: since §6.5
+  // a segment reserves recordsPerSegment * maxRecordBytes so the record
+  // count always ends a segment first, which makes maxRecordBytes a real
+  // per-record bound rather than a formality. Raising it here and
+  // dropping recordsPerSegment to match keeps the reservation modest.
+  JournalOptions options;
+  options.recordsPerSegment = 64;
+  options.maxRecordBytes = 4 * 1024 * 1024;
+  JournalWriter writer(dir.path(), options);
 
   std::string big(2 * 1024 * 1024, 'x');
   for (std::size_t i = 0; i < big.size(); ++i) {
@@ -109,7 +169,7 @@ TEST(WriterReader, LargeInputRoundTrips) {
   writer.append(1, bytesOf(big), {});
   writer.flush(false);
 
-  JournalReader reader(dir.dataPath(), dir.indexPath());
+  JournalReader reader(dir.path());
   RecordView r = reader.record(1);
   EXPECT_EQ(toString(r.input()), big);
 }
@@ -117,20 +177,20 @@ TEST(WriterReader, LargeInputRoundTrips) {
 TEST(WriterReader, ReopenResumesAtNextSequenceNumberAndStaysDense) {
   testing::TempDir dir;
   {
-    JournalWriter writer(dir.dataPath(), dir.indexPath());
+    JournalWriter writer(dir.path());
     writer.append(1, bytesOf("a"), {});
     writer.append(2, bytesOf("b"), {});
     EXPECT_EQ(writer.nextSequenceNumber(), 3u);
   }  // writer destroyed: closedCleanly set, files flushed
 
   {
-    JournalWriter writer(dir.dataPath(), dir.indexPath());
+    JournalWriter writer(dir.path());
     EXPECT_EQ(writer.nextSequenceNumber(), 3u);
     writer.append(3, bytesOf("c"), {});
     writer.flush(false);
   }
 
-  JournalReader reader(dir.dataPath(), dir.indexPath());
+  JournalReader reader(dir.path());
   ASSERT_EQ(reader.committedCount(), 3u);
   EXPECT_EQ(toString(reader.record(1).input()), "a");
   EXPECT_EQ(toString(reader.record(2).input()), "b");
@@ -139,7 +199,7 @@ TEST(WriterReader, ReopenResumesAtNextSequenceNumberAndStaysDense) {
 
 TEST(WriterReader, AppendRejectsNonDenseSequenceNumber) {
   testing::TempDir dir;
-  JournalWriter writer(dir.dataPath(), dir.indexPath());
+  JournalWriter writer(dir.path());
   writer.append(1, bytesOf("a"), {});
   EXPECT_THROW(writer.append(3, bytesOf("skip-two"), {}), std::logic_error);
   EXPECT_THROW(writer.append(1, bytesOf("repeat"), {}), std::logic_error);
@@ -147,11 +207,11 @@ TEST(WriterReader, AppendRejectsNonDenseSequenceNumber) {
 
 TEST(WriterReader, ReaderObservesAppendsThroughLiveMappingWithoutReopening) {
   testing::TempDir dir;
-  JournalWriter writer(dir.dataPath(), dir.indexPath());
+  JournalWriter writer(dir.path());
   writer.append(1, bytesOf("a"), {});
   writer.flush(false);
 
-  JournalReader reader(dir.dataPath(), dir.indexPath());
+  JournalReader reader(dir.path());
   ASSERT_EQ(reader.committedCount(), 1u);
 
   writer.append(2, bytesOf("b"), {});
@@ -165,11 +225,11 @@ TEST(WriterReader, ReaderObservesAppendsThroughLiveMappingWithoutReopening) {
 
 TEST(WriterReader, RecordOutOfRangeThrows) {
   testing::TempDir dir;
-  JournalWriter writer(dir.dataPath(), dir.indexPath());
+  JournalWriter writer(dir.path());
   writer.append(1, bytesOf("a"), {});
   writer.flush(false);
 
-  JournalReader reader(dir.dataPath(), dir.indexPath());
+  JournalReader reader(dir.path());
   EXPECT_THROW(reader.record(0), std::out_of_range);
   EXPECT_THROW(reader.record(2), std::out_of_range);
 }

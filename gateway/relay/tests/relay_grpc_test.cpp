@@ -38,7 +38,7 @@ Payload payloadOf(const std::int64_t& v) {
 
 void appendRecords(const std::filesystem::path& dataDir, std::uint64_t startSeq,
                     const std::vector<std::int64_t>& values) {
-  journal::JournalWriter writer(dataDir / "journal.data", dataDir / "journal.index");
+  journal::JournalWriter writer(dataDir / "journal");
   for (std::size_t i = 0; i < values.size(); ++i) {
     writer.append(startSeq + i, payloadOf(values[i]), {});
   }
@@ -152,7 +152,7 @@ TEST(RelayGrpc, DeliversRecordsAppendedContinuouslyWhileSubscribed) {
   // loop finds all at once before Subscribe() even starts reading.
   constexpr int kAppended = 20000;
   std::thread writerThread([&dir] {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     for (int i = 0; i < kAppended; ++i) {
       writer.append(2 + i, payloadOf(1000 + i), {});
       if (i % 64 == 0) {
@@ -199,7 +199,7 @@ TEST(RelayGrpc, SurvivesClientsCancellingMidStreamRepeatedly) {
   ASSERT_NE(server, nullptr);
 
   std::thread writerThread([&dir] {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     for (int i = 0; i < 20000; ++i) {
       writer.append(2 + i, payloadOf(1000 + i), {});
       if (i % 64 == 0) {
@@ -247,7 +247,7 @@ TEST(RelayGrpc, BacklogCatchUpThroughputStaysOffTheGatherLoopFloor) {
   const std::filesystem::path dir = makeTempDir();
   constexpr int kBacklog = 50000;
   {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     for (int i = 0; i < kBacklog; ++i) {
       writer.append(1 + i, payloadOf(i), {});
       if (i % 256 == 0) writer.flush(false);

@@ -57,7 +57,7 @@ std::filesystem::path makeTempDir() {
 // reproduce.
 std::filesystem::path recordJournal(const std::vector<std::int64_t>& deltas) {
   const std::filesystem::path dir = makeTempDir();
-  journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+  journal::JournalWriter writer(dir / "journal");
   SumStateMachine recorder;
   for (std::size_t i = 0; i < deltas.size(); ++i) {
     OutputCollector outputs;
@@ -143,7 +143,7 @@ TEST(ReplayCheck, ExplicitOutputDirIsUsedAndNotAutoRemoved) {
   EXPECT_EQ(result.replayOutputDir, outputDir);
   // An explicitly-provided output dir is never auto-removed, success
   // or not — it's the caller's, not ours to delete.
-  EXPECT_TRUE(std::filesystem::exists(outputDir / "journal.data"));
+  EXPECT_TRUE(std::filesystem::exists(outputDir / "journal" / journal::kManifestFileName));
 
   std::filesystem::remove_all(dataDir);
   std::filesystem::remove_all(outputDir);

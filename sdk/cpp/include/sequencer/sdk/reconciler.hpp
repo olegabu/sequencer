@@ -36,7 +36,7 @@ struct ReconciliationMismatch {
 class Reconciler {
  public:
   explicit Reconciler(const std::filesystem::path& dataDir)
-      : reader_(dataDir / "journal.data", dataDir / "journal.index") {}
+      : reader_(dataDir / "journal") {}
 
   std::optional<ReconciliationMismatch> check(std::uint64_t sequenceNumber,
                                                Payload expectedRawRecordBytes) const {

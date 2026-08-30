@@ -61,7 +61,7 @@ class ApplyLoopTest : public ::testing::Test {
     std::string tmpl = (std::filesystem::temp_directory_path() / "apply_loop_test_XXXXXX").string();
     ASSERT_NE(::mkdtemp(tmpl.data()), nullptr);
     dir_ = tmpl;
-    writer_ = std::make_unique<journal::JournalWriter>(dir_ / "j.data", dir_ / "j.index");
+    writer_ = std::make_unique<journal::JournalWriter>(dir_ / "j");
     ring_ = std::make_unique<CommittedEntryRing>(16, 64);
     loop_ = std::make_unique<ApplyLoop>(sm_, *writer_, *ring_, &recordCompletion);
   }
@@ -101,7 +101,7 @@ TEST_F(ApplyLoopTest, StepMintsDenseSequenceNumbersAndAppendsToJournal) {
   EXPECT_EQ(ctxs[2].designatedTotal, 13);
 
   writer_->flush(false);
-  journal::JournalReader reader(dir_ / "j.data", dir_ / "j.index");
+  journal::JournalReader reader(dir_ / "j");
   ASSERT_EQ(reader.committedCount(), 3u);
   journal::RecordView r3 = reader.record(3);
   std::int64_t v;
@@ -164,45 +164,44 @@ TEST_F(ApplyLoopTest, RunWithParkModeStillDrainsInSequenceOrder) {
   }
 }
 
-// A full journal must stop the apply loop, not the process. Before
-// this, JournalWriter::append threw std::length_error straight out of
-// the apply thread with nothing catching it, so the node died through
+// A record the journal cannot take must stop the apply loop, not the
+// process. Before this, JournalWriter::append threw straight out of the
+// apply thread with nothing catching it, so the node died through
 // std::terminate leaving only "terminate called after throwing an
 // instance of 'std::length_error'" -- which cost two benchmark fleets
 // before anyone worked out what it meant.
 //
-// The tiny maxIndexEntries here is the whole trick: it makes
-// exhaustion reachable in a unit test rather than after ~268M records.
-TEST(ApplyLoopExhaustion, AFullJournalHaltsTheLoopInsteadOfKillingTheProcess) {
+// Since §6.5 the journal rolls rather than filling, so the reachable
+// version of that failure is a record larger than maxRecordBytes: that
+// bound is fixed at creation because a segment's data file is reserved
+// at recordsPerSegment * maxRecordBytes, and honouring an oversized
+// record would break the addressing arithmetic every reader depends on.
+TEST(ApplyLoopExhaustion, AnOversizedRecordHaltsTheLoopInsteadOfKillingTheProcess) {
   const std::filesystem::path dir =
       std::filesystem::temp_directory_path() / "seq_apply_exhaust_test";
   std::filesystem::remove_all(dir);
-  std::filesystem::create_directories(dir);
 
   journal::JournalOptions options;
-  options.maxIndexEntries = 4;
-  journal::JournalWriter writer(dir / "j.data", dir / "j.index", options);
+  options.recordsPerSegment = 16;
+  options.maxRecordBytes = 64;  // an 8-byte delta plus its output fits; a large input does not
+  journal::JournalWriter writer(dir, options);
 
   SumStateMachine stateMachine;
   CommittedEntryRing ring(64, std::size_t{64} << 10);
   ApplyLoop loop(stateMachine, writer, ring, &recordCompletion);
 
-  // One more than the journal can hold.
-  const int kCount = 5;
-  std::vector<CompletionCtx> ctxs(kCount);
-  for (int i = 0; i < kCount; ++i) {
-    static thread_local std::int64_t delta;
-    delta = 1;
-    ring.push(payloadOf(delta), &ctxs[i]);
-  }
+  std::vector<CompletionCtx> ctxs(3);
+  static thread_local std::int64_t delta;
+  delta = 1;
+  ring.push(payloadOf(delta), &ctxs[0]);
+  ring.push(payloadOf(delta), &ctxs[1]);
+  // Too large for maxRecordBytes, so append() refuses it.
+  const std::vector<std::byte> oversized(200, std::byte{7});
+  ring.push(Payload(oversized.data(), oversized.size()), &ctxs[2]);
 
   std::atomic<bool> stop{false};
   std::thread applyThread([&] { loop.run(stop, /*pureSpin=*/false); });
-  while (!loop.halted() && !ctxs[3].called.load(std::memory_order_acquire)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  // Give the fifth entry a chance to be the one that overflows.
-  for (int i = 0; i < 200 && !loop.halted(); ++i) {
+  for (int i = 0; i < 500 && !loop.halted(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   stop.store(true, std::memory_order_relaxed);
@@ -211,40 +210,99 @@ TEST(ApplyLoopExhaustion, AFullJournalHaltsTheLoopInsteadOfKillingTheProcess) {
   // Reaching here at all is most of the point: the thread came back
   // rather than taking the process down with it.
   EXPECT_TRUE(loop.halted());
-  EXPECT_NE(loop.haltReason().find("maxIndexEntries"), std::string::npos)
+  EXPECT_NE(loop.haltReason().find("maxRecordBytes"), std::string::npos)
       << "halt reason should name the limit that was hit: " << loop.haltReason();
   // The records that DID fit are still durable and correctly numbered.
-  EXPECT_EQ(writer.committedCount(), 4u);
-  for (int i = 0; i < 4; ++i) {
-    EXPECT_TRUE(ctxs[i].called.load()) << "entry " << i << " should have completed";
-  }
+  EXPECT_EQ(writer.committedCount(), 2u);
+  EXPECT_TRUE(ctxs[0].called.load());
+  EXPECT_TRUE(ctxs[1].called.load());
   std::filesystem::remove_all(dir);
 }
 
-// fillPercent reports whichever limit is closer to full, so a long run
-// can watch the wall approach instead of discovering it.
-TEST(ApplyLoopExhaustion, FillPercentTracksTheBindingLimit) {
+// The rollover itself (§6.5): write past a segment boundary and check
+// that every record is still readable, through a reader that was
+// constructed before any of the later segments existed. That is the
+// case the design has to get right -- a reader discovers new segments
+// from the committed count alone, with no notification from the writer.
+TEST(ApplyLoopExhaustion, RecordsRemainReadableAcrossSegmentBoundaries) {
   const std::filesystem::path dir =
-      std::filesystem::temp_directory_path() / "seq_fill_percent_test";
+      std::filesystem::temp_directory_path() / "seq_apply_rollover_test";
   std::filesystem::remove_all(dir);
-  std::filesystem::create_directories(dir);
 
   journal::JournalOptions options;
-  options.maxIndexEntries = 10;
-  journal::JournalWriter writer(dir / "j.data", dir / "j.index", options);
-  EXPECT_EQ(writer.fillPercent(), 0);
+  options.recordsPerSegment = 8;
+  options.maxRecordBytes = 128;
+  journal::JournalWriter writer(dir, options);
 
   SumStateMachine stateMachine;
   OutputCollector collector;
   const std::int64_t delta = 1;
-  for (int i = 0; i < 5; ++i) {
+  // Deliberately not a multiple of recordsPerSegment: the last segment
+  // should be partially filled.
+  constexpr std::uint64_t kCount = 21;
+  for (std::uint64_t i = 1; i <= kCount; ++i) {
     collector.reset();
-    stateMachine.apply(static_cast<std::uint64_t>(i + 1), payloadOf(delta), collector);
-    writer.append(static_cast<std::uint64_t>(i + 1), payloadOf(delta), collector.outputs());
+    stateMachine.apply(i, payloadOf(delta), collector);
+    writer.append(i, payloadOf(delta), collector.outputs());
   }
-  // Five of ten index entries used; the data file is nowhere near full,
-  // so the index is what fillPercent must be reporting.
-  EXPECT_EQ(writer.fillPercent(), 50);
+  writer.flush(false);
+
+  EXPECT_EQ(writer.segmentCount(), 3u) << "21 records at 8 per segment is three segments";
+
+  journal::JournalReader reader(dir);
+  ASSERT_EQ(reader.committedCount(), kCount);
+  for (std::uint64_t i = 1; i <= kCount; ++i) {
+    journal::RecordView r = reader.record(i);
+    EXPECT_EQ(r.sequenceNumber(), i);
+    std::int64_t total = 0;
+    std::memcpy(&total, r.output(0).data(), sizeof(total));
+    EXPECT_EQ(total, static_cast<std::int64_t>(i)) << "record " << i << " read back wrong";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// Reopening a rolled journal must resume in the right segment at the
+// right offset, not at the start of one. Recovery derives both from the
+// committed count alone (§6.3, §6.5).
+TEST(ApplyLoopExhaustion, ReopeningARolledJournalResumesInTheActiveSegment) {
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / "seq_apply_reopen_test";
+  std::filesystem::remove_all(dir);
+
+  journal::JournalOptions options;
+  options.recordsPerSegment = 8;
+  options.maxRecordBytes = 128;
+  SumStateMachine stateMachine;
+  OutputCollector collector;
+  const std::int64_t delta = 1;
+
+  {
+    journal::JournalWriter writer(dir, options);
+    for (std::uint64_t i = 1; i <= 11; ++i) {  // into the second segment
+      collector.reset();
+      stateMachine.apply(i, payloadOf(delta), collector);
+      writer.append(i, payloadOf(delta), collector.outputs());
+    }
+  }
+  {
+    // Geometry comes from the manifest, so it deliberately is NOT passed
+    // again here -- passing different options must not resize anything.
+    journal::JournalWriter writer(dir);
+    EXPECT_EQ(writer.nextSequenceNumber(), 12u);
+    EXPECT_EQ(writer.recordsPerSegment(), 8u);
+    for (std::uint64_t i = 12; i <= 20; ++i) {
+      collector.reset();
+      stateMachine.apply(i, payloadOf(delta), collector);
+      writer.append(i, payloadOf(delta), collector.outputs());
+    }
+    writer.flush(false);
+  }
+
+  journal::JournalReader reader(dir);
+  ASSERT_EQ(reader.committedCount(), 20u);
+  for (std::uint64_t i = 1; i <= 20; ++i) {
+    EXPECT_EQ(reader.record(i).sequenceNumber(), i) << "record " << i << " after reopen";
+  }
   std::filesystem::remove_all(dir);
 }
 

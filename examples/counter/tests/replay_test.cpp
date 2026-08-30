@@ -44,7 +44,7 @@ TEST(CounterReplay, RecordedJournalReplaysByteIdenticalThroughFreshStateMachine)
   const std::vector<std::int64_t> deltas = {5, -2, 10, -13, 100, 0, 42};
 
   {
-    journal::JournalWriter writer(dataDir / "journal.data", dataDir / "journal.index");
+    journal::JournalWriter writer(dataDir / "journal");
     CounterStateMachine recorder;
     for (std::size_t i = 0; i < deltas.size(); ++i) {
       OutputCollector outputs;

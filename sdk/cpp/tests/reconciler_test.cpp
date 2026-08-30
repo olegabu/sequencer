@@ -36,7 +36,7 @@ Bytes rawRecordBytesFor(std::uint64_t sequenceNumber, std::int64_t input) {
 TEST(Reconciler, MatchingBytesReconcileCleanly) {
   const std::filesystem::path dir = makeTempDir();
   {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});
     writer.append(2, payloadOf(-2), {});
     writer.flush(false);
@@ -54,7 +54,7 @@ TEST(Reconciler, MatchingBytesReconcileCleanly) {
 TEST(Reconciler, MismatchedBytesAreReportedAsAFraudProof) {
   const std::filesystem::path dir = makeTempDir();
   {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});
     writer.flush(false);
   }
@@ -73,7 +73,7 @@ TEST(Reconciler, MismatchedBytesAreReportedAsAFraudProof) {
 TEST(Reconciler, NotYetCommittedIsDistinguishedFromAMismatch) {
   const std::filesystem::path dir = makeTempDir();
   {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});
     writer.flush(false);
   }
@@ -90,7 +90,7 @@ TEST(Reconciler, NotYetCommittedIsDistinguishedFromAMismatch) {
 TEST(Reconciler, CheckAllReturnsOnlyTheMismatches) {
   const std::filesystem::path dir = makeTempDir();
   {
-    journal::JournalWriter writer(dir / "journal.data", dir / "journal.index");
+    journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});
     writer.append(2, payloadOf(-2), {});
     writer.flush(false);

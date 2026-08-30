@@ -39,7 +39,7 @@ Payload payloadOf(const std::int64_t& v) {
 
 void appendRecords(const std::filesystem::path& dataDir, std::uint64_t startSeq,
                     const std::vector<std::int64_t>& values) {
-  journal::JournalWriter writer(dataDir / "journal.data", dataDir / "journal.index");
+  journal::JournalWriter writer(dataDir / "journal");
   for (std::size_t i = 0; i < values.size(); ++i) {
     writer.append(startSeq + i, payloadOf(values[i]), {});
   }
@@ -190,7 +190,7 @@ TEST(RelayGateway, DeliveredRecordsAreByteIdenticalToTheColocatedJournal) {
   ASSERT_TRUE(client.ok()) << client.errorMessage();
   ASSERT_TRUE(waitForCount(client, 3, std::chrono::seconds(5)));
 
-  journal::JournalReader reader(dir / "journal.data", dir / "journal.index");
+  journal::JournalReader reader(dir / "journal");
   const std::vector<Bytes> received = client.rawSnapshot();
   ASSERT_EQ(received.size(), 3u);
   for (std::uint64_t seq = 1; seq <= 3; ++seq) {

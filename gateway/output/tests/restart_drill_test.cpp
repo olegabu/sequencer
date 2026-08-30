@@ -60,7 +60,7 @@ Payload payloadOf(const std::int64_t& v) {
 
 void appendRecords(const std::filesystem::path& dataDir, std::uint64_t startSeq,
                     const std::vector<std::int64_t>& values) {
-  journal::JournalWriter writer(dataDir / "journal.data", dataDir / "journal.index");
+  journal::JournalWriter writer(dataDir / "journal");
   for (std::size_t i = 0; i < values.size(); ++i) {
     writer.append(startSeq + i, payloadOf(values[i]), {});
   }

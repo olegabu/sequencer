@@ -158,7 +158,7 @@ bool waitForCommittedCount(const std::filesystem::path& dataDir, std::uint64_t t
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     try {
-      journal::JournalReader reader(dataDir / "journal.data", dataDir / "journal.index");
+      journal::JournalReader reader(dataDir / "journal");
       if (reader.committedCount() >= target) {
         return true;
       }
@@ -175,8 +175,8 @@ bool waitForCommittedCount(const std::filesystem::path& dataDir, std::uint64_t t
 // same way three_node_smoke_test.cpp checks it for an uninterrupted
 // cluster.
 void expectNoDivergence(const std::filesystem::path& dirA, const std::filesystem::path& dirB) {
-  journal::JournalReader a(dirA / "journal.data", dirA / "journal.index");
-  journal::JournalReader b(dirB / "journal.data", dirB / "journal.index");
+  journal::JournalReader a(dirA / "journal");
+  journal::JournalReader b(dirB / "journal");
   const std::uint64_t common = std::min(a.committedCount(), b.committedCount());
   ASSERT_GT(common, 0u);
   for (std::uint64_t seq = 1; seq <= common; ++seq) {
@@ -235,7 +235,7 @@ TEST(AcceptanceDrills, KillLeaderUnderLoadShowsNoGapsNoDivergenceAndContinuedCom
   ASSERT_EQ(survivors.size(), 2u);
 
   const auto survivorCommittedCount = [&](std::size_t idx) {
-    journal::JournalReader reader(cluster.dataDirs[idx] / "journal.data", cluster.dataDirs[idx] / "journal.index");
+    journal::JournalReader reader(cluster.dataDirs[idx] / "journal");
     return reader.committedCount();
   };
   ASSERT_TRUE(waitForCommittedCount(cluster.dataDirs[survivors[0]], kPreKillCommits + 1, std::chrono::seconds(10)))

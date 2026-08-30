@@ -131,8 +131,7 @@ class RelayGatewayImpl {
     while (!stopRequested_.load(std::memory_order_relaxed)) {
       if (!currentReader()) {
         try {
-          auto reader = std::make_shared<journal::JournalReader>(config_.dataDir / "journal.data",
-                                                                   config_.dataDir / "journal.index");
+          auto reader = std::make_shared<journal::JournalReader>(config_.dataDir / "journal");
           std::lock_guard<std::mutex> lock(mutex_);
           reader_ = reader;
         } catch (const std::exception&) {

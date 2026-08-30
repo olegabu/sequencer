@@ -73,8 +73,7 @@ int main(int argc, char** argv) {
   }
 
   try {
-    sequencer::journal::JournalReader reader(FLAGS_data_dir + "/journal.data",
-                                              FLAGS_data_dir + "/journal.index");
+    sequencer::journal::JournalReader reader(FLAGS_data_dir + "/journal");
     const std::uint64_t committed = reader.committedCount();
     const std::uint64_t from = std::max<std::uint64_t>(FLAGS_from, 1);
     const std::uint64_t to = FLAGS_to == 0 ? committed : std::min(FLAGS_to, committed);

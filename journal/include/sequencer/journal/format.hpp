@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace sequencer::journal {
@@ -55,6 +56,69 @@ static_assert(sizeof(IndexHeader) == 24,
               "IndexHeader must not gain implicit padding — the layout is on-disk ABI");
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+
+// JournalManifest — specification.md §6.5. One small fixed-size file at
+// the root of a journal directory, holding the geometry every segment
+// was created with and, critically, the committed count.
+//
+// The count lives HERE rather than in any segment's index header, and
+// that is the whole point: §6.3 allows exactly one synchronization
+// point between writer and readers, and a per-segment count would make
+// that one-per-segment, leaving a reader to reason about which of
+// several counts governs a record it is trying to read. One global
+// count keeps §6.3's protocol literally unchanged — only its address
+// moved.
+//
+// Segment *count* is deliberately absent: it is
+// ceil(committedCount / recordsPerSegment), so storing it would create
+// a second fact that could disagree with the first.
+inline constexpr std::uint32_t kManifestMagic = 0x4a4d4e31;  // "JMN1", read as LE u32
+inline constexpr std::uint32_t kManifestVersion = 1;
+
+struct JournalManifest {
+  std::uint32_t magic;
+  std::uint32_t version;
+  std::uint64_t recordsPerSegment;  // fixed at creation; §6.5's O(1) addressing depends on it
+  std::uint64_t maxRecordBytes;     // fixed at creation; bounds one record so data cannot fill first
+  std::atomic<std::uint32_t> closedCleanly;
+  std::uint32_t reserved;  // explicit padding — always zero, never read
+  std::atomic<std::uint64_t> committedCount;
+};
+
+static_assert(sizeof(JournalManifest) == 40,
+              "JournalManifest must not gain implicit padding — the layout is on-disk ABI");
+
+// Segment file stems — specification.md §6.5. Deliberately braft's own
+// shape (log_inprogress_%020ld / log_%020ld_%020ld), because a node
+// keeps a braft log in the same data directory and two different
+// segment-naming schemes there would only confuse. Callers append
+// ".data" or ".index".
+//
+// Both stems are DERIVABLE from a sequence number alone, which is what
+// makes seal-by-rename free for readers: having computed a segment
+// index arithmetically, a reader knows its first record, so it can
+// construct both candidate names and try the sealed one, then the open
+// one — no directory listing, no sorted search (§6.5).
+namespace detail {
+
+inline std::string paddedSequence(std::uint64_t value) {
+  std::string out = std::to_string(value);
+  return out.size() >= 20 ? out : std::string(20 - out.size(), '0') + out;
+}
+
+}  // namespace detail
+
+inline std::string openSegmentStem(std::uint64_t firstSequenceNumber) {
+  return "journal_inprogress_" + detail::paddedSequence(firstSequenceNumber);
+}
+
+inline std::string sealedSegmentStem(std::uint64_t firstSequenceNumber,
+                                      std::uint64_t lastSequenceNumber) {
+  return "journal_" + detail::paddedSequence(firstSequenceNumber) + "_" +
+         detail::paddedSequence(lastSequenceNumber);
+}
+
+inline constexpr const char* kManifestFileName = "manifest";
 
 // IndexEntry — specification.md §6.2. Entry i (0-based) <-> sequence
 // number i+1: `index[N-1]` locates record N in O(1), which is the entire

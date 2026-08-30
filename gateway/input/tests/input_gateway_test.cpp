@@ -217,7 +217,7 @@ TEST_F(InputGatewayTest, ConcurrentSubmitsEachGetTheirOwnSequenceNumber) {
   }
 
   // And the journal agrees: one record per submit, no more.
-  journal::JournalReader reader(dir_ / "journal.data", dir_ / "journal.index");
+  journal::JournalReader reader(dir_ / "journal");
   EXPECT_EQ(reader.committedCount(), static_cast<std::uint64_t>(kSubmitters));
 }
 
@@ -227,7 +227,7 @@ TEST_F(InputGatewayTest, MalformedRequestIsRejectedByCodecWithoutProposing) {
       submit(Payload(reinterpret_cast<const std::byte*>(tooShort.data()), tooShort.size()));
   EXPECT_TRUE(result.failed);
 
-  journal::JournalReader reader(dir_ / "journal.data", dir_ / "journal.index");
+  journal::JournalReader reader(dir_ / "journal");
   EXPECT_EQ(reader.committedCount(), 0u) << "a codec-rejected request must never reach Propose";
 }
 
@@ -244,7 +244,7 @@ TEST_F(InputGatewayTest, SignatureVerifierRejectionPreventsProposing) {
   const SubmitResult result = submit(bytesOf(5));
   EXPECT_TRUE(result.failed);
 
-  journal::JournalReader reader(dir_ / "journal.data", dir_ / "journal.index");
+  journal::JournalReader reader(dir_ / "journal");
   EXPECT_EQ(reader.committedCount(), 0u) << "a rejected signature must never reach Propose";
 }
 
