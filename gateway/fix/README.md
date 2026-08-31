@@ -193,52 +193,61 @@ sending `263=0` (snapshot only) is registered for updates and gets no
 snapshot. A snapshot is an application-level query the codec or state
 machine must answer; the subscription half is what is built.
 
-## Known: the delivery path caps around 1,000 messages/sec
+## Where the FIX path's throughput limit actually is: the rig
 
-Measured against `examples/counter`'s FIX gateway on one machine, one
-node, one session (2026-09-01). **Do not run a FIX sweep expecting more
-than this until it is fixed.**
+Measured on one machine, one node, one session (2026-09-01), with stage
+timers inside both of the gateway's own loops (`FIX_STAGE_TIMERS=1`).
 
-Isolated by controls rather than by reasoning, because reasoning has a
-poor record here:
+**The gateway is not the limit. The load generator is.** An earlier
+version of this section said the opposite; it was wrong, and the way it
+was wrong is worth keeping.
 
-| stage | carries | how |
-|---|---|---|
-| machine + node + raft | 10,000/s | brpc input gateway, same box, same node |
-| output chassis (journal → ring → socket) | 10,007/s | same, plus the WebSocket output gateway |
-| FIX session + input transport | ~77,000/s | `fix_loadgen_loopback_test` against an echo peer |
-| **FIX gateway end to end** | **~1,000/s** | p50 4.7 ms, p99 75 ms; collapses at 2,000/s |
+The gateway's two threads are both idle under load:
 
-Every stage clears 10k except the whole. The one component no control
-exercises is `FixOutputTransport`'s delivery path — journal record to
-ring entry to FIX encode to socket — so that is where the limit is.
+| thread | at 1,000 msg/s |
+|---|---|
+| FIX session reader (input) | **97% waiting for bytes**, 3% processing (~60 µs per read) |
+| ring reader (output) | **83–89% idle**, 1% delivering (~11 µs per entry), 6% flushing |
 
-A profile of the gateway under load (`perf record -F 999 -g`) shows no
-dominant application symbol, ~9% in `std::string` compare/erase/replace
-and ~6% in mutex traffic, with most samples in the kernel and a syscall
-histogram dominated by 50µs idle sleeps rather than by I/O. That is the
-shape of a path doing many small pieces of work under locks, not one
-expensive operation.
+The ring reader spins about a million times per two seconds to find two
+thousand entries. Neither side is short of capacity.
 
-What that path does **per message**, which is the place to start:
+The sender is, and its failure looks like a server limit unless you read
+the drop counter:
 
-- `sessionFor()` — mutex, map lookup
-- `alreadyDelivered()` / `markDelivered()` — two more mutexes, two
-  `std::map<std::string, …>` lookups keyed by the CompID pair, so a
-  string compare each
-- `recordSent()` — a fourth mutex, and an insert into a map that **is
-  never pruned**; it grows for the life of a session, which is a leak
-  independent of its cost here
-- `setLastJournalSequence()` — throttled now, but still a call
-- and per broadcast entry, `topicNameFor()` returns a **string copy**
-  and `subscribersOf()` returns a **`std::set` copy**, both under
-  further mutexes
+| sender threads | offered | achieved | `dropped-by-rig` |
+|---|---|---|---|
+| **1** | 2,000/s | **1,982** | **0** |
+| 2 | 2,000/s | 0 | 9,001 |
+| 8 | 2,000/s | 0 | 9,001 |
+| 1 | 5,000/s | 0 | 24,001 |
 
-All of it on the single ring-reader thread, which exists to guarantee
-journal ordering (§8.11) and therefore cannot simply be parallelised —
-the work has to get cheaper instead.
+More sender threads makes it **worse**, which is the signature of
+contention inside the sender rather than pressure on the server:
+`FixRequester` serializes every send behind one mutex, so threads queue
+against each other and the open-loop scheduler falls behind. Its
+`dropped-by-rig` count is the harness saying so plainly.
 
-Three earlier fixes are already in and are not the remaining cause: the
-counters no longer touch the filesystem per message (that alone was
-750/s → 2,000/s), `emit()`'s outbound persist is throttled too, and
-writes coalesce per drain.
+That the earlier reading survived several rounds is the lesson. The
+number that mattered — `dropped-by-rig 13001` — was printed the first
+time and read as evidence about the gateway.
+
+**Consequences for measuring this gateway:**
+
+- Drive it with **one sender thread per client process**, not many.
+- A single sender carries roughly 2,000/s against a real gateway, far
+  below the ~77k/s it manages against a trivial echo peer, because the
+  echo has no latency to keep outstanding work against.
+- So a FIX sweep must be **multi-client**, as
+  `bench/load_generator/README.md` already says, and now for a sharper
+  reason: per-sender capacity against a real gateway is the binding
+  constraint.
+
+**What is not yet known:** where the gateway itself saturates. Nothing
+here has driven it hard enough to find out. Latency is measurable and
+reasonable — p50 ~4.9 ms against the brpc path's ~3.2 ms at the same
+rate, an extra ~1.7 ms for the FIX encode and the session hop.
+
+Three fixes from this investigation are in: counters no longer touch the
+filesystem per message (750/s → 2,000/s on its own), `emit()`'s outbound
+persist is throttled too, and writes coalesce per drain.

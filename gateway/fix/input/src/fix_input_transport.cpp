@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -347,11 +349,31 @@ struct FixInputTransport::Impl {
                    sizeof(timeout));
 
       std::vector<char> buffer(16 * 1024);
+
+      // Stage timers, the counterpart of the ring reader's. That one
+      // showed itself starved at 83-89% idle, which puts the limit
+      // upstream -- here. This splits a session's reader thread into
+      // waiting for bytes and whatever the chassis does with each
+      // message (codec, signature, proposeAsync).
+      using Ns = std::chrono::nanoseconds;
+      const auto tick = [] { return std::chrono::steady_clock::now(); };
+      std::uint64_t readNs = 0, processNs = 0, reads = 0, bytesRead = 0;
+      auto lastReport = tick();
+      constexpr std::uint64_t kReportIntervalNs = 2'000'000'000ULL;
+      // Off unless asked for: these are diagnostics, and a sweep
+      // does not want them in its logs. Set FIX_STAGE_TIMERS=1.
+      const bool stageTimers = std::getenv("FIX_STAGE_TIMERS") != nullptr;
+
       while (!connection->stop.load(std::memory_order_relaxed) &&
              !this->stopping.load(std::memory_order_relaxed)) {
         boost::system::error_code ec;
+        const auto readStart = tick();
         const std::size_t n =
             connection->socket.read_some(net::buffer(buffer.data(), buffer.size()), ec);
+        readNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<Ns>(tick() - readStart).count());
+        ++reads;
+        bytesRead += n;
         if (ec) {
           if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) {
             connection->session->poll();
@@ -359,8 +381,30 @@ struct FixInputTransport::Impl {
           }
           break;  // peer gone
         }
+        const auto processStart = tick();
         connection->session->onBytes(std::string_view(buffer.data(), n));
         connection->session->poll();
+        processNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<Ns>(tick() - processStart).count());
+
+        const auto sinceReport = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<Ns>(tick() - lastReport).count());
+        if (stageTimers && sinceReport >= kReportIntervalNs && reads > 0) {
+          // read% high means this thread is waiting for the client.
+          // process% high means the per-message chassis work -- codec,
+          // signature, proposeAsync -- is what costs.
+          std::fprintf(stderr,
+                       "[fix-in] window=%.2fs reads=%llu bytes=%llu read=%.1f%% process=%.1f%% "
+                       "process_per_read=%.1fus bytes_per_read=%.0f\n",
+                       static_cast<double>(sinceReport) / 1e9, (unsigned long long)reads,
+                       (unsigned long long)bytesRead,
+                       100.0 * static_cast<double>(readNs) / static_cast<double>(sinceReport),
+                       100.0 * static_cast<double>(processNs) / static_cast<double>(sinceReport),
+                       static_cast<double>(processNs) / reads / 1000.0,
+                       static_cast<double>(bytesRead) / reads);
+          readNs = processNs = reads = bytesRead = 0;
+          lastReport = tick();
+        }
       }
 
       // Persist before anything else: the counters are throttled on the

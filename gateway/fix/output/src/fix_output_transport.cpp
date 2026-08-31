@@ -3,6 +3,9 @@
 #include <sequencer/journal/reader.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -356,6 +359,26 @@ void FixOutputTransport::start(int /*listenPort*/) {
     constexpr int kMaxDrain = 1024;
     std::vector<std::uint64_t> touched;
 
+    // Stage timers. The question they answer is the one a profile could
+    // not: is this reader STARVED -- waiting on entries that arrive too
+    // slowly -- or BUSY, spending real time delivering each one? Those
+    // point at opposite halves of the system and the fix differs
+    // completely, so guessing between them is what these exist to
+    // avoid.
+    //
+    // Reported to the log every kReportIntervalNs rather than through
+    // bvar, because this gateway runs no brpc server and so has no
+    // /vars page to read them from.
+    using Ns = std::chrono::nanoseconds;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    std::uint64_t idleNs = 0, deliverNs = 0, flushNs = 0;
+    std::uint64_t entries = 0, drains = 0, emptyDrains = 0;
+    auto lastReport = now();
+    constexpr std::uint64_t kReportIntervalNs = 2'000'000'000ULL;
+      // Off unless asked for: these are diagnostics, and a sweep
+      // does not want them in its logs. Set FIX_STAGE_TIMERS=1.
+      const bool stageTimers = std::getenv("FIX_STAGE_TIMERS") != nullptr;
+
     while (!impl_->stopping.load(std::memory_order_relaxed)) {
       touched.clear();
       int gathered = 0;
@@ -384,6 +407,7 @@ void FixOutputTransport::start(int /*listenPort*/) {
           impl_->deliver(sessionId, body, origin);
         };
 
+        const auto deliverStart = now();
         if ((tag & sequencer::kSessionTagBit) != 0) {
           deliverTo(tag & ~sequencer::kSessionTagBit);
         } else {
@@ -394,13 +418,20 @@ void FixOutputTransport::start(int /*listenPort*/) {
             }
           }
         }
+        deliverNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<Ns>(now() - deliverStart).count());
         ++gathered;
+        ++entries;
       }
 
       // One syscall per session per drain.
+      const auto flushStart = now();
       for (const std::uint64_t sessionId : touched) {
         impl_->sessions.endBatch(sessionId);
       }
+      flushNs += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<Ns>(now() - flushStart).count());
+      ++drains;
 
       if (sawOverrun) {
         // Lapped by the producer. Unlike a per-subscriber transport
@@ -412,9 +443,37 @@ void FixOutputTransport::start(int /*listenPort*/) {
         continue;
       }
       if (gathered == 0) {
+        ++emptyDrains;
+        const auto idleStart = now();
         idle.idle();
+        idleNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<Ns>(now() - idleStart).count());
       } else {
         idle.reset();
+      }
+
+      const auto sinceReport = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<Ns>(now() - lastReport).count());
+      if (stageTimers && sinceReport >= kReportIntervalNs &&
+          (entries > 0 || emptyDrains > 0)) {
+        // STARVED vs BUSY reads straight off these: idle dominating the
+        // window means entries are not arriving; deliver or flush
+        // dominating means each one costs too much.
+        std::fprintf(stderr,
+                     "[fix-out] window=%.2fs entries=%llu drains=%llu empty=%llu "
+                     "idle=%.1f%% deliver=%.1f%% flush=%.1f%% "
+                     "deliver_per_entry=%.1fus flush_per_drain=%.1fus\n",
+                     static_cast<double>(sinceReport) / 1e9,
+                     (unsigned long long)entries, (unsigned long long)drains,
+                     (unsigned long long)emptyDrains,
+                     100.0 * static_cast<double>(idleNs) / static_cast<double>(sinceReport),
+                     100.0 * static_cast<double>(deliverNs) / static_cast<double>(sinceReport),
+                     100.0 * static_cast<double>(flushNs) / static_cast<double>(sinceReport),
+                     entries ? static_cast<double>(deliverNs) / entries / 1000.0 : 0.0,
+                     drains ? static_cast<double>(flushNs) / drains / 1000.0 : 0.0);
+        idleNs = deliverNs = flushNs = 0;
+        entries = drains = emptyDrains = 0;
+        lastReport = now();
       }
     }
   });
