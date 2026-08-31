@@ -3,16 +3,21 @@
   "version": "0.1.0",
   "builtin-baseline": "7e21420f775f72ae938bdeb5e6068f722088f06a",
   "dependencies": [
-    "gtest",
     "benchmark",
+    "boost-beast",
     "braft",
     "brpc",
-    "boost-beast",
-    "openssl",
     "grpc",
-    "hdr-histogram"
+    "gtest",
+    "hdr-histogram",
+    "hffix",
+    "openssl",
+    "quickfix"
   ],
   "overrides": [
-    { "name": "glog", "version": "0.6.0" }
+    {
+      "name": "glog",
+      "version": "0.6.0"
+    }
   ]
 }
