@@ -192,3 +192,53 @@ mechanisms above. It is not "tail the journal only".
 sending `263=0` (snapshot only) is registered for updates and gets no
 snapshot. A snapshot is an application-level query the codec or state
 machine must answer; the subscription half is what is built.
+
+## Known: the delivery path caps around 1,000 messages/sec
+
+Measured against `examples/counter`'s FIX gateway on one machine, one
+node, one session (2026-09-01). **Do not run a FIX sweep expecting more
+than this until it is fixed.**
+
+Isolated by controls rather than by reasoning, because reasoning has a
+poor record here:
+
+| stage | carries | how |
+|---|---|---|
+| machine + node + raft | 10,000/s | brpc input gateway, same box, same node |
+| output chassis (journal → ring → socket) | 10,007/s | same, plus the WebSocket output gateway |
+| FIX session + input transport | ~77,000/s | `fix_loadgen_loopback_test` against an echo peer |
+| **FIX gateway end to end** | **~1,000/s** | p50 4.7 ms, p99 75 ms; collapses at 2,000/s |
+
+Every stage clears 10k except the whole. The one component no control
+exercises is `FixOutputTransport`'s delivery path — journal record to
+ring entry to FIX encode to socket — so that is where the limit is.
+
+A profile of the gateway under load (`perf record -F 999 -g`) shows no
+dominant application symbol, ~9% in `std::string` compare/erase/replace
+and ~6% in mutex traffic, with most samples in the kernel and a syscall
+histogram dominated by 50µs idle sleeps rather than by I/O. That is the
+shape of a path doing many small pieces of work under locks, not one
+expensive operation.
+
+What that path does **per message**, which is the place to start:
+
+- `sessionFor()` — mutex, map lookup
+- `alreadyDelivered()` / `markDelivered()` — two more mutexes, two
+  `std::map<std::string, …>` lookups keyed by the CompID pair, so a
+  string compare each
+- `recordSent()` — a fourth mutex, and an insert into a map that **is
+  never pruned**; it grows for the life of a session, which is a leak
+  independent of its cost here
+- `setLastJournalSequence()` — throttled now, but still a call
+- and per broadcast entry, `topicNameFor()` returns a **string copy**
+  and `subscribersOf()` returns a **`std::set` copy**, both under
+  further mutexes
+
+All of it on the single ring-reader thread, which exists to guarantee
+journal ordering (§8.11) and therefore cannot simply be parallelised —
+the work has to get cheaper instead.
+
+Three earlier fixes are already in and are not the remaining cause: the
+counters no longer touch the filesystem per message (that alone was
+750/s → 2,000/s), `emit()`'s outbound persist is throttled too, and
+writes coalesce per drain.
