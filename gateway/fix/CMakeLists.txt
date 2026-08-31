@@ -21,6 +21,27 @@ target_include_directories(sequencer_fix_session
 )
 target_compile_features(sequencer_fix_session PUBLIC cxx_std_20)
 
+find_package(Boost REQUIRED COMPONENTS system)
+
+# The FIX input transport: the session core plus Asio sockets, as an
+# InputTransport the generic chassis can serve (specification.md §8.10).
+add_library(sequencer_fix_input STATIC
+  input/src/fix_input_transport.cpp
+)
+add_library(sequencer::fix_input ALIAS sequencer_fix_input)
+
+target_include_directories(sequencer_fix_input PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/input/include>"
+)
+target_link_libraries(sequencer_fix_input
+  PUBLIC
+    sequencer::fix_session
+    sequencer::gateway_input
+  PRIVATE
+    Boost::system
+)
+target_compile_features(sequencer_fix_input PUBLIC cxx_std_20)
+
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
