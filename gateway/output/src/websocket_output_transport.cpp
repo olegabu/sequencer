@@ -1,5 +1,7 @@
 #include <sequencer/websocket_output_transport.hpp>
 
+#include "output_batch_metrics.hpp"
+
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
@@ -218,6 +220,7 @@ struct WebSocketOutputTransport::Impl {
         if (ec) {
           return;  // client gone (or stop() closed the socket under us)
         }
+        gateway::output::detail::websocketBatchMetrics().recordBatch(gathered);
         idle.reset();
       }
       if (overrun) {

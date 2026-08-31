@@ -1,5 +1,7 @@
 #include <sequencer/grpc_output_transport.hpp>
 
+#include "output_batch_metrics.hpp"
+
 #include <sequencer/output_codec.hpp>
 
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
@@ -90,6 +92,7 @@ class GenericOutputServiceImpl final : public gateway::output::grpc_proto::Gener
         if (!writer->Write(batch)) {
           break;  // client gone
         }
+        gateway::output::detail::grpcBatchMetrics().recordBatch(batch.payloads_size());
         idle.reset();
       }
       if (overrun) {

@@ -403,6 +403,33 @@ cases as the WebSocket table above (`BroadcastDeliversToConnectedClient`,
 are held to the same bar since they implement the same
 `OutputTransport` contract.
 
+## Watching the batching
+
+All three transports batch identically -- each subscriber's reader
+drains `[cursor, head)` up to 1024 entries and sends the result as one
+wire operation -- but only gRPC's batching is visible from outside,
+because it is declared in that transport's wire schema as a repeated
+field. brpc and WebSocket batch inside length-prefixed framing, where a
+subscriber cannot tell one frame of four records from four frames of
+one.
+
+So each publishes its own bvars, on the gateway's brpc `/vars` page:
+
+| bvar | says |
+|---|---|
+| `output_batch_size_{brpc,grpc,websocket}` | windowed average records per wire write |
+| `output_wire_writes_{brpc,grpc,websocket}` | the count batching is meant to reduce |
+| `output_records_sent_{brpc,grpc,websocket}` | the count it must preserve |
+
+`records_sent / wire_writes` is the realised batch factor. One set per
+transport, because `examples/counter`'s combined output gateway runs
+all three in one process and bvar names are process-global.
+
+These cost 35.7 ns per wire write (measured), against the ~1-10 us of
+the write itself -- 0.09% of one core at 100k records/s -- and nothing
+on the idle path: a caught-up reader sends nothing and so records
+nothing.
+
 ## Seeing it in action
 
 `examples/counter`'s `counter_output_gateway` is a real, runnable

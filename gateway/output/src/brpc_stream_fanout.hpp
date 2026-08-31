@@ -38,6 +38,8 @@
 #include <sequencer/broadcast_ring.hpp>
 #include <sequencer/output_codec.hpp>
 
+#include "output_batch_metrics.hpp"
+
 namespace sequencer::gateway::output::detail {
 
 class BrpcStreamFanout : public brpc::StreamInputHandler {
@@ -183,6 +185,7 @@ class BrpcStreamFanout : public brpc::StreamInputHandler {
       }
       if (!batch.empty()) {
         write(streamId, batch);
+        brpcBatchMetrics().recordBatch(gathered);
         idle.reset();
       }
       if (overrun) {
