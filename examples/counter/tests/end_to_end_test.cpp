@@ -1,7 +1,7 @@
 // specification.md §15 item 6: "an end-to-end test submitting through
 // an input gateway and observing through an output gateway." Four real
 // processes — counter_node, counter_input_gateway, and
-// counter_websocket_output_gateway, the actual compiled binaries, not stand-ins —
+// counter_output_gateway, the actual compiled binaries, not stand-ins —
 // plus a real WebSocket client, proving the entire pipeline described
 // in specification.md §3's topology diagram end to end:
 //
@@ -162,9 +162,10 @@ TEST(CounterEndToEnd, SubmitThroughInputGatewayIsObservedThroughOutputGateway) {
 
   ChildProcess inputGateway(COUNTER_INPUT_GATEWAY_MAIN_PATH,
                              {"--node_peers=127.0.0.1:28981", "--listen_port=28982"});
-  ChildProcess outputGateway(COUNTER_WEBSOCKET_OUTPUT_GATEWAY_MAIN_PATH,
+  ChildProcess outputGateway(COUNTER_OUTPUT_GATEWAY_MAIN_PATH,
                               {"--data_dir=" + nodeDataDir.string(),
-                               "--resume_file=" + resumeFile.string(), "--listen_port=28983"});
+                               "--resume_file=" + resumeFile.string(),
+                               "--websocket_port=28983"});
 
   // Connect the WebSocket observer before submitting anything — the
   // output gateway's Fanout delivers live only (see

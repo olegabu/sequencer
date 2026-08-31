@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 NODE_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_node"
 IG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_input_gateway"
-OG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_websocket_output_gateway"
+OG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_output_gateway"
 
 for bin in "$NODE_BIN" "$IG_BIN" "$OG_BIN"; do
   if [[ ! -x "$bin" ]]; then
@@ -88,7 +88,7 @@ echo "== starting the input gateway (curl target: http://127.0.0.1:$IG_PORT) =="
 IG_PID=$!
 
 echo "== starting the output gateway (websocat target: ws://127.0.0.1:$OG_PORT/totals) =="
-"$OG_BIN" --data_dir="$DATA_DIR" --resume_file="$RESUME_FILE" --listen_port="$OG_PORT" \
+"$OG_BIN" --data_dir="$DATA_DIR" --resume_file="$RESUME_FILE" --websocket_port="$OG_PORT" \
   --logtostderr --logbufsecs=0 >"$DATA_DIR/output_gateway.log" 2>&1 &
 OG_PID=$!
 

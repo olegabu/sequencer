@@ -60,29 +60,23 @@ set_target_properties(counter_input_gateway_main PROPERTIES OUTPUT_NAME counter_
 # component's CMakeLists.txt and README.md's "Topic routing" note for
 # why nothing here was actually counter-specific.
 #
-# Named for its flavor (websocket_), like the brpc and gRPC ones below:
-# this used to be the unmarked `output_gateway_main.cpp` /
-# `counter_output_gateway` purely because it was the first flavor to
-# exist, which left the one binary whose transport was hardest to guess
-# from its name as the one that didn't say.
-add_executable(counter_websocket_output_gateway_main websocket_output_gateway_main.cpp)
-target_link_libraries(counter_websocket_output_gateway_main PRIVATE counter::output_codec sequencer::gateway_output_websocket sequencer::gateway_output gflags::gflags_static)
-set_target_properties(counter_websocket_output_gateway_main PROPERTIES OUTPUT_NAME counter_websocket_output_gateway)
-
-# The brpc flavor: the chassis's own built-in transport
-# (BrpcOutputTransport), needing no override and so no extra transport
-# library beyond the base sequencer::gateway_output — see
-# brpc_output_gateway_main.cpp's own file comment.
-add_executable(counter_brpc_output_gateway_main brpc_output_gateway_main.cpp)
-target_link_libraries(counter_brpc_output_gateway_main PRIVATE counter::output_codec sequencer::gateway_output gflags::gflags_static)
-set_target_properties(counter_brpc_output_gateway_main PROPERTIES OUTPUT_NAME counter_brpc_output_gateway)
-
-# The combined flavor: one process serving any subset of the three
-# transports, each on its own port (output_gateway_main.cpp's own file
-# comment for why that is strictly less work than running the
-# single-transport binaries side by side). Links all three transport
-# libraries, which is exactly what the separate library targets in
-# gateway/output/ exist to make optional for applications that don't.
+# ONE output gateway binary, serving any subset of the three transports,
+# each on its own port and each enabled by its own --*_port flag
+# (output_gateway_main.cpp's file comment).
+#
+# There were once three more beside it, one per transport. They were
+# deleted: each was ~37 lines differing only in which transport it
+# constructed, so every chassis change had to be made four times, and
+# the combined binary already demonstrates all three. What they bought
+# was a slimmer link -- the WebSocket-only binary was 8.0 MB against
+# this one's 24.1 MB, since this links brpc AND gRPC AND Beast -- which
+# is a real saving for a deployment but not the job of an example.
+#
+# An application that wants exactly one transport still gets that
+# slimmer link: link only the transport library it needs (the separate
+# targets in gateway/output/ exist for this) and construct that one
+# transport, which is what each deleted main did. This example does not
+# need to show three copies of it.
 add_executable(counter_output_gateway_main output_gateway_main.cpp)
 target_link_libraries(counter_output_gateway_main PRIVATE counter::output_codec
                                                             sequencer::gateway_output
@@ -116,9 +110,6 @@ set_property(TARGET gRPC::grpc++ APPEND PROPERTY
 # (gateway/output/) with the existing CounterOutputCodec, unchanged —
 # "just like" the WebSocket output gateway above. No counter-specific
 # proto or codegen needed for this half.
-add_executable(counter_grpc_output_gateway_main grpc_output_gateway_main.cpp)
-target_link_libraries(counter_grpc_output_gateway_main PRIVATE counter::output_codec sequencer::gateway_output_grpc sequencer::gateway_output gflags::gflags_static)
-set_target_properties(counter_grpc_output_gateway_main PROPERTIES OUTPUT_NAME counter_grpc_output_gateway)
 
 # Input: a fully-typed, counter-specific gRPC service (its own proto),
 # not a retrofit of the byte-opaque RunInputGateway chassis — see

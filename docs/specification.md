@@ -1456,7 +1456,7 @@ examples/counter/
 ├── counter_output_codec.{hpp,cpp}
 ├── node_main.cpp             # sequencer::RunNode(...)
 ├── input_gateway_main.cpp    # sequencer::RunInputGateway(...) — brpc/REST/gRPC
-├── websocket_output_gateway_main.cpp  # sequencer::RunOutputGateway(...) — WebSocket
+├── output_gateway_main.cpp     # sequencer::RunOutputGateway(...) — brpc, gRPC, WebSocket
 │                              #   via Boost.Beast (§8.7); brpc has no native
 │                              #   WebSocket support, so this is the one place
 │                              #   the example depends on something beyond brpc

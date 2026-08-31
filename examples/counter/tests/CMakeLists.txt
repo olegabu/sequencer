@@ -40,7 +40,7 @@ target_link_libraries(counter_end_to_end_test PRIVATE sequencer::gateway_input B
 target_compile_definitions(counter_end_to_end_test PRIVATE
   COUNTER_NODE_MAIN_PATH="$<TARGET_FILE:counter_node_main>"
   COUNTER_INPUT_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_input_gateway_main>"
-  COUNTER_WEBSOCKET_OUTPUT_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_websocket_output_gateway_main>"
+  COUNTER_OUTPUT_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_output_gateway_main>"
 )
-add_dependencies(counter_end_to_end_test counter_node_main counter_input_gateway_main counter_websocket_output_gateway_main)
+add_dependencies(counter_end_to_end_test counter_node_main counter_input_gateway_main counter_output_gateway_main)
 gtest_discover_tests(counter_end_to_end_test PROPERTIES TIMEOUT 60)

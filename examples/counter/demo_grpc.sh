@@ -30,7 +30,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 NODE_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_node"
 IG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_grpc_input_gateway"
-OG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_grpc_output_gateway"
+OG_BIN="$REPO_ROOT/$BUILD_DIR/examples/counter/counter_output_gateway"
 
 for bin in "$NODE_BIN" "$IG_BIN" "$OG_BIN"; do
   if [[ ! -x "$bin" ]]; then
@@ -93,7 +93,7 @@ echo "== starting the gRPC input gateway (grpcurl target: 127.0.0.1:$IG_PORT seq
 IG_PID=$!
 
 echo "== starting the gRPC output gateway (grpcurl target: 127.0.0.1:$OG_PORT sequencer.gateway.output.grpc_proto.GenericOutputService/Subscribe) =="
-"$OG_BIN" --data_dir="$DATA_DIR" --resume_file="$RESUME_FILE" --listen_port="$OG_PORT" \
+"$OG_BIN" --data_dir="$DATA_DIR" --resume_file="$RESUME_FILE" --grpc_port="$OG_PORT" \
   --logtostderr --logbufsecs=0 >"$DATA_DIR/output_gateway.log" 2>&1 &
 OG_PID=$!
 
@@ -126,8 +126,8 @@ wait "$GRPCURL_PID" 2>/dev/null || true
 GRPCURL_PID=""
 
 echo
-echo "== raw grpcurl output (OutputRecord.payload is base64 — protobuf's own JSON mapping for a"
-echo "   \"bytes\" field, not something specific to this transport) =="
+echo "== raw grpcurl output (each OutputRecordBatch.payloads entry is base64 — protobuf's own"
+echo "   JSON mapping for a \"bytes\" field, not something specific to this transport) =="
 cat "$DATA_DIR/grpc_output.log"
 
 echo
@@ -148,14 +148,37 @@ for chunk in text.split("}\n{"):
     chunk = chunk if chunk.startswith("{") else "{" + chunk
     chunk = chunk if chunk.endswith("}") else chunk + "}"
     obj = json.loads(chunk)
-    payload = base64.b64decode(obj["payload"])
-    print(payload.decode("utf-8"))
-    count += 1
+    # One OutputRecordBatch carries a repeated "payloads" field, so a
+    # single message may hold several records -- how many depends on
+    # what the reader found available in the ring, not on anything the
+    # subscriber controls (see gateway/output/README.md's batching
+    # note). Older single-record "payload" is accepted too.
+    payloads = obj.get("payloads")
+    if payloads is None:
+        payloads = [obj["payload"]] if "payload" in obj else []
+    for encoded in payloads:
+        print(base64.b64decode(encoded).decode("utf-8"))
+        count += 1
 print(f"\n{count} record(s) decoded", file=sys.stderr)
 PYEOF
 
 expected=${#DELTAS[@]}
-actual=$(grep -c '"payload"' "$DATA_DIR/grpc_output.log" || true)
+# Counts RECORDS, not messages: grep -c would count batches, and one
+# batch can carry several records.
+actual=$(python3 -c '
+import base64, json, sys
+text = open(sys.argv[1]).read()
+n = 0
+for chunk in text.split("}\n{"):
+    chunk = chunk.strip()
+    if not chunk:
+        continue
+    chunk = chunk if chunk.startswith("{") else "{" + chunk
+    chunk = chunk if chunk.endswith("}") else chunk + "}"
+    obj = json.loads(chunk)
+    n += len(obj.get("payloads", [obj["payload"]] if "payload" in obj else []))
+print(n)
+' "$DATA_DIR/grpc_output.log" 2>/dev/null || echo 0)
 echo
 if [[ "$actual" -eq "$expected" ]]; then
   echo "OK: received $actual/$expected records over gRPC, matching the grpcurl submissions above."

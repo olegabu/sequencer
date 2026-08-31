@@ -405,12 +405,14 @@ are held to the same bar since they implement the same
 
 ## Seeing it in action
 
-`examples/counter`'s `counter_websocket_output_gateway` is a real, runnable
-`RunOutputGateway` using `WebSocketOutputTransport` — see
+`examples/counter`'s `counter_output_gateway` is a real, runnable
+`RunOutputGateway`; `--websocket_port` selects `WebSocketOutputTransport` — see
 [examples/counter/README.md](../../examples/counter/README.md) for
 flags and a full worked example alongside its input gateway
 counterpart, or `examples/counter/demo.sh` for a live walkthrough
-driven entirely by `curl` and `websocat`. `counter_grpc_output_gateway`
-is the same codec, same journal, wired to `GrpcOutputTransport`
-instead — see `examples/counter/demo_grpc.sh` for the `grpcurl`
-counterpart to `demo.sh`.
+driven entirely by `curl` and `websocat`. The same binary with
+`--grpc_port` is the same codec and same journal wired to
+`GrpcOutputTransport` instead — see `examples/counter/demo_grpc.sh` for
+the `grpcurl` counterpart to `demo.sh` — and `--brpc_port` selects the
+built-in `BrpcOutputTransport`. Setting several serves them all at
+once from one journal tail.
