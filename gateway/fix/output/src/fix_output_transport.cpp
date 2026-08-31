@@ -29,14 +29,14 @@ class CapturingFanout final : public sequencer::Fanout {
 // Serves a ResendRequest for one session by re-reading the journal.
 class JournalResendSource final : public ResendSource {
  public:
-  JournalResendSource(FixOutputTransport& transport, std::uint64_t sessionId,
+  JournalResendSource(FixOutputTransport& transport, std::string sessionKey,
                        sequencer::journal::JournalReader& reader, sequencer::OutputCodec& codec)
-      : transport_(transport), sessionId_(sessionId), reader_(reader), codec_(codec) {}
+      : transport_(transport), sessionKey_(std::move(sessionKey)), reader_(reader), codec_(codec) {}
 
   bool resend(std::uint64_t begin, std::uint64_t end, const Emit& emit) override {
     bool servedAny = false;
     for (std::uint64_t seqNum = begin; seqNum <= end; ++seqNum) {
-      const SentRecord* record = transport_.sentRecord(sessionId_, seqNum);
+      const SentRecord* record = transport_.sentRecord(sessionKey_, seqNum);
       if (record == nullptr || record->journalSequenceNumber == 0) {
         // Nothing was sent at this outbound number, or it was an
         // administrative message -- neither is resent, and the session
@@ -78,7 +78,9 @@ class JournalResendSource final : public ResendSource {
 
  private:
   FixOutputTransport& transport_;
-  std::uint64_t sessionId_;
+  // The CompID pair, which survives a reconnect -- see
+  // FixOutputTransport::sentRecord().
+  std::string sessionKey_;
   sequencer::journal::JournalReader& reader_;
   sequencer::OutputCodec& codec_;
 };
@@ -107,7 +109,7 @@ struct FixOutputTransport::Impl {
   // an outbound message store -- a ResendRequest re-reads the journal
   // at these positions rather than replaying a saved copy.
   mutable std::mutex sentMutex;
-  std::unordered_map<std::uint64_t, std::map<std::uint64_t, SentRecord>> sent;
+  std::unordered_map<std::string, std::map<std::uint64_t, SentRecord>> sent;
 
   // Set by attachJournal(): what a resend re-reads.
   std::unique_ptr<sequencer::journal::JournalReader> journal;
@@ -115,9 +117,10 @@ struct FixOutputTransport::Impl {
   std::vector<std::unique_ptr<JournalResendSource>> resendSources;
   std::mutex resendMutex;
 
-  void recordSent(std::uint64_t sessionId, std::uint64_t seqNum, const SentRecord& record) {
+  void recordSent(const std::string& sessionKey, std::uint64_t seqNum,
+                   const SentRecord& record) {
     std::lock_guard<std::mutex> lock(sentMutex);
-    sent[sessionId][seqNum] = record;
+    sent[sessionKey][seqNum] = record;
   }
 
   std::set<std::uint64_t> subscribersOf(const std::string& topic) {
@@ -166,7 +169,8 @@ struct FixOutputTransport::Impl {
     record.journalSequenceNumber = origin.journalSequenceNumber;
     record.outputIndex = origin.outputIndex;
     record.msgType = std::string(msgType);
-    recordSent(sessionId, outboundSeqNum, record);
+    // Keyed by the session's FIX identity, so a reconnect finds it.
+    recordSent(session->sessionKey(), outboundSeqNum, record);
   }
 };
 
@@ -191,12 +195,15 @@ void FixOutputTransport::attachJournal(const std::filesystem::path& dataDir,
   // Install a ResendSource on each session AS IT LOGS ON, not lazily on
   // first delivery: a ResendRequest is commonly the first thing a
   // reconnecting client sends, so it must already be servable.
-  impl_->sessions.setSessionReadyFn([this](std::uint64_t sessionId, FixSession& session) {
+  impl_->sessions.setSessionReadyFn([this](std::uint64_t /*sessionId*/, FixSession& session) {
     if (impl_->journal == nullptr || impl_->codec == nullptr) {
       return;
     }
-    auto source = std::make_unique<JournalResendSource>(*this, sessionId, *impl_->journal,
-                                                         *impl_->codec);
+    // The session's own key, captured now that Logon has adopted the
+    // peer's identity -- which is why this runs on session-ready and not
+    // at accept time.
+    auto source = std::make_unique<JournalResendSource>(*this, session.sessionKey(),
+                                                         *impl_->journal, *impl_->codec);
     session.setResendSource(source.get());
     std::lock_guard<std::mutex> lock(impl_->resendMutex);
     impl_->resendSources.push_back(std::move(source));
@@ -280,10 +287,10 @@ void FixOutputTransport::stop() {
   }
 }
 
-const SentRecord* FixOutputTransport::sentRecord(std::uint64_t sessionId,
+const SentRecord* FixOutputTransport::sentRecord(const std::string& sessionKey,
                                                   std::uint64_t outboundSeqNum) const {
   std::lock_guard<std::mutex> lock(impl_->sentMutex);
-  const auto session = impl_->sent.find(sessionId);
+  const auto session = impl_->sent.find(sessionKey);
   if (session == impl_->sent.end()) {
     return nullptr;
   }
@@ -291,9 +298,9 @@ const SentRecord* FixOutputTransport::sentRecord(std::uint64_t sessionId,
   return record == session->second.end() ? nullptr : &record->second;
 }
 
-std::size_t FixOutputTransport::sentRecordCount(std::uint64_t sessionId) const {
+std::size_t FixOutputTransport::sentRecordCount(const std::string& sessionKey) const {
   std::lock_guard<std::mutex> lock(impl_->sentMutex);
-  const auto session = impl_->sent.find(sessionId);
+  const auto session = impl_->sent.find(sessionKey);
   return session == impl_->sent.end() ? 0 : session->second.size();
 }
 

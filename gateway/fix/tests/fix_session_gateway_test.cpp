@@ -151,14 +151,15 @@ class FixOutputCodec : public sequencer::OutputCodec {
 
 class TestClient {
  public:
-  TestClient(int port, std::string compId) : socket_(ioContext_) {
+  TestClient(int port, std::string compId, SequenceStore* sharedStore = nullptr)
+      : socket_(ioContext_) {
     tcp::resolver resolver(ioContext_);
     net::connect(socket_, resolver.resolve("127.0.0.1", std::to_string(port)));
     SessionConfig config;
     config.role = Role::Initiator;
     config.senderCompId = std::move(compId);
     config.targetCompId = "SEQUENCER";
-    session_ = std::make_unique<FixSession>(config, store_, [] {
+    session_ = std::make_unique<FixSession>(config, sharedStore ? *sharedStore : store_, [] {
       return static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -323,24 +324,42 @@ TEST(FixSessionGateway, ExecutionReportsArriveFromTheJournalInOrderNeverSynchron
 // without the journal position travelling with each entry, the gateway
 // could not know which record produced a given sent message, and the
 // only correct answer to a resend would be a gap fill.
-// DISABLED, with the reason stated rather than the test quietly
-// deleted. Everything up to the last step works and is verified: the
-// reconnecting client is admitted, detects the gap, and asks; the
-// gateway's ResendSource is consulted, finds the journal position, and
-// would re-read and re-run the codec.
+// specification.md §8.12 reason 1, end to end: a client drops, comes
+// back with fresh counters, detects the gap against the gateway's
+// persisted outbound number, and is caught up FROM THE JOURNAL -- the
+// record re-read and the codec re-run, with no outbound message store
+// anywhere.
 //
-// What is missing is the RE-KEYING. The (session, outbound seqNum) ->
-// journal position map is keyed by the per-connection routing id, which
-// is new on every reconnect -- so the positions recorded for the old
-// connection are invisible to the new one, and the resend correctly
-// degrades to a gap fill. Fixing it means what
-// 03-instruction-fix-gateway.md step 2.5 actually asks for: keep the
-// map per FIX IDENTITY (the CompID pair, which survives the socket),
-// and reconstruct it on restart by re-reading the journal from the
-// session's last persisted position. That is a piece of work, not an
-// oversight to patch here.
+// This is what the RecordOrigin on BroadcastRing and the identity-keyed
+// sent map exist for. Keyed by connection instead, the returning
+// session could not see its own history and the resend degraded to a
+// gap fill exactly when it mattered most.
+// DISABLED, with the reason stated precisely rather than the test
+// deleted. The identity re-keying this needed IS done -- the sent map
+// is keyed by CompID pair now, so a returning session sees its own
+// history -- and that was necessary. It is not sufficient.
 //
-// Re-enable by removing the DISABLED_ prefix once that lands.
+// What is missing is CATCH-UP ON RECONNECT, which is a different
+// mechanism from ResendRequest and the rest of what step 2.5 asks for:
+// "reconstruct it on restart by re-reading the journal via the relay
+// from the session's last persisted position".
+//
+// The gap this test kept running into: an output addressed to a session
+// that is currently disconnected is dropped by deliver(), so the
+// gateway's outbound sequence number never advances for it. A client
+// that was away therefore has NO gap to detect when it returns -- from
+// the session layer's point of view nothing was ever sent to it -- and
+// ResendRequest, which only ever replays numbers the gateway did send,
+// correctly has nothing to offer. Catching such a client up means
+// re-reading the journal from its last persisted position and sending
+// what it missed as NEW messages, not as resends.
+//
+// ResendRequest itself works and is covered by fix_session_test.cpp's
+// direct tests: the source is consulted, finds the journal position,
+// re-reads the record, re-runs the codec, and emits with PossDupFlag
+// and the original SendingTime.
+//
+// Re-enable once reconnect catch-up lands.
 TEST(FixSessionGateway, DISABLED_AResendRequestIsServedFromTheJournal) {
   const std::filesystem::path dir = makeTempDir();
 
@@ -371,47 +390,43 @@ TEST(FixSessionGateway, DISABLED_AResendRequestIsServedFromTheJournal) {
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
 
-  std::string original;
+  // The client keeps its own counters across the drop, as a real client
+  // does -- reconnecting with FRESH counters is a sequence-too-low
+  // condition that FIX treats as fatal, and would test nothing about
+  // resends.
+  class SharedStore : public SequenceStore {
+   public:
+    SequenceNumbers load(const std::string& k) override { return n_[k]; }
+    void store(const std::string& k, const SequenceNumbers& v) override { n_[k] = v; }
+    std::map<std::string, SequenceNumbers> n_;
+  } clientStore;
 
   {
-    // A client places an order and receives its report, then drops.
-    TestClient client(29612, "ACME");
+    // The client submits an order and drops IMMEDIATELY, before the
+    // execution report can reach it. The gateway commits the order and
+    // sends the report to a socket that is already gone, advancing its
+    // own outbound counter -- so the client is genuinely behind when it
+    // returns. That is the situation a resend exists for.
+    TestClient client(29612, "ACME", &clientStore);
     client.logon();
     ASSERT_TRUE(client.isLoggedOn());
     client.order(4);
-    client.pumpFor(std::chrono::milliseconds(800), [&] { return client.received().size() >= 1; });
-    ASSERT_GE(client.received().size(), 1u);
-    original = client.received()[0];
   }
 
-  // Wait for the gateway to observe the drop and release the identity:
-  // a reconnect claiming a still-live CompID pair is refused, by
-  // design. A fixed sleep here was too short and made this test look
-  // like a resend failure when it was a teardown race.
+  // Let the gateway commit and attempt delivery to the dead session.
   std::this_thread::sleep_for(std::chrono::seconds(2));
 
   {
-    // It reconnects with FRESH counters -- a restarted client, which is
-    // the case a resend exists for. The gateway's own outbound counter
-    // persisted across the drop, so its Logon echo carries a sequence
-    // number ahead of what this client expects; the client detects the
-    // gap itself and asks for the range, and the gateway serves it by
-    // re-reading the JOURNAL.
-    //
-    // An earlier version of this test asked for a resend of messages
-    // the client had ALREADY received. FIX correctly ignores that -- a
-    // PossDup below the expected sequence number is a duplicate of
-    // something already processed -- so it asserted behaviour the
-    // protocol forbids rather than the behaviour §8.12 promises.
-    TestClient client(29612, "ACME");
+    TestClient client(29612, "ACME", &clientStore);
     client.logon();
-    client.pumpFor(std::chrono::milliseconds(1500), [&] { return !client.received().empty(); });
+    // Its Logon carries the sequence number it left off at, so the
+    // gateway accepts it; the gateway's echo is ahead of what the
+    // client expects, so the client asks for the range and is caught up
+    // FROM THE JOURNAL.
+    client.pumpFor(std::chrono::milliseconds(2000), [&] { return !client.received().empty(); });
 
     ASSERT_FALSE(client.received().empty())
         << "the reconnecting client must be caught up from the journal";
-    EXPECT_EQ(client.received().back(), original)
-        << "a resend must reproduce the original bytes -- same record, same codec, "
-            "and no outbound message store anywhere";
     EXPECT_TRUE(client.sawPossDup()) << "FIX 4.4 requires a resent message carry PossDupFlag";
   }
 

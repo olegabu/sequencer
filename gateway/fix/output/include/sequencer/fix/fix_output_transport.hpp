@@ -77,12 +77,19 @@ class FixOutputTransport : public sequencer::OutputTransport {
   // `codec` must outlive this transport; the session gateway owns it.
   void attachJournal(const std::filesystem::path& dataDir, sequencer::OutputCodec& codec);
 
-  // The (session, outbound MsgSeqNum) -> journal position mapping that
-  // ResendRequest handling needs. Kept in memory per live session and
-  // reconstructed on restart by re-reading the journal from the
-  // session's last persisted position -- there is no message store.
-  const SentRecord* sentRecord(std::uint64_t sessionId, std::uint64_t outboundSeqNum) const;
-  std::size_t sentRecordCount(std::uint64_t sessionId) const;
+  // The (FIX session, outbound MsgSeqNum) -> journal position mapping
+  // that ResendRequest handling needs. There is no message store: a
+  // resend re-reads the record named here.
+  //
+  // Keyed by SESSION KEY -- the CompID pair -- not by the connection's
+  // routing id. That distinction is the whole point: a routing id is
+  // new on every reconnect, so positions recorded before a drop would
+  // be invisible to the session that comes back, and a resend would
+  // degrade to a gap fill exactly when it is most needed. The CompID
+  // pair survives the socket, as the sequence counters keyed by it do.
+  const SentRecord* sentRecord(const std::string& sessionKey,
+                                std::uint64_t outboundSeqNum) const;
+  std::size_t sentRecordCount(const std::string& sessionKey) const;
 
   struct Impl;
 

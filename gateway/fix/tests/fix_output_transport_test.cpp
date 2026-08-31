@@ -241,11 +241,13 @@ TEST(FixOutputTransport, SentMessagesAreRecordedForResend) {
   // ResendRequest consults. specification.md §8.12 reason 1: there is
   // no outbound message store, so a resend re-reads the journal here --
   // which is what lets it survive a restart.
-  ASSERT_GE(gateway.output->sentRecordCount(sessionId), 1u);
+  // Keyed by FIX identity now, not the connection id.
+  const std::string sessionKey = "SEQUENCER->ACME";
+  ASSERT_GE(gateway.output->sentRecordCount(sessionKey), 1u);
   // Outbound 1 is the Logon echo; the application message follows it.
   const SentRecord* record = nullptr;
   for (std::uint64_t seq = 1; seq <= 4 && record == nullptr; ++seq) {
-    const SentRecord* candidate = gateway.output->sentRecord(sessionId, seq);
+    const SentRecord* candidate = gateway.output->sentRecord(sessionKey, seq);
     if (candidate != nullptr && candidate->journalSequenceNumber != 0) {
       record = candidate;
     }
