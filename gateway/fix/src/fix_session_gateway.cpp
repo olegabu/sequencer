@@ -97,4 +97,58 @@ int RunFixSessionGateway(SessionGatewayConfig config,
   return 0;
 }
 
+int RunFixMarketDataGateway(MarketDataGatewayConfig config,
+                             std::unique_ptr<sequencer::OutputCodec> outputCodec) {
+  gStopRequested.store(false, std::memory_order_relaxed);
+
+  // FixInputTransport is used here purely as a SESSION ACCEPTOR -- it
+  // is the component that accepts connections, runs Logon, heartbeats
+  // and sequence numbers, and hands sessions to the output side. What
+  // makes this the market-data shape is what is NOT built beside it:
+  // no InputGatewayImpl, no NodeProposer, no node endpoints. Nothing in
+  // this process can propose.
+  //
+  // Reusing it rather than growing a second acceptor inside
+  // FixOutputTransport keeps one implementation of the session-accept
+  // path, which is the same argument §8.12 makes for one session core
+  // across two roles.
+  FixInputConfig acceptorConfig;
+  acceptorConfig.senderCompId = config.senderCompId;
+  acceptorConfig.heartBtInt = config.heartBtInt;
+  acceptorConfig.sequenceStoreDir = config.sequenceStoreDir.string();
+  FixInputTransport acceptor(acceptorConfig);
+
+  // Application messages are accepted and dropped. A MarketDataRequest
+  // has already been turned into a subscription by the transport before
+  // this runs (that is session-level routing, not application logic);
+  // anything else has no meaning to a gateway that cannot propose.
+  acceptor.attach([](std::shared_ptr<sequencer::RequestContext> request) { request->respond({}); },
+                   [](const sequencer::SessionInfo&) {});
+
+  sequencer::OutputCodec* codecForResends = outputCodec.get();
+  auto ownedOutput = std::make_unique<FixOutputTransport>(acceptor);
+  FixOutputTransport* output = ownedOutput.get();
+
+  sequencer::gateway::output::detail::OutputGatewayConfig outputConfig;
+  outputConfig.dataDir = config.dataDir;
+  outputConfig.resumeFile = config.resumeFile;
+  sequencer::gateway::output::detail::OutputGatewayImpl outputGateway(
+      outputConfig, std::move(outputCodec),
+      std::unique_ptr<sequencer::OutputTransport>(std::move(ownedOutput)), 0);
+  output->attachJournal(config.dataDir, *codecForResends);
+
+  outputGateway.start();
+  acceptor.start(config.listenPort);
+
+  std::signal(SIGINT, handleStopSignal);
+  std::signal(SIGTERM, handleStopSignal);
+  while (!gStopRequested.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+
+  acceptor.stop();
+  outputGateway.stop();
+  return 0;
+}
+
 }  // namespace sequencer::fix

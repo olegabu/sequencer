@@ -61,4 +61,32 @@ int RunFixSessionGateway(SessionGatewayConfig config,
                           std::unique_ptr<sequencer::InputCodec> inputCodec,
                           std::unique_ptr<sequencer::OutputCodec> outputCodec);
 
+struct MarketDataGatewayConfig {
+  int listenPort = 0;
+  std::filesystem::path dataDir;
+  std::filesystem::path resumeFile;
+  std::string senderCompId = "SEQUENCER-MD";
+  int heartBtInt = 30;
+  std::filesystem::path sequenceStoreDir;
+};
+
+// The output-only shape (specification.md §8.12 "Shape"): a FIX gateway
+// that only ever sends, fed by Fanout::broadcast, with subscription by
+// the client's own MarketDataRequest.
+//
+// Note what it does NOT take: no node endpoints and no InputCodec. That
+// is a structural guarantee rather than a convention -- there is no
+// proposer anywhere in this configuration, so a market-data gateway
+// cannot submit to the raft group even if a client sends it something
+// that looks like an order. It can therefore be deployed where an
+// order-entry gateway should not be, and a compromise of it can submit
+// nothing.
+//
+// Recovery works exactly as it does for order entry: a market-data
+// session is a FIX session, so it drops, reconnects, and is caught up
+// from the journal and served ResendRequests from it. See
+// gateway/fix/README.md's "Recovery: three mechanisms".
+int RunFixMarketDataGateway(MarketDataGatewayConfig config,
+                             std::unique_ptr<sequencer::OutputCodec> outputCodec);
+
 }  // namespace sequencer::fix

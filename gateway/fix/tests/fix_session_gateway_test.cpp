@@ -217,6 +217,7 @@ class TestClient {
   }
   bool isLoggedOn() const { return session_->isLoggedOn(); }
   const std::vector<std::string>& received() const { return received_; }
+  FixSession& session() { return *session_; }
 
  private:
   class MemoryStore : public SequenceStore {
@@ -431,6 +432,84 @@ TEST(FixSessionGateway, AClientIsCaughtUpFromTheJournalAfterReconnecting) {
   std::raise(SIGTERM);
   gatewayThread.join();
   node.stop();
+  std::filesystem::remove_all(dir);
+}
+
+// The output-only shape (specification.md §8.12 "Shape"): market data,
+// with no raft group and no way to propose anything. A subscriber gets
+// a topic's broadcasts only after asking for them by MarketDataRequest.
+//
+// A codec that broadcasts rather than addressing a session -- the other
+// half of Fanout, and what a market-data feed uses.
+class BroadcastOutputCodec : public sequencer::OutputCodec {
+ public:
+  void toOutput(const sequencer::journal::RecordView& record, sequencer::Fanout& fanout) override {
+    for (std::size_t i = 0; i < record.outputCount(); ++i) {
+      const sequencer::Payload output = record.output(i);
+      const std::string text(reinterpret_cast<const char*>(output.data()), output.size());
+      const std::string body = "35=W\0015001=" + text + "\001";
+      fanout.broadcast("TOTALS", sequencer::Bytes(
+          reinterpret_cast<const std::byte*>(body.data()),
+          reinterpret_cast<const std::byte*>(body.data()) + body.size()));
+    }
+  }
+};
+
+TEST(FixMarketDataGateway, BroadcastsReachOnlySubscribersAndNothingCanBeProposed) {
+  const std::filesystem::path dir = makeTempDir();
+
+  // A journal with content, written by a node that then goes away --
+  // the market-data gateway only ever reads it.
+  {
+    node::detail::NodeConfig nodeConfig;
+    nodeConfig.groupId = "fix-md-test";
+    nodeConfig.peerId = "127.0.0.1:29621:0";
+    nodeConfig.initialPeers = nodeConfig.peerId;
+    nodeConfig.dataDir = dir;
+    nodeConfig.electionTimeoutMs = 300;
+    node::detail::NodeImpl node(nodeConfig, std::make_unique<MatchingStateMachine>());
+    node.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!node.isLeader() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(node.isLeader());
+    node.stop();
+  }
+
+  MarketDataGatewayConfig config;
+  config.listenPort = 29622;
+  config.dataDir = dir;
+  config.resumeFile = dir / "md-resume";
+  config.senderCompId = "SEQUENCER";
+  config.sequenceStoreDir = (dir / "md-seq").string();
+
+  std::thread gatewayThread(
+      [&] { RunFixMarketDataGateway(config, std::make_unique<BroadcastOutputCodec>()); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+
+  {
+    TestClient subscriber(29622, "ALPHA");
+    subscriber.logon();
+    TestClient bystander(29622, "BETA");
+    bystander.logon();
+    ASSERT_TRUE(subscriber.isLoggedOn()) << "the market-data gateway must accept FIX sessions";
+    ASSERT_TRUE(bystander.isLoggedOn());
+
+    // Only one of them asks.
+    subscriber.session().sendApplication("V", "262=req1\001146=1\00155=TOTALS\001");
+    subscriber.pumpFor(std::chrono::milliseconds(400));
+    bystander.pumpFor(std::chrono::milliseconds(200));
+
+    // Nothing is published while this gateway runs -- it cannot
+    // propose, which is the structural point of the shape -- so the
+    // assertion that matters is the negative one.
+    EXPECT_TRUE(bystander.received().empty())
+        << "a session that sent no MarketDataRequest must receive nothing";
+  }
+
+  std::raise(SIGTERM);
+  gatewayThread.join();
   std::filesystem::remove_all(dir);
 }
 
