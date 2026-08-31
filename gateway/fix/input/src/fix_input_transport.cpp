@@ -21,6 +21,27 @@ namespace {
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
+// Reads MsgType without allocating.
+bool msgTypeIs(const hffix::message_reader& message, std::string_view expected) {
+  const auto type = message.message_type();
+  if (type == message.end()) {
+    return false;
+  }
+  return std::string_view(type->value().begin(), type->value().size()) == expected;
+}
+
+// Every Symbol (tag 55) in a MarketDataRequest -- one request may name
+// several instruments, and each becomes a topic subscription.
+std::vector<std::string> symbolsOf(const hffix::message_reader& message) {
+  std::vector<std::string> symbols;
+  for (auto it = message.begin(); it != message.end(); ++it) {
+    if (it->tag() == 55) {
+      symbols.emplace_back(it->value().begin(), it->value().size());
+    }
+  }
+  return symbols;
+}
+
 std::uint64_t steadyMicros() {
   return static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
@@ -171,6 +192,10 @@ struct FixInputTransport::Impl {
 
   RequestFn onRequest;
   DisconnectFn onDisconnect;
+  // Set by the output side: a MarketDataRequest is a subscription, and
+  // the output half is what acts on it (§8.10's topic question,
+  // resolved FIX's own way).
+  std::function<void(std::uint64_t, const std::string&)> onSubscribe;
 
   net::io_context ioContext;
   std::unique_ptr<tcp::acceptor> acceptor;
@@ -237,11 +262,24 @@ struct FixInputTransport::Impl {
       this->write(*connection, frame);
     });
     connection->session->setAppMessageFn([this, connection](const hffix::message_reader& message) {
+      // One exception to "the transport never interprets an application
+      // message": MarketDataRequest (35=V) is a subscription, which is
+      // how §8.10's open topic question is resolved FIX's own way
+      // (§8.12 "Shape") -- a session that has requested a symbol
+      // receives that topic's broadcasts, one that has not receives
+      // nothing. It is still passed to the codec afterwards, since an
+      // application may want to see the request too.
+      if (msgTypeIs(message, "V") && this->onSubscribe) {
+        for (const std::string& symbol : symbolsOf(message)) {
+          this->onSubscribe(connection->sessionId, symbol);
+        }
+      }
+
       if (!this->onRequest) {
         return;
       }
-      // The transport never interprets an application message: it is
-      // handed to the codec exactly as it arrived (§8.10).
+      // Otherwise the transport hands the message to the codec exactly
+      // as it arrived, uninterpreted (§8.10).
       this->onRequest(std::make_shared<FixRequestContext>(
           std::string(message.message_begin(), message.message_size()), connection->sessionId));
     });
@@ -343,6 +381,20 @@ FixSession* FixInputTransport::sessionFor(std::uint64_t sessionId) {
   std::lock_guard<std::mutex> lock(impl_->connectionsMutex);
   const auto it = impl_->connections.find(sessionId);
   return it == impl_->connections.end() ? nullptr : it->second->session.get();
+}
+
+std::vector<std::uint64_t> FixInputTransport::liveSessions() {
+  std::lock_guard<std::mutex> lock(impl_->connectionsMutex);
+  std::vector<std::uint64_t> ids;
+  ids.reserve(impl_->connections.size());
+  for (const auto& [id, connection] : impl_->connections) {
+    ids.push_back(id);
+  }
+  return ids;
+}
+
+void FixInputTransport::setSubscribeFn(SessionSource::SubscribeFn fn) {
+  impl_->onSubscribe = std::move(fn);
 }
 
 void FixInputTransport::start(int listenPort) {

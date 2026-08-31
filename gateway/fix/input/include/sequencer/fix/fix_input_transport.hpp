@@ -27,8 +27,10 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <sequencer/fix/fix_session.hpp>
+#include <sequencer/fix/session_source.hpp>
 #include <sequencer/input_transport.hpp>
 
 namespace sequencer::fix {
@@ -55,7 +57,7 @@ struct FixInputConfig {
   std::string sequenceStoreDir;
 };
 
-class FixInputTransport : public sequencer::InputTransport {
+class FixInputTransport : public sequencer::InputTransport, public SessionSource {
  public:
   explicit FixInputTransport(FixInputConfig config);
   ~FixInputTransport() override;
@@ -77,11 +79,15 @@ class FixInputTransport : public sequencer::InputTransport {
   // business (§8.12).
   void setAuthenticator(Authenticator authenticator);
 
-  // Hands the output side the live session for `sessionId`, so a
-  // session gateway can deliver execution reports on the very session
-  // that submitted the order (§8.12 "Shape": one shared session core).
-  // Returns nullptr if that session is gone.
-  FixSession* sessionFor(std::uint64_t sessionId);
+  // --- SessionSource (gateway/fix/output/) ---
+  //
+  // Implemented here so an order-entry gateway shares ONE session core
+  // between its input and output halves: a client's execution reports
+  // arrive on the very session that submitted the order, which is FIX's
+  // convention and specification.md §8.12 "Shape"'s requirement.
+  FixSession* sessionFor(std::uint64_t sessionId) override;
+  std::vector<std::uint64_t> liveSessions() override;
+  void setSubscribeFn(SubscribeFn fn) override;
 
   struct Impl;
 

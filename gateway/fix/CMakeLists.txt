@@ -42,6 +42,23 @@ target_link_libraries(sequencer_fix_input
 )
 target_compile_features(sequencer_fix_input PUBLIC cxx_std_20)
 
+# The FIX output transport: delivery onto live FIX sessions, sharing a
+# session core with the input side in the order-entry shape.
+add_library(sequencer_fix_output STATIC
+  output/src/fix_output_transport.cpp
+)
+add_library(sequencer::fix_output ALIAS sequencer_fix_output)
+
+target_include_directories(sequencer_fix_output PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/output/include>"
+)
+target_link_libraries(sequencer_fix_output
+  PUBLIC
+    sequencer::fix_session
+    sequencer::gateway_output
+)
+target_compile_features(sequencer_fix_output PUBLIC cxx_std_20)
+
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
