@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -145,7 +146,12 @@ struct FixConnection {
 
   tcp::socket socket;
   std::unique_ptr<FixSession> session;
+  // Routing identity: which CONNECTION an output goes to. Distinct
+  // from the FIX session identity below, which is the CompID pair and
+  // survives reconnects -- conflating the two was the bug this pair of
+  // fields exists to keep fixed.
   std::uint64_t sessionId = 0;
+  std::string identityKey;
   // Serializes writes: the reader thread writes replies, and on a
   // session gateway the OUTPUT side writes execution reports on this
   // same session, from its own thread.
@@ -174,6 +180,8 @@ struct FixInputTransport::Impl {
   std::mutex connectionsMutex;
   std::map<std::uint64_t, std::shared_ptr<FixConnection>> connections;
   std::atomic<std::uint64_t> nextSessionId{1};
+  // CompID pairs currently held by a live connection.
+  std::set<std::string> liveIdentities;
   // Kept so stop() can join them. InputTransport::stop()'s contract is
   // that no callback can still fire once it returns, and a detached
   // reader thread cannot promise that -- it would still be holding
@@ -202,13 +210,29 @@ struct FixInputTransport::Impl {
     SessionConfig sessionConfig;
     sessionConfig.role = Role::Acceptor;
     sessionConfig.senderCompId = this->config.senderCompId;
-    sessionConfig.targetCompId =
-        this->config.targetCompId.empty() ? ("CLIENT" + std::to_string(sessionId))
-                                            : this->config.targetCompId;
+    // Left as configured -- EMPTY means "adopt from the Logon's
+    // SenderCompID", which is how a reconnecting client resumes its own
+    // session and its own sequence counters. Synthesizing a
+    // per-connection CompID here (an earlier version did) made every
+    // reconnect a brand-new session, which is exactly what a FIX client
+    // must not experience.
+    sessionConfig.targetCompId = this->config.targetCompId;
     sessionConfig.heartBtInt = this->config.heartBtInt;
     connection->session =
         std::make_unique<FixSession>(sessionConfig, this->sequences, steadyMicros);
     connection->session->setAuthenticator(this->authenticator);
+    // Refuse a second live connection for an identity already in use.
+    // Counters are keyed by CompID now, so two connections sharing one
+    // identity would interleave writers onto a single pair.
+    connection->session->setIdentityGuard([this, connection](const std::string& key) {
+      std::lock_guard<std::mutex> lock(this->connectionsMutex);
+      if (this->liveIdentities.count(key) != 0) {
+        return false;
+      }
+      this->liveIdentities.insert(key);
+      connection->identityKey = key;
+      return true;
+    });
     connection->session->setSendFn([this, connection](std::string_view frame) {
       this->write(*connection, frame);
     });

@@ -154,8 +154,19 @@ FixSession::FixSession(SessionConfig config, SequenceStore& sequences, ClockFn c
   // The key both sides of a session agree on, and what the sequence
   // store is keyed by. Direction matters: an acceptor's sender is the
   // initiator's target.
-  sessionKey_ = config_.senderCompId + "->" + config_.targetCompId;
-  sequences_ = sequences_store_.load(sessionKey_);
+  //
+  // An acceptor with no configured targetCompId does not yet know who
+  // is calling, so the key -- and therefore the counters -- cannot be
+  // resolved until its Logon arrives. Loading here anyway would key the
+  // counters on an empty peer name and hand every reconnecting client
+  // somebody else's sequence numbers, so it is deferred to
+  // adoptIdentity().
+  if (config_.role == Role::Acceptor && config_.targetCompId.empty()) {
+    identityPending_ = true;
+  } else {
+    sessionKey_ = config_.senderCompId + "->" + config_.targetCompId;
+    sequences_ = sequences_store_.load(sessionKey_);
+  }
   // Reserved once; the message path must not grow these (§8.12 reason 3).
   receive_.reserve(64 * 1024);
   buffer_.reserve(8 * 1024);
@@ -302,6 +313,21 @@ bool FixSession::checkSequence(const hffix::message_reader& message, char /*msgT
   return true;
 }
 
+// An acceptor learns who its peer is from the Logon's SenderCompID and
+// only then loads that session's persisted counters. This is what makes
+// a reconnect resume the SAME FIX session: the counters are keyed by
+// the CompID pair, which survives the socket, rather than by the
+// connection, which does not.
+void FixSession::adoptIdentity(const hffix::message_reader& message) {
+  const std::optional<std::string_view> peer = field(message, hffix::tag::SenderCompID);
+  if (peer.has_value() && !peer->empty()) {
+    config_.targetCompId.assign(peer->data(), peer->size());
+  }
+  sessionKey_ = config_.senderCompId + "->" + config_.targetCompId;
+  sequences_ = sequences_store_.load(sessionKey_);
+  identityPending_ = false;
+}
+
 void FixSession::handleLogon(const hffix::message_reader& message) {
   const std::optional<std::string_view> username = field(message, hffix::tag::Username);
   const std::optional<std::string_view> password = field(message, hffix::tag::Password);
@@ -309,6 +335,21 @@ void FixSession::handleLogon(const hffix::message_reader& message) {
                       password.value_or(std::string_view{}))) {
     sendLogout("authentication failed");
     disconnect(DisconnectReason::AuthenticationFailed);
+    return;
+  }
+
+  // Identity first: everything below reads or writes the counters, and
+  // until the peer is known those belong to no session in particular.
+  if (identityPending_) {
+    adoptIdentity(message);
+  }
+
+  // A second live connection claiming an identity that is already in
+  // use would interleave two writers onto one pair of counters. Refuse
+  // it rather than corrupt both.
+  if (identityGuard_ && !identityGuard_(sessionKey_)) {
+    sendLogout("session already connected");
+    disconnect(DisconnectReason::DuplicateIdentity);
     return;
   }
 

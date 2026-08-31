@@ -18,6 +18,8 @@
 #include <hffix_fields.hpp>
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -43,13 +45,13 @@ class MemorySequenceStore : public SequenceStore {
 // A real FIX client: a socket plus a FixSession in Initiator role.
 class TestClient {
  public:
-  explicit TestClient(int port) : socket_(ioContext_) {
+  explicit TestClient(int port, std::string compId = "CLIENT") : socket_(ioContext_) {
     tcp::resolver resolver(ioContext_);
     net::connect(socket_, resolver.resolve("127.0.0.1", std::to_string(port)));
 
     SessionConfig config;
     config.role = Role::Initiator;
-    config.senderCompId = "CLIENT";
+    config.senderCompId = compId;
     config.targetCompId = "SEQUENCER";
     config.heartBtInt = 30;
     // Each client claims a distinct CompID so the acceptor's synthetic
@@ -113,6 +115,30 @@ class TestClient {
   std::vector<std::string> received_;
 };
 
+// Reads back what the transport's own FileSequenceStore wrote, in the
+// same format, so a test can assert on persistence without reaching
+// into the transport.
+class FileSequenceStoreProbe {
+ public:
+  explicit FileSequenceStoreProbe(std::string directory) : directory_(std::move(directory)) {}
+
+  SequenceNumbers load(const std::string& sessionKey) const {
+    std::string safe = sessionKey;
+    for (char& c : safe) {
+      if (c == '/' || c == '>' || c == '-') {
+        c = '_';
+      }
+    }
+    std::ifstream in(std::filesystem::path(directory_) / (safe + ".seq"));
+    SequenceNumbers numbers;
+    in >> numbers.nextOutbound >> numbers.nextInbound;
+    return numbers;
+  }
+
+ private:
+  std::string directory_;
+};
+
 struct Harness {
   std::unique_ptr<FixInputTransport> transport;
   std::atomic<int> requests{0};
@@ -121,16 +147,12 @@ struct Harness {
   std::mutex bodiesMutex;
   std::vector<std::shared_ptr<sequencer::RequestContext>> contexts;
 
-  explicit Harness(int port) {
+  explicit Harness(int port, std::string storeDir = {}) {
     FixInputConfig config;
     config.senderCompId = "SEQUENCER";
-    // Left EMPTY on purpose: that gives each connection its own
-    // synthetic identity and therefore its own sequence counters. With
-    // a fixed targetCompId every connection is the SAME FIX session, so
-    // a second concurrent client is correctly rejected as a sequence
-    // violation -- which is what this originally did, and is worth
-    // knowing rather than working around silently. See FixInputConfig's
-    // comment on the identity limitation behind this.
+    config.sequenceStoreDir = std::move(storeDir);
+    // Left empty so each client's identity is adopted from its own
+    // Logon, which is how a real acceptor works.
     transport = std::make_unique<FixInputTransport>(config);
     transport->attach(
         [this](std::shared_ptr<sequencer::RequestContext> request) {
@@ -244,11 +266,63 @@ TEST(FixInputTransport, AnOrderlyLogoutIsReportedAsASessionLoss) {
   EXPECT_EQ(harness.disconnects.load(), 1);
 }
 
+// The reason identity is adopted from the Logon rather than synthesized
+// per connection: a client that drops and reconnects must resume ITS
+// OWN session, with its own sequence counters, not be handed a fresh
+// one. Counters are keyed by the CompID pair, which survives the
+// socket.
+TEST(FixInputTransport, AReconnectingClientResumesItsOwnSequenceNumbers) {
+  const std::string storeDir =
+      (std::filesystem::temp_directory_path() /
+       ("fix-seq-" + std::to_string(::getpid()))).string();
+  std::filesystem::remove_all(storeDir);
+  Harness harness(29407, storeDir);
+
+  {
+    TestClient client(29407, "ACME");
+    client.logon();
+    ASSERT_TRUE(client.isLoggedOn());
+    client.send("U1", "5001=1\001");
+    client.send("U1", "5001=2\001");
+    client.pumpFor(std::chrono::milliseconds(400),
+                    [&] { return harness.requests.load() >= 2; });
+    ASSERT_EQ(harness.requests.load(), 2);
+  }
+
+  // The gateway-side counters for ACME must have advanced and been
+  // persisted: Logon plus two application messages inbound.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (harness.disconnects.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  FileSequenceStoreProbe probe(storeDir);
+  const SequenceNumbers persisted = probe.load("SEQUENCER->ACME");
+  EXPECT_EQ(persisted.nextInbound, 4u)
+      << "Logon(1) + two application messages(2,3) leaves 4 expected next";
+  std::filesystem::remove_all(storeDir);
+}
+
+// Two live connections claiming one FIX identity would interleave
+// writers onto a single pair of counters. The second is refused.
+TEST(FixInputTransport, ASecondConnectionForALiveIdentityIsRefused) {
+  Harness harness(29408);
+  TestClient first(29408, "ACME");
+  first.logon();
+  ASSERT_TRUE(first.isLoggedOn());
+
+  TestClient second(29408, "ACME");
+  second.logon();
+  EXPECT_FALSE(second.isLoggedOn())
+      << "a duplicate live identity must be refused, not given the same counters";
+  EXPECT_TRUE(first.isLoggedOn()) << "the established session must be unaffected";
+}
+
 TEST(FixInputTransport, EachSessionGetsItsOwnIdentity) {
   Harness harness(29406);
-  TestClient first(29406);
+  TestClient first(29406, "ALPHA");
   first.logon();
-  TestClient second(29406);
+  TestClient second(29406, "BETA");
   second.logon();
   ASSERT_TRUE(first.isLoggedOn());
   ASSERT_TRUE(second.isLoggedOn());

@@ -39,22 +39,16 @@ struct FixInputConfig {
   std::string senderCompId = "SEQUENCER";
   std::string targetCompId;  // empty accepts whatever the client claims
   int heartBtInt = 30;
-  // LIMITATION, stated because it is easy to miss and expensive to
-  // discover: leaving targetCompId EMPTY gives each accepted
-  // connection a synthetic identity ("CLIENT<n>"), which is what makes
-  // several concurrent test clients work. Setting it makes every
-  // connection share one FIX session identity, and therefore one pair
-  // of sequence counters -- so a second concurrent connection is
-  // correctly rejected as a sequence violation.
+  // Leave EMPTY in production. An acceptor does not know who is calling
+  // until the Logon arrives, and an empty value makes the session adopt
+  // the peer's identity from the Logon's SenderCompID (tag 49). That is
+  // what lets a client reconnect to ITS OWN session: the sequence
+  // counters are keyed by the CompID pair, which survives the socket.
   //
-  // A real acceptor derives the identity from the Logon's own
-  // SenderCompID (tag 49) and looks the counters up by it, which is how
-  // a client reconnects to its own session after a drop. That is NOT
-  // implemented: the session core loads its counters at construction,
-  // before any Logon has been parsed, so learning the identity later
-  // means re-keying the store mid-session. It is the next thing to
-  // build here, and until it exists a deployment gets either one named
-  // session or n anonymous ones.
+  // Setting it pins every connection to one FIX identity, which is
+  // useful only for a single-client deployment or a test. A second
+  // concurrent connection claiming a live identity is refused either
+  // way -- two writers on one pair of counters would corrupt both.
   // Where the two per-session counters are persisted (§8.12: the only
   // session state that must survive a restart). Empty keeps them in
   // memory, which is correct only for tests.

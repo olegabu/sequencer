@@ -67,6 +67,7 @@ enum class DisconnectReason {
   MalformedFraming,
   SequenceTooLow,
   AuthenticationFailed,
+  DuplicateIdentity,  // another live connection already holds this CompID pair
   LocalShutdown,
 };
 
@@ -74,6 +75,15 @@ struct SessionConfig {
   Role role = Role::Acceptor;
   std::string beginString = "FIX.4.4";
   std::string senderCompId;
+  // For an ACCEPTOR this may be left empty: the peer's identity is not
+  // known until its Logon arrives, and the session adopts it from the
+  // Logon's SenderCompID (tag 49). That adoption is what lets a client
+  // reconnect to ITS OWN session -- the persisted sequence counters are
+  // keyed by the CompID pair, so a reconnecting client resumes where it
+  // left off instead of starting a fresh one.
+  //
+  // For an INITIATOR it is required: an initiator knows who it is
+  // calling.
   std::string targetCompId;
   // Negotiated at Logon: an acceptor echoes what the initiator asked
   // for (FIX 4.4 §Logon), an initiator proposes this value.
@@ -191,6 +201,17 @@ class FixSession {
   void logout(std::string_view text = {});
 
   bool isLoggedOn() const noexcept { return state_ == State::LoggedOn; }
+
+  // Called by an acceptor before completing a Logon, to refuse a second
+  // concurrent connection claiming an identity that is already live.
+  // Returning false makes the session reject the Logon and disconnect.
+  //
+  // This is the counterpart of identity adoption: once counters are
+  // keyed by CompID rather than by connection, two live connections
+  // sharing an identity would interleave writes onto one pair of
+  // counters and corrupt both.
+  using IdentityGuard = std::function<bool(const std::string& sessionKey)>;
+  void setIdentityGuard(IdentityGuard guard) { identityGuard_ = std::move(guard); }
   const SequenceNumbers& sequences() const noexcept { return sequences_; }
   const std::string& sessionKey() const noexcept { return sessionKey_; }
   DisconnectReason disconnectReason() const noexcept { return disconnectReason_; }
@@ -221,6 +242,7 @@ class FixSession {
   // --- message handling ---
   void handleMessage(const hffix::message_reader& message);
   bool checkSequence(const hffix::message_reader& message, char msgType);
+  void adoptIdentity(const hffix::message_reader& message);
   void handleLogon(const hffix::message_reader& message);
   void handleLogout(const hffix::message_reader& message);
   void handleTestRequest(const hffix::message_reader& message);
@@ -255,6 +277,7 @@ class FixSession {
   AppMessageFn onApp_;
   EventFn onEvent_;
   Authenticator authenticate_ = acceptAnyCredentials();
+  IdentityGuard identityGuard_;
   ResendSource* resendSource_ = nullptr;
 
   State state_ = State::Idle;
@@ -271,6 +294,9 @@ class FixSession {
 
   std::uint64_t lastReceivedUs_ = 0;
   std::uint64_t lastSentUs_ = 0;
+  // Acceptor with no configured peer: the counters cannot be loaded
+  // until the Logon names it. See adoptIdentity().
+  bool identityPending_ = false;
   bool testRequestOutstanding_ = false;
   std::uint64_t testRequestId_ = 0;
   // Set while replaying a ResendRequest, so emit() does not renumber.
