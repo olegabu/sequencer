@@ -59,6 +59,22 @@ target_link_libraries(sequencer_fix_output
 )
 target_compile_features(sequencer_fix_output PUBLIC cxx_std_20)
 
+# The order-entry session gateway: both halves over one session core.
+add_library(sequencer_fix_gateway STATIC
+  src/fix_session_gateway.cpp
+)
+add_library(sequencer::fix_gateway ALIAS sequencer_fix_gateway)
+
+target_include_directories(sequencer_fix_gateway PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(sequencer_fix_gateway
+  PUBLIC
+    sequencer::fix_input
+    sequencer::fix_output
+)
+target_compile_features(sequencer_fix_gateway PUBLIC cxx_std_20)
+
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
