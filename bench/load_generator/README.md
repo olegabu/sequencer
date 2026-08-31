@@ -218,3 +218,46 @@ bare-braft product with no gateway or relay tier at all:
    transport (`output_grpc_p50_us` / `output_brpc_p50_us` /
    `output_websocket_p50_us`), the same discipline `relay_p50_us`
    exists for.
+
+## The FIX sender, and the rig-not-the-bottleneck criterion
+
+`include/sequencer/bench/fix_requester.hpp` is a `LoadGeneratorRequester`
+over the same session core the gateway's acceptor runs, in `Initiator`
+role (specification.md §8.12). Replies are correlated by a private tag
+(5000), not by order, because a session gateway delivers outputs in
+journal order rather than request order.
+
+A rig has to outrun the system it measures, or its numbers describe
+itself. The criterion is **≥2× the highest rate the gateway is ever
+targeted at, with zero drops** — the sweeps target 100k, so the sender
+must clear 200k.
+
+**It does not, yet.** Measured on the development machine, release
+build, 2026-08-31:
+
+| offered | achieved | sent | completed | drops |
+|---|---|---|---|---|
+| 200,000/s | **72,727/s** | 222,620 | 222,620 | **0** |
+
+Zero drops is real: every message emitted was accounted for. The rate
+is not sufficient. At 72.7k/s a 100k sweep would be reporting the rig
+as much as the gateway, so **no FIX throughput number should be quoted
+until this moves.**
+
+The likely cause is the one this repository has now hit three times: one
+`write()` syscall per message, in both directions. The relay, output and
+input gateways each got their order of magnitude from coalescing writes,
+and the FIX path does none yet — `FixSession::sendApplication()` invokes
+its send callback once per message. That is the first thing to try.
+
+Reproduce with:
+
+```sh
+./build/release/gateway/fix/tests/fix_loadgen_loopback_test \
+  --gtest_also_run_disabled_tests
+```
+
+Loopback is deliberate and limited: it isolates the sender's own cost
+per message by removing the NIC and any cross-host RTT. It says nothing
+about gateway latency on real hardware and must not be quoted as if it
+did.

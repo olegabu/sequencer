@@ -71,3 +71,16 @@ target_link_libraries(sequencer_bench_output_observer INTERFACE
   $<IF:$<TARGET_EXISTS:hdr_histogram::hdr_histogram>,hdr_histogram::hdr_histogram,hdr_histogram::hdr_histogram_static>
 )
 target_compile_features(sequencer_bench_output_observer INTERFACE cxx_std_20)
+
+# The FIX load sender: the gateway's own session core in Initiator role
+# (specification.md §8.12 reason 2). Header-only, so this target exists
+# to carry the dependency rather than to compile anything.
+add_library(sequencer_bench_fix_requester INTERFACE)
+add_library(sequencer::bench_fix_requester ALIAS sequencer_bench_fix_requester)
+target_include_directories(sequencer_bench_fix_requester INTERFACE
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(sequencer_bench_fix_requester INTERFACE
+  sequencer::bench_load_generator
+  sequencer::fix_session
+)

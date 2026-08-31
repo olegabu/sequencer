@@ -60,6 +60,18 @@ session layer for the rig anyway. Building it once, usable in both
 roles, makes this gateway's session layer close to free and tests it
 from both sides.
 
+> **Measured, and not yet vindicated.** The rig criterion is ≥2× the
+> highest target rate on loopback with zero drops — 200k/s for a 100k
+> sweep. Our sender currently reaches **72,727/s** with zero drops
+> (release build, 2026-08-31; see
+> `bench/load_generator/README.md`). Zero drops is real; the rate is
+> not sufficient, and 72.7k/s is itself "tens of thousands", so this
+> reason's specific claim about outrunning QuickFIX is **unproven until
+> that number moves**. Reasons 1 and 3 are untouched by it. The sender
+> is deliberately naive — one write per message, no coalescing — which
+> is the first thing to try, and is how every other gateway here found
+> its order of magnitude.
+
 **3. We keep our own threading and allocation model.** An engine brings
 its thread and socket architecture with it, and QuickFIX's is a poor fit
 for a process whose siblings follow the sequencer's no-allocation,
