@@ -131,15 +131,29 @@ protobuf_generate(
   PLUGIN "protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
 )
 
-add_executable(counter_grpc_input_gateway_main
-  grpc_input_gateway_main.cpp
+# The generated stubs as their own library rather than compiled
+# straight into the gateway: tests/grpc_input_gateway_test.cpp needs
+# the same client stubs to drive that gateway, and duplicating the
+# generated sources into a second target compiles them twice and
+# invites the two copies to drift.
+add_library(counter_input_grpc_proto STATIC
   ${COUNTER_INPUT_GRPC_PROTO_SOURCES}
   ${COUNTER_INPUT_GRPC_SERVICE_SOURCES}
 )
-target_include_directories(counter_grpc_input_gateway_main PRIVATE
+add_library(counter::input_grpc_proto ALIAS counter_input_grpc_proto)
+target_include_directories(counter_input_grpc_proto PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>"
 )
+target_link_libraries(counter_input_grpc_proto PUBLIC
+  gRPC::grpc++
+  protobuf::libprotobuf
+)
+
+add_executable(counter_grpc_input_gateway_main
+  grpc_input_gateway_main.cpp
+)
 target_link_libraries(counter_grpc_input_gateway_main PRIVATE
+  counter::input_grpc_proto
   sequencer::gateway_input
   gRPC::grpc++
   gRPC::grpc++_reflection

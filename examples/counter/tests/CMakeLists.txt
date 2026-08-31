@@ -44,3 +44,15 @@ target_compile_definitions(counter_end_to_end_test PRIVATE
 )
 add_dependencies(counter_end_to_end_test counter_node_main counter_input_gateway_main counter_output_gateway_main)
 gtest_discover_tests(counter_end_to_end_test PROPERTIES TIMEOUT 60)
+
+# Drives the typed gRPC submission path as real processes; see the test
+# file's own comment for the batching hazard it exists to catch.
+add_executable(counter_grpc_input_gateway_test grpc_input_gateway_test.cpp)
+target_link_libraries(counter_grpc_input_gateway_test PRIVATE
+  counter::input_grpc_proto gRPC::grpc++ GTest::gtest GTest::gtest_main Threads::Threads)
+target_compile_definitions(counter_grpc_input_gateway_test PRIVATE
+  COUNTER_NODE_MAIN_PATH="$<TARGET_FILE:counter_node_main>"
+  COUNTER_GRPC_INPUT_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_grpc_input_gateway_main>"
+)
+add_dependencies(counter_grpc_input_gateway_test counter_node_main counter_grpc_input_gateway_main)
+gtest_discover_tests(counter_grpc_input_gateway_test PROPERTIES TIMEOUT 90)
