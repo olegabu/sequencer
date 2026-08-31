@@ -8,8 +8,17 @@ it via an application-supplied `InputCodec`, verify the client
 signature, forward to the raft group's current leader (following
 redirects), and relay the receipt back. Every line of that loop is
 generic except the two calls into the codec — see
-`src/submit_service_impl.hpp` for the whole thing, annotated line by
-line against §8.6's pseudocode.
+`src/request_pipeline.hpp` for the whole thing, annotated line by line
+against §8.6's pseudocode.
+
+That loop lives apart from any transport on purpose. A client-facing
+protocol is an `InputTransport` (`include/sequencer/input_transport.hpp`),
+mirroring the output side's `OutputTransport`, and the built-in brpc
+path (`src/brpc_input_transport.hpp`) is an ordinary implementation of
+it rather than a privileged one — an interface whose only implementation
+is the new thing gets shaped around the new thing, and the old path then
+quietly diverges. A FIX session gateway (`gateway/fix/`) plugs in the
+same way.
 
 ## Why the wire format is "whatever the codec wants," concretely
 

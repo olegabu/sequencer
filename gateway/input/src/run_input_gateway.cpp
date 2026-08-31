@@ -45,6 +45,12 @@ void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_o
 }  // namespace
 
 int RunInputGateway(int argc, char** argv, std::unique_ptr<InputCodec> codec) {
+  return RunInputGateway(argc, argv, std::move(codec),
+                          gateway::input::detail::defaultInputTransportFactory());
+}
+
+int RunInputGateway(int argc, char** argv, std::unique_ptr<InputCodec> codec,
+                     std::function<std::unique_ptr<InputTransport>()> transportFactory) {
   google::InitGoogleLogging(argv[0]);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
@@ -59,7 +65,9 @@ int RunInputGateway(int argc, char** argv, std::unique_ptr<InputCodec> codec) {
   config.maxBatchSize = static_cast<std::size_t>(std::max(0, FLAGS_max_batch_size));
   config.maxInFlightBatches = std::max(0, FLAGS_max_inflight_batches);
 
-  gateway::input::detail::InputGatewayImpl gateway(std::move(config), std::move(codec));
+  gateway::input::detail::InputGatewayImpl gateway(std::move(config), std::move(codec),
+                                                    sequencer::acceptAllSignatures,
+                                                    std::move(transportFactory));
   gateway.start();
   LOG(INFO) << "input gateway started: listen_port=" << FLAGS_listen_port
             << " node_peers=" << FLAGS_node_peers;

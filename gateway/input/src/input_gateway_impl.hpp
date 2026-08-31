@@ -1,23 +1,30 @@
 #pragma once
 
-// Ties together the client-facing brpc server, the NodeProposer, and
+// Ties together a client-facing InputTransport, the NodeProposer, and
 // the codec — everything RunInputGateway (input_gateway.hpp) sets up,
 // minus argv/gflags parsing, exactly as node/'s NodeImpl is separated
 // from RunNode, so this class can be driven directly and
 // deterministically from tests.
+//
+// The transport is pluggable (specification.md §8.10 choice (b)): brpc
+// by default, a FIX session gateway or anything else by passing a
+// factory. The chassis loop itself is in request_pipeline.hpp and is
+// the same whichever transport is in use.
 
-#include <brpc/server.h>
-
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sequencer/input_codec.hpp>
+#include <sequencer/input_transport.hpp>
 #include <sequencer/signature_verifier.hpp>
 
+#include "brpc_input_transport.hpp"
 #include "node_proposer.hpp"
-#include "submit_service_impl.hpp"
+#include "request_pipeline.hpp"
 
 namespace sequencer::gateway::input::detail {
 
@@ -35,36 +42,55 @@ struct InputGatewayConfig {
   // transport (FIX) sets SessionStream, and the chassis then withholds
   // designated outputs from the codec entirely, because the output
   // side delivers them from the journal instead.
+  // Superseded by the transport's own shape() when a transport is
+  // supplied; retained because a deployment may still want to force
+  // SessionStream semantics onto a request/response transport for
+  // testing the guard.
   sequencer::TransportShape transportShape = sequencer::TransportShape::RequestResponse;
 };
+
+// Builds the transport a gateway will serve. Mirrors
+// RunOutputGateway's transport factory (specification.md §8.5).
+using InputTransportFactory = std::function<std::unique_ptr<sequencer::InputTransport>()>;
+
+inline InputTransportFactory defaultInputTransportFactory() {
+  return [] { return std::unique_ptr<sequencer::InputTransport>(std::make_unique<BrpcInputTransport>()); };
+}
 
 class InputGatewayImpl {
  public:
   InputGatewayImpl(InputGatewayConfig config, std::unique_ptr<sequencer::InputCodec> codec,
-                    sequencer::SignatureVerifier verifier = sequencer::acceptAllSignatures)
+                    sequencer::SignatureVerifier verifier = sequencer::acceptAllSignatures,
+                    InputTransportFactory transportFactory = defaultInputTransportFactory())
       : config_(std::move(config)),
         codec_(std::move(codec)),
         proposer_(config_.nodeEndpoints, config_.maxBatchSize, config_.maxInFlightBatches),
-        service_(*codec_, proposer_, std::move(verifier), config_.transportShape) {}
+        transport_(transportFactory()),
+        // The TRANSPORT's shape wins over the config's: §8.11 makes the
+        // shape a property of the transport, not a deployment choice,
+        // and a transport that declares SessionStream must not be able
+        // to have request/response delivery configured back on. The
+        // config value only applies to the default transport, which
+        // declares RequestResponse anyway -- so it is reachable in
+        // tests without weakening the rule.
+        pipeline_(*codec_, proposer_, std::move(verifier),
+                   transport_->shape() == sequencer::TransportShape::SessionStream
+                       ? sequencer::TransportShape::SessionStream
+                       : config_.transportShape) {}
 
   InputGatewayImpl(const InputGatewayImpl&) = delete;
   InputGatewayImpl& operator=(const InputGatewayImpl&) = delete;
 
   void start() {
-    if (server_.AddService(&service_, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-      throw std::runtime_error("InputGatewayImpl::start: AddService(SubmitService) failed");
-    }
-    brpc::ServerOptions serverOptions;
-    if (server_.Start(config_.listenPort, &serverOptions) != 0) {
-      throw std::runtime_error("InputGatewayImpl::start: brpc::Server::Start failed on port " +
-                                std::to_string(config_.listenPort));
-    }
+    transport_->attach(
+        [this](std::shared_ptr<sequencer::RequestContext> request) {
+          pipeline_.handle(std::move(request));
+        },
+        [this](const sequencer::SessionInfo& session) { pipeline_.handleDisconnect(session); });
+    transport_->start(config_.listenPort);
   }
 
-  void stop() {
-    server_.Stop(0);
-    server_.Join();
-  }
+  void stop() { transport_->stop(); }
 
   int listenPort() const { return config_.listenPort; }
 
@@ -72,8 +98,8 @@ class InputGatewayImpl {
   InputGatewayConfig config_;
   std::unique_ptr<sequencer::InputCodec> codec_;
   NodeProposer proposer_;
-  SubmitServiceImpl service_;
-  brpc::Server server_;
+  std::unique_ptr<sequencer::InputTransport> transport_;
+  RequestPipeline pipeline_;
 };
 
 }  // namespace sequencer::gateway::input::detail
