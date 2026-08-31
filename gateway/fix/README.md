@@ -193,61 +193,52 @@ sending `263=0` (snapshot only) is registered for updates and gets no
 snapshot. A snapshot is an application-level query the codec or state
 machine must answer; the subscription half is what is built.
 
-## Where the FIX path's throughput limit actually is: the rig
+## Throughput, and the bug that hid it
 
-Measured on one machine, one node, one session (2026-09-01), with stage
-timers inside both of the gateway's own loops (`FIX_STAGE_TIMERS=1`).
+Measured on one machine, one node, one session, release build
+(2026-09-01):
 
-**The gateway is not the limit. The load generator is.** An earlier
-version of this section said the opposite; it was wrong, and the way it
-was wrong is worth keeping.
+| offered | achieved | p50 | p99 | dropped |
+|---|---|---|---|---|
+| 2,000/s | 1,982 | 4.8 ms | 16 ms | 0 |
+| 5,000/s | 4,955 | 4.9 ms | 21 ms | 0 |
+| 10,000/s | 9,893 | 6.4 ms | 19 ms | 0 |
+| **20,000/s** | **19,831** | **9.8 ms** | 37 ms | **0** |
+| 40,000/s | 37,877 | 82 ms | 135 ms | 13,567 |
 
-The gateway's two threads are both idle under load:
+So it carries 20k/s cleanly and knees between 20k and 40k, comparable to
+the brpc path on the same box.
 
-| thread | at 1,000 msg/s |
-|---|---|
-| FIX session reader (input) | **97% waiting for bytes**, 3% processing (~60 µs per read) |
-| ring reader (output) | **83–89% idle**, 1% delivering (~11 µs per entry), 6% flushing |
+**An earlier version of this section reported a ceiling of ~1,000/s.
+That was wrong by a factor of twenty, and how it went wrong is the part
+worth keeping.**
 
-The ring reader spins about a million times per two seconds to find two
-thousand entries. Neither side is short of capacity.
+The load generator did not send `ResetSeqNumFlag` on Logon. Each run is
+a fresh process with fresh in-memory sequence counters, while the
+gateway persists this CompID's numbers across runs — so every run after
+the *first* against a given gateway logged on at MsgSeqNum 1 against a
+gateway expecting thousands. That is MsgSeqNum-too-low, which FIX treats
+as unrecoverable, so the gateway logged the client out and dropped it.
+The client kept sending into a dead session, replies never came, and the
+harness dutifully reported `dropped-by-rig`.
 
-The sender is, and its failure looks like a server limit unless you read
-the drop counter:
+Every sweep row after the first was therefore measuring a refused
+session. The evidence looked exactly like a server that collapses under
+load, and it survived a `perf` profile, a syscall trace, stage timers on
+both gateway threads, and three commits. What exposed it was running the
+*same* configuration three times in a row instead of sweeping upward:
+run 1 passed, runs 2 and 3 failed identically. Distinct CompIDs per run
+made it disappear.
 
-| sender threads | offered | achieved | `dropped-by-rig` |
-|---|---|---|---|
-| **1** | 2,000/s | **1,982** | **0** |
-| 2 | 2,000/s | 0 | 9,001 |
-| 8 | 2,000/s | 0 | 9,001 |
-| 1 | 5,000/s | 0 | 24,001 |
+Two things follow, both now in the code:
 
-More sender threads makes it **worse**, which is the signature of
-contention inside the sender rather than pressure on the server:
-`FixRequester` serializes every send behind one mutex, so threads queue
-against each other and the open-loop scheduler falls behind. Its
-`dropped-by-rig` count is the harness saying so plainly.
+- `FixRequester` logs on with `ResetSeqNumFlag`, which is precisely the
+  mechanism for "I have no history, start us both at 1".
+- `start()` waits a moment and re-checks, because a gateway rejecting a
+  logon on sequence grounds sends a valid Logon echo *first* and
+  disconnects immediately after — so `isLoggedOn()` is briefly true for
+  a session that is already dead.
 
-That the earlier reading survived several rounds is the lesson. The
-number that mattered — `dropped-by-rig 13001` — was printed the first
-time and read as evidence about the gateway.
-
-**Consequences for measuring this gateway:**
-
-- Drive it with **one sender thread per client process**, not many.
-- A single sender carries roughly 2,000/s against a real gateway, far
-  below the ~77k/s it manages against a trivial echo peer, because the
-  echo has no latency to keep outstanding work against.
-- So a FIX sweep must be **multi-client**, as
-  `bench/load_generator/README.md` already says, and now for a sharper
-  reason: per-sender capacity against a real gateway is the binding
-  constraint.
-
-**What is not yet known:** where the gateway itself saturates. Nothing
-here has driven it hard enough to find out. Latency is measurable and
-reasonable — p50 ~4.9 ms against the brpc path's ~3.2 ms at the same
-rate, an extra ~1.7 ms for the FIX encode and the session hop.
-
-Three fixes from this investigation are in: counters no longer touch the
-filesystem per message (750/s → 2,000/s on its own), `emit()`'s outbound
-persist is throttled too, and writes coalesce per drain.
+Stage timers (`FIX_STAGE_TIMERS=1`) remain available in both of the
+gateway's loops. Under the corrected setup they still show plenty of
+headroom, which is consistent with the knee being above 20k.

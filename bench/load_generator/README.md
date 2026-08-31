@@ -238,6 +238,12 @@ four isolated runs:
 |---|---|---|
 | 200,000/s | **~77,000/s** (76.5k, 78.3k, 78.7k, 87.1k) | **0** |
 
+A correction to the figure above: it was measured against a trivial
+echo peer AND before `FixRequester` sent `ResetSeqNumFlag` on Logon.
+Against a real gateway a single sender sustains **20,000/s with zero
+drops** (see `gateway/fix/README.md`), so the per-sender constraint is
+far less tight than this section first concluded.
+
 **The criterion is met by the rig, not by one sender**, and the
 distinction matters. The rig is not a single process: sweeps run from
 five client boxes, each with a load generator beside its own gateway,

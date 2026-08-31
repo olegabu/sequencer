@@ -64,6 +64,24 @@ class FixRequester : public LoadGeneratorRequester {
     // the path being measured.
     config.heartBtInt = 0;
 
+    // ResetSeqNumFlag on Logon, and this is NOT optional for a rig.
+    //
+    // Each run is a fresh process with fresh in-memory counters, while
+    // the gateway persists this CompID's numbers across runs. Without
+    // the reset the client logs on at MsgSeqNum 1 against a gateway
+    // expecting thousands, which is MsgSeqNum-too-low -- unrecoverable
+    // in FIX, so the gateway logs it out and drops it. 141=Y is exactly
+    // the mechanism for "I have no history, start us both at 1".
+    //
+    // Its absence cost a great deal here. Every benchmark run after the
+    // FIRST against a given gateway was measuring a session the gateway
+    // had already refused: sends went nowhere, replies never came, and
+    // the harness reported it as dropped-by-rig. That was read as the
+    // gateway collapsing above 1,000-2,000 msg/s, and several rounds of
+    // profiling chased it. Distinct CompIDs per run hid it; repeating
+    // one run exposed it in three lines.
+    config.resetSeqNumOnLogon = true;
+
     session_ = std::make_unique<sequencer::fix::FixSession>(
         config, store_,
         [] {
@@ -72,10 +90,12 @@ class FixRequester : public LoadGeneratorRequester {
                   std::chrono::steady_clock::now().time_since_epoch())
                   .count());
         });
+    // Encoded frames go into a buffer, NOT onto the socket. The write
+    // syscall happens on the writer thread below, so it is off the
+    // critical section every sender is serialized through.
     session_->setSendFn([this](std::string_view frame) {
-      std::lock_guard<std::mutex> lock(writeMutex_);
-      boost::system::error_code ec;
-      boost::asio::write(socket_, boost::asio::buffer(frame.data(), frame.size()), ec);
+      std::lock_guard<std::mutex> lock(outMutex_);
+      outBuffer_.append(frame.data(), frame.size());
     });
     session_->setAppMessageFn([this](const hffix::message_reader& message) { onReply(message); });
   }
@@ -87,11 +107,23 @@ class FixRequester : public LoadGeneratorRequester {
   // error rather than a slow run.
   bool start() {
     reader_ = std::thread([this] { receiveLoop(); });
+    writer_ = std::thread([this] { writeLoop(); });
     session_->start();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (!session_->isLoggedOn() && std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    if (!session_->isLoggedOn()) {
+      return false;
+    }
+    // Confirm the session SURVIVES, rather than trusting the moment it
+    // came up. A gateway that rejects the logon on sequence grounds
+    // replies with a valid Logon echo first and disconnects immediately
+    // after, so isLoggedOn() is briefly true for a session that is
+    // already dead -- which is how a whole benchmark run could be spent
+    // sending into a closed session and reporting it as the gateway's
+    // fault.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
     return session_->isLoggedOn();
   }
 
@@ -112,6 +144,9 @@ class FixRequester : public LoadGeneratorRequester {
     if (reader_.joinable()) {
       reader_.join();
     }
+    if (writer_.joinable()) {
+      writer_.join();
+    }
   }
 
   // Subscribes to a broadcast topic by its FIX-standard mechanism: a
@@ -130,14 +165,23 @@ class FixRequester : public LoadGeneratorRequester {
       std::lock_guard<std::mutex> lock(pendingMutex_);
       pending_[sequence] = std::move(onDone);
     }
-    // One message, built straight into the session's own buffer. The
-    // body is the correlation tag and a delta of 1 -- the smallest
-    // thing the counter state machine accepts, so what is measured is
-    // the transport rather than the application.
+    // One message. The body is the correlation tag and a delta of 1 --
+    // the smallest thing the counter state machine accepts, so what is
+    // measured is the transport rather than the application.
+    //
+    // Built OUTSIDE the lock: a FIX session must assign MsgSeqNum and
+    // emit bytes in one order, so sendApplication() has to be
+    // serialized, but nothing else does. Formatting the body under the
+    // lock made every sender wait on every other sender's string work.
     const std::string body = std::to_string(kCorrelationTag) + "=" + std::to_string(sequence) +
                               "\001" + "5001=1\001";
-    std::lock_guard<std::mutex> lock(sendMutex_);
-    session_->sendApplication("U1", body);
+    {
+      // The critical section is now encode-and-append only: no syscall,
+      // no allocation of the body, no formatting. The writer thread
+      // owns the socket.
+      std::lock_guard<std::mutex> lock(sendMutex_);
+      session_->sendApplication("U1", body);
+    }
   }
 
  private:
@@ -190,6 +234,38 @@ class FixRequester : public LoadGeneratorRequester {
     }
   }
 
+  // Drains whatever has been encoded and writes it as ONE syscall.
+  //
+  // This is the rule the relay, output and input gateways all arrived
+  // at -- gather what is available now, send once, never delay a send
+  // to wait for more -- applied to the rig, which needed it as much as
+  // they did. With the write inline under the send lock, adding sender
+  // threads made throughput WORSE: at 2,000/s one thread carried it
+  // with zero drops while two dropped 9,001 (gateway/fix/README.md).
+  void writeLoop() {
+    std::string batch;
+    while (!stopping_.load(std::memory_order_relaxed)) {
+      {
+        std::lock_guard<std::mutex> lock(outMutex_);
+        batch.swap(outBuffer_);
+        outBuffer_.clear();
+      }
+      if (batch.empty()) {
+        // Nothing waiting. A short sleep rather than a spin: this
+        // thread is not latency-critical, it is throughput-critical,
+        // and burning a core here would take one from the senders.
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        continue;
+      }
+      boost::system::error_code ec;
+      boost::asio::write(socket_, boost::asio::buffer(batch.data(), batch.size()), ec);
+      batch.clear();
+      if (ec) {
+        return;
+      }
+    }
+  }
+
   void receiveLoop() {
     // A receive timeout so the blocking read returns periodically and
     // the loop can see stopping_. Closing the socket from another
@@ -235,8 +311,10 @@ class FixRequester : public LoadGeneratorRequester {
   std::unique_ptr<sequencer::fix::FixSession> session_;
   std::thread reader_;
   std::atomic<bool> stopping_{false};
-  std::mutex writeMutex_;
-  std::mutex sendMutex_;
+  std::mutex sendMutex_;   // serializes MsgSeqNum assignment and encoding
+  std::mutex outMutex_;    // guards the encoded-bytes buffer
+  std::string outBuffer_;
+  std::thread writer_;
   std::mutex pendingMutex_;
   // std::map, not unordered_map: the FIFO fallback above needs
   // begin() to be the OLDEST outstanding request, and the harness's
