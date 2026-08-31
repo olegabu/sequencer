@@ -573,7 +573,13 @@ std::uint64_t FixSession::emit(std::string_view msgType,
   lastSentUs_ = clock_();
   if (!inResend_) {
     sequences_.nextOutbound = seqNum + 1;
-    persist();
+    // Throttled, like the inbound counter and the journal position.
+    // This is the OUTBOUND path and it was missed when the other two
+    // were throttled -- so every message the gateway sent still did a
+    // file write and a rename, and the gateway still folded at ~1000
+    // messages/sec after the other two were fixed. Measuring the A/B
+    // rather than assuming the first fix had worked is what found it.
+    persistThrottled();
   }
   return seqNum;
 }
