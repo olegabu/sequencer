@@ -195,6 +195,21 @@ class FixSession {
   FixSession(SessionConfig config, SequenceStore& sequences, ClockFn clock,
               WallClockFn wallClock = {});
 
+  // Writes the counters through on the way out. Necessary since
+  // persistence was throttled off the per-message path: a session that
+  // ends inside the throttle window would otherwise lose its last
+  // advance, and the next session for that identity would resume behind
+  // where it actually got to -- which in FIX means re-sending sequence
+  // numbers the peer has already seen and being disconnected for it.
+  //
+  // Transports that lose a connection WITHOUT destroying the session
+  // must still call flushSequences() themselves; a destructor cannot
+  // help there.
+  ~FixSession();
+
+  FixSession(const FixSession&) = delete;
+  FixSession& operator=(const FixSession&) = delete;
+
   void setSendFn(SendFn fn) { send_ = std::move(fn); }
   void setAppMessageFn(AppMessageFn fn) { onApp_ = std::move(fn); }
   void setEventFn(EventFn fn) { onEvent_ = std::move(fn); }

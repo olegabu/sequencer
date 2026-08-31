@@ -181,6 +181,15 @@ FixSession::FixSession(SessionConfig config, SequenceStore& sequences, ClockFn c
   buffer_.reserve(8 * 1024);
 }
 
+FixSession::~FixSession() {
+  // Best effort: a store that throws here would take the process down
+  // during teardown, which is never the right trade for a counter file.
+  try {
+    persist();
+  } catch (...) {
+  }
+}
+
 void FixSession::start() {
   lastReceivedUs_ = clock_();
   lastSentUs_ = clock_();
