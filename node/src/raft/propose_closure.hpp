@@ -18,7 +18,9 @@
 #include <bthread/countdown_event.h>
 
 #include <cstdint>
+#include <span>
 #include <string>
+#include <vector>
 
 #include <sequencer/payload.hpp>
 
@@ -32,7 +34,10 @@ class ProposeClosure : public ::braft::Closure {
 
   bthread::CountdownEvent event{1};
   std::uint64_t sequenceNumber = 0;
-  std::string designatedOutput;
+  // Plural (specification.md §4, §5.2), in emission order, possibly
+  // empty. Owned copies: the Payloads handed to onEntryApplied() point
+  // into the apply arena, which the next apply() overwrites.
+  std::vector<std::string> designatedOutputs;
 };
 
 // apply_loop.hpp's CompletionCallback, bound to a ProposeClosure. Safe
@@ -40,14 +45,22 @@ class ProposeClosure : public ::braft::Closure {
 // submits to braft::Node::apply() attaches exactly a ProposeClosure
 // (Propose is the only task producer node/ has today) — see node.proto
 // and node_impl.cpp.
-inline void onEntryApplied(void* context, std::uint64_t sequenceNumber, Payload designatedOutput) {
+inline void onEntryApplied(void* context, std::uint64_t sequenceNumber,
+                            std::span<const Payload> designatedOutputs) {
   if (context == nullptr) {
     return;
   }
   auto* closure = static_cast<ProposeClosure*>(context);
   closure->sequenceNumber = sequenceNumber;
-  closure->designatedOutput.assign(reinterpret_cast<const char*>(designatedOutput.data()),
-                                    designatedOutput.size());
+  // The single-output copy this replaced became a loop; still on the
+  // apply thread, so it is bounded by kMaxOutputsPerInput and does no
+  // work per output beyond one string copy each.
+  closure->designatedOutputs.clear();
+  closure->designatedOutputs.reserve(designatedOutputs.size());
+  for (const Payload& output : designatedOutputs) {
+    closure->designatedOutputs.emplace_back(reinterpret_cast<const char*>(output.data()),
+                                             output.size());
+  }
   closure->Run();
 }
 

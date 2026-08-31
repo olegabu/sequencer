@@ -27,6 +27,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -62,7 +63,9 @@ class PassThroughCodec : public sequencer::InputCodec {
   Result<Bytes> toInput(const ClientRequest& request) override {
     return Result<Bytes>::Ok(Bytes(request.body.begin(), request.body.end()));
   }
-  Bytes toOutput(const Receipt& receipt, Payload designatedOutput) override {
+  Bytes toOutput(const Receipt& receipt, std::span<const Payload> designatedOutputs) override {
+    const Payload designatedOutput =
+        designatedOutputs.empty() ? Payload{} : designatedOutputs[0];
     Bytes out(sizeof(receipt.sequenceNumber) + designatedOutput.size());
     std::memcpy(out.data(), &receipt.sequenceNumber, sizeof(receipt.sequenceNumber));
     std::memcpy(out.data() + sizeof(receipt.sequenceNumber), designatedOutput.data(), designatedOutput.size());
@@ -153,7 +156,7 @@ class ProposeClientTest : public ::testing::Test {
     }
     outcome.ok = true;
     outcome.receipt.sequenceNumber = response.sequence_number();
-    const std::string& designated = response.designated_output();
+    const std::string& designated = response.designated_outputs(0);
     outcome.designatedOutput.assign(reinterpret_cast<const std::byte*>(designated.data()),
                                      reinterpret_cast<const std::byte*>(designated.data()) + designated.size());
     return outcome;

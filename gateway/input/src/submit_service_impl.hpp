@@ -22,7 +22,9 @@
 #include <butil/iobuf.h>
 
 #include <cerrno>
+#include <span>
 #include <string>
+#include <vector>
 
 #include <sequencer/input_codec.hpp>
 #include <sequencer/signature_verifier.hpp>
@@ -34,8 +36,13 @@ namespace sequencer::gateway::input::detail {
 
 class SubmitServiceImpl : public sequencer::gateway::input::proto::SubmitService {
  public:
-  SubmitServiceImpl(InputCodec& codec, NodeProposer& proposer, SignatureVerifier verifier)
-      : codec_(codec), proposer_(proposer), verifier_(std::move(verifier)) {}
+  // `shape` defaults to RequestResponse: that is what every transport
+  // this chassis serves today is (brpc baidu_std, brpc's gRPC, HTTP
+  // +JSON), and it keeps existing callers unchanged. A SessionStream
+  // transport must pass it explicitly -- see TransportShape.
+  SubmitServiceImpl(InputCodec& codec, NodeProposer& proposer, SignatureVerifier verifier,
+                     TransportShape shape = TransportShape::RequestResponse)
+      : codec_(codec), proposer_(proposer), verifier_(std::move(verifier)), shape_(shape) {}
 
   void Submit(::google::protobuf::RpcController* controllerBase,
               const sequencer::gateway::input::proto::SubmitRequest* /*request*/,
@@ -81,10 +88,28 @@ class SubmitServiceImpl : public sequencer::gateway::input::proto::SubmitService
         return;
       }
 
-      // codec->toOutput(receipt, designatedOutput) — application
+      // codec->toOutput(receipt, designatedOutputs) — application
       // knowledge again.
-      const Payload designated(outcome.designatedOutput.data(), outcome.designatedOutput.size());
-      const Bytes responseBytes = codec_.toOutput(outcome.receipt, designated);
+      //
+      // specification.md §8.11: which path delivers an output is fixed
+      // by the transport's SHAPE. On a RequestResponse transport (this
+      // one, and every transport the chassis serves today) the
+      // designated outputs are the reply. On a SessionStream transport
+      // they must NOT be delivered here at all -- the output side
+      // sends every output for that session from the journal, in
+      // sequence-number order -- so the chassis hands the codec an
+      // empty span rather than trusting each transport to remember.
+      // Enforced here, not by convention, so a future FIX input
+      // transport cannot double-deliver by omission.
+      std::vector<Payload> designatedSpans;
+      if (shape_ == TransportShape::RequestResponse) {
+        designatedSpans.reserve(outcome.designatedOutputs.size());
+        for (const Bytes& output : outcome.designatedOutputs) {
+          designatedSpans.emplace_back(output.data(), output.size());
+        }
+      }
+      const Bytes responseBytes = codec_.toOutput(
+          outcome.receipt, std::span<const Payload>(designatedSpans.data(), designatedSpans.size()));
 
       // sendClientResponse(response) (generic).
       cntl->response_attachment().append(responseBytes.data(), responseBytes.size());
@@ -95,6 +120,7 @@ class SubmitServiceImpl : public sequencer::gateway::input::proto::SubmitService
   InputCodec& codec_;
   NodeProposer& proposer_;
   SignatureVerifier verifier_;
+  const TransportShape shape_ = TransportShape::RequestResponse;
 };
 
 }  // namespace sequencer::gateway::input::detail

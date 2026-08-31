@@ -24,6 +24,12 @@
 
 namespace sequencer {
 
+// specification.md §8.11: a gateway delivers each output to a given
+// client exactly once, by the path its transport shape dictates, and
+// never by both. For a session transport, this path carries EVERY
+// output addressed to the session, in sequence-number order --
+// including the ones the state machine designated, which the input
+// side deliberately withholds from its synchronous reply.
 class OutputTransport {
  public:
   virtual ~OutputTransport() = default;

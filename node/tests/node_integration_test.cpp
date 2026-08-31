@@ -118,16 +118,17 @@ TEST_F(NodeIntegrationTest, ProposeReturnsDenseSequenceNumbersAndDesignatedOutpu
   EXPECT_TRUE(r1->error_message().empty());
   EXPECT_FALSE(r1->redirect());
   EXPECT_EQ(r1->sequence_number(), 1u);
-  ASSERT_EQ(r1->designated_output().size(), sizeof(std::int64_t));
+  ASSERT_EQ(r1->designated_outputs_size(), 1);
+  ASSERT_EQ(r1->designated_outputs(0).size(), sizeof(std::int64_t));
   std::int64_t total1;
-  std::memcpy(&total1, r1->designated_output().data(), sizeof(total1));
+  std::memcpy(&total1, r1->designated_outputs(0).data(), sizeof(total1));
   EXPECT_EQ(total1, 5);
 
   auto r2 = propose(-2);
   ASSERT_TRUE(r2.has_value());
   EXPECT_EQ(r2->sequence_number(), 2u);
   std::int64_t total2;
-  std::memcpy(&total2, r2->designated_output().data(), sizeof(total2));
+  std::memcpy(&total2, r2->designated_outputs(0).data(), sizeof(total2));
   EXPECT_EQ(total2, 3);
 
   auto r3 = propose(10);

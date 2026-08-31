@@ -29,6 +29,13 @@ struct InputGatewayConfig {
   // and what happened when neither did.
   std::size_t maxBatchSize = 0;
   int maxInFlightBatches = 0;
+  // specification.md §8.11: which path delivers an output to a client
+  // is fixed by the transport's shape, not chosen per message. Every
+  // transport this chassis serves today is RequestResponse; a session
+  // transport (FIX) sets SessionStream, and the chassis then withholds
+  // designated outputs from the codec entirely, because the output
+  // side delivers them from the journal instead.
+  sequencer::TransportShape transportShape = sequencer::TransportShape::RequestResponse;
 };
 
 class InputGatewayImpl {
@@ -38,7 +45,7 @@ class InputGatewayImpl {
       : config_(std::move(config)),
         codec_(std::move(codec)),
         proposer_(config_.nodeEndpoints, config_.maxBatchSize, config_.maxInFlightBatches),
-        service_(*codec_, proposer_, std::move(verifier)) {}
+        service_(*codec_, proposer_, std::move(verifier), config_.transportShape) {}
 
   InputGatewayImpl(const InputGatewayImpl&) = delete;
   InputGatewayImpl& operator=(const InputGatewayImpl&) = delete;

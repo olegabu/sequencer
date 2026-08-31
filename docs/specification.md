@@ -150,7 +150,7 @@ serves any consumer: **replicas lag, never diverge.**
 
 A node's network surface is deliberately trivial — two operations:
 
-- `Propose(bytes) → {sequenceNumber, designatedOutput?} | redirect(leader) | error`
+- `Propose(bytes) → {sequenceNumber, designatedOutputs[]} | redirect(leader) | error`
   — synchronous, returns after commit, application, and journal append.
 - `Subscribe(fromSequenceNumber) → stream of raw journal records` —
   remote journal access for non-colocated consumers; colocated consumers
@@ -266,9 +266,11 @@ using Payload = std::span<const std::byte>;   // pointer + length, zero-copy
 class OutputCollector {
 public:
   void emit(Payload output);          // append one output for this input
-  void designateOutput(size_t index); // mark which emitted output, if any,
-                                      // is relayed synchronously to the
-                                      // submitting client (see §5.2)
+  void designateOutput(size_t index); // mark an emitted output as part of
+                                      // the submitting client's synchronous
+                                      // reply; callable for any number of
+                                      // outputs, in any order — the reply
+                                      // preserves emission order (see §5.2)
 };
 
 class SnapshotWriter { public: void write(const void*, size_t); };
@@ -296,16 +298,19 @@ int RunNode(int argc, char** argv, std::unique_ptr<StateMachine> stateMachine);
 ```
 
 **`designateOutput`, explained.** A state machine may emit any number of
-outputs for one input. `designateOutput(index)` marks at most one of them
-as the output relayed synchronously back to the client that submitted
-the input (§5.2) — distinct from every output's unconditional journaling
-and dissemination via output gateways, which happens regardless. A state
-machine may designate none. In the counter example (§10), the single
-output — the new running total — is also the designated output, since it
-is the only output and the submitting client is its only interested
-party; a state machine with multiple interested parties per input (for
-example, one emitting a result for the submitter and separate results
-for other parties) would designate only the submitter's own.
+outputs for one input. `designateOutput(index)` marks an emitted output
+as belonging to the submitting client's synchronous reply — the
+**designated outputs**, an ordered subset of the input's consequence set,
+returned in emission order. This is distinct from every output's
+unconditional journaling and dissemination via output gateways, which
+happens regardless. A state machine may designate none, one, or many:
+the counter example (§10) designates its single output — the new running
+total — since the submitting client is its only interested party; an
+order-matching state machine would designate the submitter's own
+execution reports (an acknowledgement, then each partial fill, then a
+final state) while leaving counterparties' execution reports and market
+data undesignated, to reach their audiences only through output gateways
+(§8.11).
 
 ### 4.1 Determinism rules (binding on every state machine)
 
@@ -358,7 +363,7 @@ brpc server (baidu_std + gRPC + HTTP/JSON on one port)
         sequenceNumber = ++next                       sibling left empty]
         stateMachine->apply(sequenceNumber, input, outputs)
         journal.append({sequenceNumber, input, outputs})
-        acknowledge{sequenceNumber, designatedOutput}
+        acknowledge{sequenceNumber, designatedOutputs[]}
 ```
 
 Normative points:
@@ -386,7 +391,7 @@ Normative points:
 `Propose` returns after commit, application, and journal append:
 
 ```
-Receipt { sequenceNumber: u64 }  +  designatedOutput: bytes?
+Receipt { sequenceNumber: u64 }  +  designatedOutputs: bytes[]   // in emission order; may be empty
 ```
 
 - **No input hash is returned.** A client verifies everything against
@@ -398,7 +403,9 @@ Receipt { sequenceNumber: u64 }  +  designatedOutput: bytes?
   root and this record's inclusion proof — is produced afterward by the
   signing gateway (§7, §8.4) and becomes available within one block.
 - Semantics: *committed at this position; will be deterministically
-  processed; outcome per the designated output and the output stream.*
+  processed; outcome per the designated outputs and the output stream —
+  which of the two a client actually receives depends on the transport's
+  shape, per §8.11.*
 
 ### 5.3 Configuration defaults (eight virtual CPUs, three zones)
 
@@ -982,7 +989,8 @@ namespace sequencer {
 // codec owns meaning:
 class InputCodec {
   virtual Result<Bytes> toInput(const ClientRequest&) = 0;    // request → input bytes
-  virtual Bytes toOutput(const Receipt&, Payload designatedOutput) = 0; // receipt → response bytes
+  virtual Bytes toOutput(const Receipt&, std::span<const Payload> designatedOutputs) = 0;
+                                                  // receipt + designated outputs → response bytes
   virtual std::optional<Bytes> onDisconnect(const SessionInfo&) = 0;
 };
 int RunInputGateway(int argc, char** argv, std::unique_ptr<InputCodec>);
@@ -1039,7 +1047,7 @@ void RunInputGateway(..., std::unique_ptr<InputCodec> codec) {
                                                   //   knowledge
     verifyClientSignature(input);                 // generic
     auto receipt = proposeToLeader(input);        // generic
-    auto response = codec->toOutput(receipt, receipt.designatedOutput);
+    auto response = codec->toOutput(receipt, receipt.designatedOutputs);
     sendClientResponse(response);                 // generic
   }
 }
@@ -1273,22 +1281,168 @@ and the one worth building if more than one non-brpc input transport
 ever exists; (a) is strictly less work and ships sooner. Neither is
 built or specified further here.
 
-Either way, a FIX engine — not a hand-rolled session layer — should own
-`Logon`/`Logout`/`Heartbeat`/`TestRequest`/`ResendRequest` and
-sequence-number bookkeeping, the same reasoning behind Boost.Beast for
-WebSocket (§8.7) and the standard gRPC library for §8.9: pick a
-focused, purpose-built dependency for the protocol's own machinery
-rather than reimplement it. QuickFIX is the concrete candidate: the
-mature, widely-used open-source C++ FIX engine, and — checked directly
-against this repository's own pinned vcpkg baseline, not assumed —
-already available there as the `quickfix` port, depending only on
-`openssl` (already a dependency of this repository, §9.1) beyond
-vcpkg's own tooling packages. `Application::onLogon`/`onLogout` map
-naturally onto `SessionId` creation/teardown and `InputCodec`'s own
-`onDisconnect` hook (§8.1's "propose a disconnect input on session
-loss") arguably better than brpc's implicit connection-close detection
-does, since a FIX logout is an explicit, named event rather than a
-socket merely going away.
+The session layer — `Logon`/`Logout`/`Heartbeat`/`TestRequest`/
+`ResendRequest` and sequence-number bookkeeping — is the part a FIX
+transport must own or delegate. The default principle this
+specification applies everywhere else (Boost.Beast for WebSocket, §8.7;
+the standard gRPC library for §8.9) is to pick a focused, purpose-built
+dependency for a protocol's own machinery rather than reimplement it,
+and QuickFIX is the mature open-source C++ engine that principle would
+select (available as the `quickfix` port in this repository's pinned
+vcpkg baseline, depending only on `openssl`). **For FIX specifically,
+this specification deviates from that principle**: the session layer is
+owned, built on the hffix parser, for reasons particular to this
+architecture that §8.12 states in full; QuickFIX is retained as the
+conformance-test client. One observation from the engine-based sketch
+survives the change: a FIX logout is an explicit, named event, so the
+session core's logon/logout callbacks map onto `SessionId`
+creation/teardown and `InputCodec::onDisconnect` (§8.1) more cleanly
+than brpc's implicit connection-close detection does.
+
+### 8.11 Delivery path per transport shape — exactly one path per output
+
+Every output reaches its audience by exactly one of two paths, and which
+one is fixed by the **shape of the transport**, not chosen per message:
+
+**Request/response transports** — REST, gRPC unary, brpc — return the
+input's designated outputs (§4) synchronously, as the reply to the
+request, straight from the node's acknowledgement. This is the natural
+reply for a client that sent one request and is waiting for one
+response, and it is the lowest-latency path to the submitter's own
+immediate consequences. Outputs *not* designated (other parties'
+results, market data) reach their audiences only through output
+gateways, as always.
+
+**Session and stream transports** — FIX being the defining case — do
+**not** use the synchronous designated outputs for client delivery at
+all. The output-gateway role of a session gateway delivers **every**
+output addressed to the session, designated or not, from the journal,
+in sequence-number order. The synchronous receipt is consumed by the
+gateway itself, for bookkeeping only: it confirms admission and
+supplies the sequence number for gap detection and timeout handling.
+FIX clients have no request/response concept to serve — the execution-
+report stream *is* the reply — and this single-path rule gives two
+properties by construction: **exactly-once** delivery (no output is ever
+sent both as a synchronous reply and again from the journal) and
+**cross-order ordering** (a client's aggressive fill on one order and a
+passive fill on another arrive in journal order, which position and
+risk logic downstream depend on).
+
+The alternative — returning designated outputs synchronously on a
+session transport *and* suppressing their duplicates when the journal
+delivers them — is faster for the aggressor by one gateway hop but
+reintroduces the cross-order ordering hazard, since the synchronous
+copy can overtake or trail journal-ordered outputs on the same session.
+It is a legitimate optimization for a deployment that has decided the
+hazard is acceptable, and must be documented as such wherever adopted;
+it is not the default, and this specification's session-gateway shape
+does not implement it. (This rule constrains any FIX input transport
+built per §8.10, whichever of its two shapes is chosen: the FIX
+session's execution reports are delivered by the output side from the
+journal, never as the propose path's synchronous reply.)
+
+The rule restated as a contract line for §8.1 and §8.3: **a gateway
+delivers each output to a given client exactly once, by the path its
+transport shape dictates, and never by both.**
+
+### 8.12 The FIX session gateway — hffix and an owned session core
+
+**Decision.** FIX transport is built on **hffix** — a header-only,
+zero-allocation FIX parser/writer that reads and writes fields directly
+on an I/O buffer and, by explicit design, does not manage sessions —
+with the **session layer owned by this repository** as a *session core*
+shared by two roles: acceptor, in the FIX gateway; initiator, in the
+benchmark harness's FIX load sender. QuickFIX is kept solely as the
+conformance-test client the gateway must interoperate with.
+
+**Why deviate from "don't reimplement."** The principle is correct as a
+default, and it should be read as the default here too; this is a
+deliberate, bounded exception justified by three properties specific to
+this architecture, not by a general preference for owning code:
+
+1. **The journal is already the resend store.** A FIX `ResendRequest`
+   asks for previously-sent outbound messages by session sequence
+   number. Every execution report the gateway ever sent is a journal
+   output routed to that session — so resends are served by re-reading
+   the journal from the relay (§8.2), deterministically, with no
+   separate outbound message store, no message-store persistence, and
+   no store-vs-journal reconciliation. Inbound messages are journaled
+   inputs. The only session state that must persist is a pair of
+   sequence-number counters per session. An engine's message store —
+   a large fraction of what an engine *is* — would be redundant
+   machinery here, duplicating the journal and introducing a second
+   source of truth for what was sent.
+2. **The session state machine is symmetric, and the harness needs it
+   anyway.** Initiator and acceptor are two roles of one protocol: the
+   same heartbeat logic, sequence rules, and resend handling. A
+   QuickFIX *initiator* as the load sender is the wrong instrument — its
+   allocation-heavy, single-thread-per-session engine caps a session at
+   roughly tens of thousands of messages per second and adds its own
+   jitter, so the rig becomes the bottleneck before the gateway does and
+   fails the harness's rig-not-the-bottleneck criterion. The rig
+   therefore needs a fast sender with a minimal session layer
+   regardless; building that session layer once, as a core usable in
+   both roles, makes the gateway's session layer nearly free rather than
+   a second implementation.
+3. **Threading and allocation stay under this repository's control.**
+   hffix's authors' critique of QuickFIX is specific and applies here:
+   an engine imposes its own thread and socket architecture, and
+   QuickFIX's choices are poor for a process whose other components
+   follow §5.4's no-allocation, controlled-thread discipline. With hffix
+   the gateway's sessions run on Boost.Asio (already a dependency via
+   Beast, §8.7) with TLS from the same stack, parsing in ~1–3µs with no
+   free-store allocation, in a threading model consistent with the rest
+   of the gateway tier.
+
+The alternatives were weighed, not ignored: QuickFIX (mature, slow,
+imposes its threading); Fix8 (roughly 3× faster than QuickFIX, but LGPL,
+with a community edition whose maintenance the project itself describes
+as uncertain); commercial engines (irrelevant to an open stack). What
+is being bet on is owning a few thousand lines of well-specified
+session-layer code, tested from both sides — in character for a project
+that already owns its journal and harness — in exchange for removing a
+redundant store, a bottlenecked rig, and an imposed threading model.
+
+**Scope of the session core (`gateway/fix/session/`).** Owned:
+`Logon` with credential authentication (tags 553/554) and heartbeat
+interval negotiation; `Heartbeat` emission and monitoring, `TestRequest`
+issue and reply; monotonic inbound/outbound sequence numbers with the
+two counters persisted per session across reconnects and restarts;
+`ResendRequest` handling in both directions — outbound resends served
+from the journal per (1), inbound gaps requested from the peer; gap fill
+and `SequenceReset`; session-level `Reject` for malformed messages; the
+`Logout` handshake; end-of-day sequence reset (`ResetSeqNumFlag`); TLS
+via Asio SSL. Validation is deliberately minimal at the session layer —
+framing, checksum, `BodyLength`, and required session fields — with
+application-message validation (required fields, types) performed by
+the typed layer or the codec, not by a data-dictionary engine. Initial
+scope is FIX 4.4; FIXT/FIX 5.0 session semantics and session-schedule
+management (start/end times) are explicitly deferred.
+
+**Shape.** This resolves §8.10's open choice (b): a new `InputTransport`
+interface mirroring `OutputTransport`, so `FixInputTransport` composes
+with an arbitrary `InputCodec` exactly as `FixOutputTransport :
+public OutputTransport` composes with an arbitrary `OutputCodec`. For
+order entry the two are deployed as one **session gateway** binary
+sharing a session core instance — the FIX convention is that all
+execution reports for a session's orders, aggressive and passive, arrive
+on the order-entry session that owns them — and delivery follows §8.11:
+every output for the session comes from the journal, in
+sequence-number order; the synchronous receipt is bookkeeping only.
+Market data is a separate, output-only FIX session (or a different
+transport entirely) fed by `Fanout::broadcast`; subscription uses FIX's
+own `MarketDataRequest`, resolving §8.10's topic question the standard
+way.
+
+**Layout and dependencies.** `gateway/fix/{session,input,output}/`;
+hffix as a header-only dependency (via its vcpkg port if present in the
+pinned baseline, otherwise vendored under `third_party/hffix/` — verify
+against the baseline, do not assume); `quickfix` as a *test-only*
+dependency for the conformance suite; `bench/load_generator/` gains a
+FIX transport built on the same session core in initiator role. The
+FIX gateway's own `README.md` must restate the deviation rationale
+above, in its own words, so that anyone opening that directory
+understands why an engine was not used before they propose adding one.
 
 ## 9. Repository layout and build tooling
 
@@ -1305,6 +1459,10 @@ sequencer/
 │                     #   an application links this and supplies a codec
 │   ├── output/      # RunOutputGateway chassis + OutputCodec interface —
 │                     #   likewise, application-linked
+│   ├── fix/         # §8.12: session/ (the owned session core on hffix +
+│   │                 #   Asio, acceptor and initiator roles), input/
+│   │                 #   (FixInputTransport), output/ (FixOutputTransport);
+│   │                 #   its README restates why no FIX engine is used
 │   └── relay/       # the relay gateway (§8.2): reads a colocated
 │                     #   replica's journal, re-serves Subscribe over the
 │                     #   network, byte-identical, no codec involved.
@@ -1346,7 +1504,10 @@ sequencer/
 ├── vcpkg.json       # dependencies: braft, brpc, protobuf, gtest, benchmark,
 │                     #   boost-beast (WebSocket, output gateways only —
 │                     #   §8.7), openssl (§9.1), grpc (real gRPC streaming,
-│                     #   §8.9), hdr-histogram (bench/load_generator/ only)
+│                     #   §8.9), hdr-histogram (bench/load_generator/ only),
+│                     #   hffix (header-only, §8.12 — or vendored under
+│                     #   third_party/ if no port exists in the baseline),
+│                     #   quickfix (test-only: FIX conformance client, §8.12)
 └── CMakeLists.txt   # CMake with the Ninja generator
 ```
 
@@ -1443,7 +1604,7 @@ is its only interested party.
 
 **Codecs.** `CounterInputCodec` translates a small JSON body (for
 example `{"delta": 5}`) into the 8-byte input, and a receipt plus
-designated output back into a JSON response. `CounterOutputCodec`
+single designated output back into a JSON response. `CounterOutputCodec`
 translates each journal record into a JSON message (sequence number and
 new total) published over WebSocket.
 

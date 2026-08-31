@@ -10,6 +10,7 @@
 // with neither braft nor brpc anywhere in its link.
 
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -43,11 +44,21 @@ class OutputCollector {
     outputs_[count_++] = output;
   }
 
+  // Marks an already-emitted output as part of the submitting client's
+  // synchronous reply (specification.md §4). Callable any number of
+  // times, in any order; designating the same index twice is
+  // idempotent. The designated set is exposed in EMISSION order --
+  // the order the outputs were emit()ted -- not the order this was
+  // called in, which is what §5.2's "in emission order" requires.
+  //
+  // A bitset over output indices gives that ordering for free (walk it
+  // ascending) and needs no allocation, which §5.4 forbids on the
+  // apply thread.
   void designateOutput(std::size_t index) {
     if (index >= count_) {
       throw std::out_of_range("OutputCollector::designateOutput: index >= emitted output count");
     }
-    designated_ = index;
+    designated_.set(index);
   }
 
   // --- Harness-internal accessors (not part of the application-facing
@@ -57,18 +68,39 @@ class OutputCollector {
   void reset() noexcept {
     count_ = 0;
     designated_.reset();
+    designatedCount_ = 0;
   }
 
   std::span<const Payload> outputs() const noexcept { return {outputs_.data(), count_}; }
 
-  Payload designatedOutput() const noexcept {
-    return designated_.has_value() ? outputs_[*designated_] : Payload{};
+  // The designated outputs, in emission order, as a contiguous span.
+  //
+  // Materialized into a second fixed array rather than returned as a
+  // filtered view: callers (the acknowledgement path, the input codec)
+  // want a span, and building it here once per apply is cheaper than
+  // making every caller walk the bitset. Still no allocation -- the
+  // array is a member, sized like outputs_.
+  std::span<const Payload> designatedOutputs() const noexcept {
+    designatedCount_ = 0;
+    for (std::size_t i = 0; i < count_; ++i) {
+      if (designated_.test(i)) {
+        designatedStorage_[designatedCount_++] = outputs_[i];
+      }
+    }
+    return {designatedStorage_.data(), designatedCount_};
   }
 
  private:
   std::array<Payload, kMaxOutputsPerInput> outputs_{};
   std::size_t count_ = 0;
-  std::optional<std::size_t> designated_;
+  std::bitset<kMaxOutputsPerInput> designated_;
+  // `mutable` because designatedOutputs() is a const observer that
+  // materializes its answer here: the bitset is the state, this is a
+  // scratch view built from it. Filling it on demand rather than
+  // maintaining it in designateOutput() is what keeps emission order
+  // correct when designation happens out of order.
+  mutable std::array<Payload, kMaxOutputsPerInput> designatedStorage_{};
+  mutable std::size_t designatedCount_ = 0;
 };
 
 // A sequential byte sink for StateMachine::snapshotSave(), backed by a

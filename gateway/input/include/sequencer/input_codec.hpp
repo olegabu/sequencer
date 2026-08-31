@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -55,6 +56,33 @@ class Result {
   std::variant<T, std::string> value_;
 };
 
+// specification.md §8.11: which of the two delivery paths carries an
+// output to a client is fixed by the SHAPE of the transport, not chosen
+// per message.
+//
+//   RequestResponse -- REST, gRPC unary, brpc. The input's designated
+//     outputs are returned synchronously as the reply. Outputs that
+//     were not designated reach their audiences through output
+//     gateways, as always.
+//
+//   SessionStream -- FIX being the defining case. Designated outputs
+//     are NOT delivered synchronously at all; the gateway's output role
+//     delivers EVERY output addressed to the session from the journal,
+//     in sequence-number order, and the synchronous receipt is consumed
+//     by the gateway for bookkeeping only (admission confirmation and
+//     the sequence number, for gap detection and timeouts).
+//
+// The rule this exists to enforce: a gateway delivers each output to a
+// given client exactly once, by the path its transport shape dictates,
+// and never by both. That buys exactly-once delivery and cross-order
+// ordering by construction, rather than by a de-duplication step that
+// can still let a synchronous copy overtake journal-ordered outputs on
+// the same session.
+enum class TransportShape {
+  RequestResponse,
+  SessionStream,
+};
+
 class InputCodec {
  public:
   virtual ~InputCodec() = default;
@@ -62,8 +90,21 @@ class InputCodec {
   // request -> input bytes, or a rejection reason.
   virtual Result<Bytes> toInput(const ClientRequest& request) = 0;
 
-  // receipt (+ the designated output, if any) -> response bytes.
-  virtual Bytes toOutput(const Receipt& receipt, Payload designatedOutput) = 0;
+  // receipt (+ the designated outputs, if any) -> response bytes.
+  //
+  // `designatedOutputs` is in EMISSION order and may be empty
+  // (specification.md §4, §5.2) -- a state machine is free to designate
+  // nothing, and a codec must handle that cleanly rather than assuming
+  // an element exists.
+  //
+  // specification.md §8.11: a gateway delivers each output to a given
+  // client exactly once, by the path its transport shape dictates, and
+  // never by both. This method is that path for RequestResponse
+  // transports only; on a SessionStream transport the chassis never
+  // calls it with designated outputs, because the output side delivers
+  // every output for the session from the journal instead.
+  virtual Bytes toOutput(const Receipt& receipt,
+                          std::span<const Payload> designatedOutputs) = 0;
 
   // Called when a stateful session ends (specification.md §8.1). May
   // return input bytes to propose as a disconnect notification, or

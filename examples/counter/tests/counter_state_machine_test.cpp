@@ -19,7 +19,15 @@ Payload payloadOf(const std::int64_t& v) {
 }
 
 std::int64_t designatedTotal(const OutputCollector& outputs) {
-  Payload d = outputs.designatedOutput();
+  // Counter designates exactly one output; this helper returns it.
+  // EXPECT rather than ASSERT because ASSERT_* may only be used in a
+  // void-returning function.
+  std::span<const Payload> designated = outputs.designatedOutputs();
+  EXPECT_EQ(designated.size(), 1u);
+  if (designated.empty()) {
+    return 0;
+  }
+  Payload d = designated[0];
   std::int64_t v;
   std::memcpy(&v, d.data(), sizeof(v));
   return v;

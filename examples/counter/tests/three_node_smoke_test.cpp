@@ -81,8 +81,8 @@ ProposeOutcome proposeFollowingRedirects(const std::vector<std::string>& endpoin
         ProposeOutcome outcome;
         outcome.ok = true;
         outcome.sequenceNumber = response.sequence_number();
-        if (response.designated_output().size() == sizeof(std::int64_t)) {
-          std::memcpy(&outcome.designatedTotal, response.designated_output().data(),
+        if (response.designated_outputs(0).size() == sizeof(std::int64_t)) {
+          std::memcpy(&outcome.designatedTotal, response.designated_outputs(0).data(),
                       sizeof(std::int64_t));
         }
         return outcome;

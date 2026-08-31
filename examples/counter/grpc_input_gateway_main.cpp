@@ -109,8 +109,11 @@ class CounterSubmitServiceImpl final : public grpc_proto::CounterSubmitService::
       }
       response->set_sequence_number(outcome.receipt.sequenceNumber);
       std::int64_t total = 0;
-      if (outcome.designatedOutput.size() == sizeof(total)) {
-        std::memcpy(&total, outcome.designatedOutput.data(), sizeof(total));
+      // Plural since specification.md §4 allows any number; counter
+      // designates exactly one, and an empty set stays total 0.
+      if (!outcome.designatedOutputs.empty() &&
+          outcome.designatedOutputs[0].size() == sizeof(total)) {
+        std::memcpy(&total, outcome.designatedOutputs[0].data(), sizeof(total));
       }
       response->set_total(total);
       reactor->Finish(::grpc::Status::OK);

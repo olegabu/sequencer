@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <vector>
 
 #include "node.pb.h"
@@ -122,8 +123,8 @@ class ProposeServiceImpl : public sequencer::node::proto::ProposeService {
     }
 
     response->set_sequence_number(closure.sequenceNumber);
-    if (!closure.designatedOutput.empty()) {
-      response->set_designated_output(closure.designatedOutput);
+    for (const std::string& output : closure.designatedOutputs) {
+      response->add_designated_outputs(output);
     }
   }
 
@@ -185,8 +186,8 @@ class ProposeServiceImpl : public sequencer::node::proto::ProposeService {
         continue;
       }
       result->set_sequence_number(closures[i].sequenceNumber);
-      if (!closures[i].designatedOutput.empty()) {
-        result->set_designated_output(closures[i].designatedOutput);
+      for (const std::string& output : closures[i].designatedOutputs) {
+        result->add_designated_outputs(output);
       }
     }
     ProposeMetrics::instance().applyWaitUs << (butil::cpuwide_time_us() - appliedAtUs);

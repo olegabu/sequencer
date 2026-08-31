@@ -14,11 +14,13 @@
 #include <brpc/controller.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,7 +61,9 @@ class PassThroughCodec : public sequencer::InputCodec {
     return Result<Bytes>::Ok(Bytes(request.body.begin(), request.body.end()));
   }
 
-  Bytes toOutput(const Receipt& receipt, Payload designatedOutput) override {
+  Bytes toOutput(const Receipt& receipt, std::span<const Payload> designatedOutputs) override {
+    const Payload designatedOutput =
+        designatedOutputs.empty() ? Payload{} : designatedOutputs[0];
     Bytes out(sizeof(receipt.sequenceNumber) + designatedOutput.size());
     std::memcpy(out.data(), &receipt.sequenceNumber, sizeof(receipt.sequenceNumber));
     std::memcpy(out.data() + sizeof(receipt.sequenceNumber), designatedOutput.data(),
@@ -68,6 +72,35 @@ class PassThroughCodec : public sequencer::InputCodec {
   }
 
   std::optional<Bytes> onDisconnect(const SessionInfo&) override { return std::nullopt; }
+};
+
+// Records what the chassis passed to toOutput(), so a test can assert
+// on the DELIVERY PATH rather than on the response bytes.
+struct DesignatedRecord {
+  std::atomic<int> calls{0};
+  std::atomic<std::size_t> lastDesignatedCount{0};
+  std::atomic<std::uint64_t> lastSequenceNumber{0};
+};
+
+class RecordingCodec : public sequencer::InputCodec {
+ public:
+  explicit RecordingCodec(DesignatedRecord& record) : record_(record) {}
+
+  Result<Bytes> toInput(const ClientRequest& request) override {
+    return Result<Bytes>::Ok(Bytes(request.body.begin(), request.body.end()));
+  }
+
+  Bytes toOutput(const Receipt& receipt, std::span<const Payload> designatedOutputs) override {
+    record_.calls.fetch_add(1, std::memory_order_relaxed);
+    record_.lastDesignatedCount.store(designatedOutputs.size(), std::memory_order_relaxed);
+    record_.lastSequenceNumber.store(receipt.sequenceNumber, std::memory_order_relaxed);
+    return Bytes();
+  }
+
+  std::optional<Bytes> onDisconnect(const SessionInfo&) override { return std::nullopt; }
+
+ private:
+  DesignatedRecord& record_;
 };
 
 Bytes bytesOf(std::int64_t v) {
@@ -246,6 +279,66 @@ TEST_F(InputGatewayTest, SignatureVerifierRejectionPreventsProposing) {
 
   journal::JournalReader reader(dir_ / "journal");
   EXPECT_EQ(reader.committedCount(), 0u) << "a rejected signature must never reach Propose";
+}
+
+// specification.md §8.11: on a SessionStream transport the chassis MUST
+// NOT hand designated outputs to the codec for client delivery -- the
+// output side sends every output for that session from the journal
+// instead, and delivering both would break the exactly-once rule and
+// the cross-order ordering that depends on it.
+//
+// The paired assertions are the point. The RequestResponse arm proves
+// the state machine really did designate an output, so the
+// SessionStream arm's empty span is the chassis withholding it rather
+// than there being nothing to withhold -- which is the way this test
+// could pass while testing nothing.
+TEST_F(InputGatewayTest, RequestResponseTransportDeliversDesignatedOutputsToTheCodec) {
+  gateway_->stop();
+  DesignatedRecord record;
+  InputGatewayConfig gatewayConfig;
+  gatewayConfig.nodeEndpoints = {"127.0.0.1:28951"};
+  gatewayConfig.listenPort = 28952;
+  gatewayConfig.transportShape = sequencer::TransportShape::RequestResponse;
+  gateway_ = std::make_unique<InputGatewayImpl>(
+      gatewayConfig, std::make_unique<RecordingCodec>(record), verifier_);
+  gateway_->start();
+
+  const SubmitResult result = submit(bytesOf(5));
+  ASSERT_FALSE(result.failed) << result.errorText;
+  EXPECT_EQ(record.calls.load(), 1);
+  EXPECT_EQ(record.lastDesignatedCount.load(), 1u)
+      << "the counter state machine designates one output; a RequestResponse "
+          "transport must deliver it synchronously";
+  EXPECT_GT(record.lastSequenceNumber.load(), 0u);
+}
+
+TEST_F(InputGatewayTest, SessionStreamTransportWithholdsDesignatedOutputsFromTheCodec) {
+  gateway_->stop();
+  DesignatedRecord record;
+  InputGatewayConfig gatewayConfig;
+  gatewayConfig.nodeEndpoints = {"127.0.0.1:28951"};
+  gatewayConfig.listenPort = 28952;
+  gatewayConfig.transportShape = sequencer::TransportShape::SessionStream;
+  gateway_ = std::make_unique<InputGatewayImpl>(
+      gatewayConfig, std::make_unique<RecordingCodec>(record), verifier_);
+  gateway_->start();
+
+  const SubmitResult result = submit(bytesOf(5));
+  ASSERT_FALSE(result.failed) << result.errorText;
+
+  EXPECT_EQ(record.calls.load(), 1) << "the codec is still called: the receipt is real, and the "
+                                       "gateway needs it for admission and bookkeeping";
+  EXPECT_EQ(record.lastDesignatedCount.load(), 0u)
+      << "§8.11: a session transport's outputs are delivered from the journal, "
+          "never as the propose path's synchronous reply";
+  // The receipt itself must survive -- it is what the session gateway
+  // uses for gap detection and timeouts.
+  EXPECT_GT(record.lastSequenceNumber.load(), 0u);
+
+  // And the output still exists in the journal, which is the path that
+  // will carry it. Withholding is not dropping.
+  journal::JournalReader reader(dir_ / "journal");
+  EXPECT_EQ(reader.committedCount(), 1u);
 }
 
 }  // namespace

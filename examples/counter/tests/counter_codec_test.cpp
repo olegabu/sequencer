@@ -9,6 +9,7 @@
 #include <sequencer/journal/record_view.hpp>
 
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -71,9 +72,23 @@ TEST(CounterInputCodec, ToOutputProducesSequenceNumberAndTotalJson) {
   CounterInputCodec codec;
   const std::int64_t total = 42;
   Receipt receipt{7};
-  Bytes response = codec.toOutput(receipt, Payload(reinterpret_cast<const std::byte*>(&total), sizeof(total)));
+  const Payload designated[] = {Payload(reinterpret_cast<const std::byte*>(&total), sizeof(total))};
+  Bytes response = codec.toOutput(receipt, std::span<const Payload>(designated, 1));
   const std::string json(reinterpret_cast<const char*>(response.data()), response.size());
   EXPECT_EQ(json, R"({"sequence_number":7,"total":42})");
+}
+
+// specification.md §4 lets a state machine designate nothing, and
+// §8.11 has the chassis hand this codec an empty span on a
+// SessionStream transport regardless of what was designated. Either
+// way the codec must produce a well-formed response rather than read
+// past an empty span.
+TEST(CounterInputCodec, ToOutputHandlesAnEmptyDesignatedSet) {
+  CounterInputCodec codec;
+  Receipt receipt{9};
+  Bytes response = codec.toOutput(receipt, std::span<const Payload>());
+  const std::string json(reinterpret_cast<const char*>(response.data()), response.size());
+  EXPECT_EQ(json, R"({"sequence_number":9,"total":0})");
 }
 
 TEST(CounterInputCodec, OnDisconnectReturnsNulloptForStatelessProtocol) {

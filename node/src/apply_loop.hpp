@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -27,8 +28,12 @@ namespace sequencer::node::detail {
 // journal (§5.1: "journal append precedes acknowledgement") — this is
 // the harness's entire acknowledgement mechanism. `context` is exactly
 // what was passed to CommittedEntryRing::push() for this entry.
+// `designatedOutputs` is in EMISSION order and may be empty
+// (specification.md §4, §5.2). Plural since 2026-08-31; the callee must
+// copy what it needs before returning, because these Payloads point
+// into the arena the next apply() reuses.
 using CompletionCallback = void (*)(void* context, std::uint64_t sequenceNumber,
-                                     Payload designatedOutput);
+                                     std::span<const Payload> designatedOutputs);
 
 class ApplyLoop {
  public:
@@ -55,7 +60,7 @@ class ApplyLoop {
     journal_.append(sequenceNumber, entry.input, collector_.outputs());
 
     if (onApplied_ != nullptr) {
-      onApplied_(entry.context, sequenceNumber, collector_.designatedOutput());
+      onApplied_(entry.context, sequenceNumber, collector_.designatedOutputs());
     }
     return true;
   }

@@ -8,6 +8,7 @@
 #include <sequencer/journal/reader.hpp>
 
 #include <atomic>
+#include <span>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -42,12 +43,17 @@ struct CompletionCtx {
   std::atomic<bool> called{false};
   std::uint64_t sequenceNumber = 0;
   std::int64_t designatedTotal = 0;
+  std::size_t designatedCount = 0;
 };
 
-void recordCompletion(void* context, std::uint64_t sequenceNumber, Payload designatedOutput) {
+void recordCompletion(void* context, std::uint64_t sequenceNumber,
+                       std::span<const Payload> designatedOutputs) {
   auto* ctx = static_cast<CompletionCtx*>(context);
   ctx->sequenceNumber = sequenceNumber;
-  std::memcpy(&ctx->designatedTotal, designatedOutput.data(), sizeof(ctx->designatedTotal));
+  ctx->designatedCount = designatedOutputs.size();
+  if (!designatedOutputs.empty()) {
+    std::memcpy(&ctx->designatedTotal, designatedOutputs[0].data(), sizeof(ctx->designatedTotal));
+  }
   ctx->called.store(true, std::memory_order_release);
 }
 

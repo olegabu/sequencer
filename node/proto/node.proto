@@ -23,7 +23,19 @@ message ProposeRequest {
 message ProposeResponse {
   // Set when the input was committed and applied.
   optional uint64 sequence_number = 1;
-  optional bytes designated_output = 2;
+
+  // The submitting client's synchronous reply outputs, in EMISSION
+  // order (specification.md §4, §5.2). Plural since 2026-08-31: a
+  // state machine may designate any number of its outputs, which the
+  // previous at-most-one field could not express -- an order-matching
+  // state machine designates an acknowledgement, then each partial
+  // fill, then a final state, all of them the submitter's own.
+  //
+  // Field 2 stays reserved: it held the singular `designated_output`,
+  // and reusing the number would let an old client silently decode a
+  // new server's first element as the whole reply.
+  reserved 2;
+  repeated bytes designated_outputs = 6;
 
   // Set when this node is not the leader (specification.md §3:
   // "Propose(bytes) -> {...} | redirect(leader) | error"). The caller
@@ -59,8 +71,11 @@ message ProposeBatchRequest {
 // batch.
 message ProposeResult {
   optional uint64 sequence_number = 1;
-  optional bytes designated_output = 2;
+  // See ProposeResponse.designated_outputs; same change, same reason,
+  // and field 2 is reserved here for the same reason.
+  reserved 2;
   optional string error_message = 3;
+  repeated bytes designated_outputs = 4;
 }
 
 message ProposeBatchResponse {

@@ -2,6 +2,12 @@
 
 // specification.md §8.5: the input side's generic chassis.
 
+// specification.md §8.11: a gateway delivers each output to a given
+// client exactly once, by the path its transport shape dictates, and
+// never by both. This chassis enforces that -- see TransportShape in
+// <sequencer/input_codec.hpp> and the guard in
+// src/submit_service_impl.hpp.
+
 #include <memory>
 
 #include <sequencer/input_codec.hpp>

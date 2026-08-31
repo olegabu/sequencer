@@ -129,7 +129,7 @@ class NodeProposer {
   struct Outcome {
     bool ok = false;
     Receipt receipt{};
-    Bytes designatedOutput;
+    std::vector<Bytes> designatedOutputs;
     std::string errorMessage;
   };
 
@@ -173,10 +173,11 @@ class NodeProposer {
       Outcome outcome;
       outcome.ok = true;
       outcome.receipt.sequenceNumber = response.sequence_number();
-      const std::string& designated = response.designated_output();
-      outcome.designatedOutput.assign(reinterpret_cast<const std::byte*>(designated.data()),
-                                       reinterpret_cast<const std::byte*>(designated.data()) +
-                                           designated.size());
+      for (const std::string& designated : response.designated_outputs()) {
+        outcome.designatedOutputs.emplace_back(
+            reinterpret_cast<const std::byte*>(designated.data()),
+            reinterpret_cast<const std::byte*>(designated.data()) + designated.size());
+      }
       return outcome;
     }
 
@@ -389,10 +390,11 @@ class NodeProposer {
       } else {
         outcome.ok = true;
         outcome.receipt.sequenceNumber = result.sequence_number();
-        const std::string& designated = result.designated_output();
-        outcome.designatedOutput.assign(reinterpret_cast<const std::byte*>(designated.data()),
-                                         reinterpret_cast<const std::byte*>(designated.data()) +
-                                             designated.size());
+        for (const std::string& designated : result.designated_outputs()) {
+          outcome.designatedOutputs.emplace_back(
+              reinterpret_cast<const std::byte*>(designated.data()),
+              reinterpret_cast<const std::byte*>(designated.data()) + designated.size());
+        }
       }
       ctx->pendings[i]->onDone(std::move(outcome));
     }
@@ -464,10 +466,11 @@ class NodeProposer {
     Outcome outcome;
     outcome.ok = true;
     outcome.receipt.sequenceNumber = ctx->response.sequence_number();
-    const std::string& designated = ctx->response.designated_output();
-    outcome.designatedOutput.assign(reinterpret_cast<const std::byte*>(designated.data()),
-                                     reinterpret_cast<const std::byte*>(designated.data()) +
-                                         designated.size());
+    for (const std::string& designated : ctx->response.designated_outputs()) {
+      outcome.designatedOutputs.emplace_back(
+          reinterpret_cast<const std::byte*>(designated.data()),
+          reinterpret_cast<const std::byte*>(designated.data()) + designated.size());
+    }
     ctx->onDone(std::move(outcome));
   }
 

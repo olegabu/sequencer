@@ -9,6 +9,8 @@
 // appears anywhere in this repository's dependency list (specification.md
 // §9), and these shapes don't warrant adding one.
 
+#include <span>
+
 #include <sequencer/input_codec.hpp>
 
 namespace sequencer::examples::counter {
@@ -23,7 +25,8 @@ class CounterInputCodec : public sequencer::InputCodec {
   // -> {"sequence_number": <uint64>, "total": <int64>}. The submitting
   // client is the designated output's only interested party
   // (specification.md §10), so this is the whole response.
-  Bytes toOutput(const Receipt& receipt, Payload designatedOutput) override;
+  Bytes toOutput(const Receipt& receipt,
+                  std::span<const Payload> designatedOutputs) override;
 
   // Counter is stateless request/response — no session, so nothing to
   // propose on disconnect.
