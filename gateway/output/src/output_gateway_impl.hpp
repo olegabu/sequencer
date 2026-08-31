@@ -138,17 +138,40 @@ class OutputGatewayImpl {
     RingFanout(sequencer::BroadcastRing& ring, sequencer::TopicRegistry& topics)
         : ring_(ring), topics_(topics) {}
 
+    // Called by the tail loop before each record's toOutput(), so every
+    // entry the codec publishes carries the journal position it came
+    // from. A transport cannot recover that afterwards -- an entry is
+    // (tag, payload) -- and gateway/fix/ needs it to serve a FIX
+    // ResendRequest from the journal rather than from a message store
+    // (specification.md §8.12 reason 1).
+    //
+    // Only the tail thread touches these, which is why they are plain
+    // members: the codec runs on it, and so does every publish.
+    void beginRecord(std::uint64_t journalSequenceNumber) {
+      journalSequenceNumber_ = journalSequenceNumber;
+      outputIndex_ = 0;
+    }
+
     void toSession(sequencer::SessionId owner, Bytes bytes) override {
-      ring_.publish(sequencer::makeSessionTag(owner), bytes.data(), bytes.size());
+      ring_.publish(sequencer::makeSessionTag(owner), bytes.data(), bytes.size(), origin());
     }
 
     void broadcast(const std::string& topic, Bytes bytes) override {
-      ring_.publish(sequencer::makeTopicTag(topics_.idFor(topic)), bytes.data(), bytes.size());
+      ring_.publish(sequencer::makeTopicTag(topics_.idFor(topic)), bytes.data(), bytes.size(),
+                     origin());
     }
 
    private:
+    // One record may emit several outputs; the index distinguishes them
+    // so a resend can name exactly one.
+    sequencer::RecordOrigin origin() {
+      return sequencer::RecordOrigin{journalSequenceNumber_, outputIndex_++};
+    }
+
     sequencer::BroadcastRing& ring_;
     sequencer::TopicRegistry& topics_;
+    std::uint64_t journalSequenceNumber_ = 0;
+    std::uint32_t outputIndex_ = 0;
   };
 
   void tailLoop() {
@@ -185,6 +208,7 @@ class OutputGatewayImpl {
       int processed = 0;
       while (processed < kMaxBurst && reader->contains(seq) &&
              !stopRequested_.load(std::memory_order_relaxed)) {
+        ringFanout_.beginRecord(seq);
         codec_->toOutput(reader->record(seq), ringFanout_);
         ++seq;
         ++processed;

@@ -57,7 +57,8 @@ struct FixOutputTransport::Impl {
   // Delivers one ring entry as a FIX message on one session. The body
   // is whatever the OutputCodec produced; the session core supplies
   // MsgSeqNum, SendingTime and CheckSum.
-  void deliver(std::uint64_t sessionId, std::string_view body) {
+  void deliver(std::uint64_t sessionId, std::string_view body,
+                const sequencer::RecordOrigin& origin) {
     FixSession* session = sessions.sessionFor(sessionId);
     if (session == nullptr) {
       return;  // gone between the ring read and here
@@ -78,28 +79,14 @@ struct FixOutputTransport::Impl {
     }
     const std::uint64_t outboundSeqNum = session->sendApplication(msgType, rest);
 
-    // What a later ResendRequest needs (§8.12 reason 1: no message
-    // store -- the journal is the store).
-    //
-    // INCOMPLETE, and stated rather than glossed: journalSequenceNumber
-    // and outputIndex are left zero because the BroadcastRing entry
-    // does not carry them. The ring publishes (tag, payload), so by the
-    // time an entry reaches a transport the journal position that
-    // produced it is gone. Plumbing it through means widening the ring
-    // entry, which changes BroadcastRing for the brpc, gRPC and
-    // WebSocket transports too -- a deliberate decision rather than an
-    // incidental one, so it is not made here.
-    //
-    // What this DOES record is enough to serve a resend for a message
-    // still in this process's memory: the type and original
-    // SendingTime, which FIX requires be preserved on a PossDup resend.
-    // What it cannot yet do is survive a restart, which is exactly the
-    // case the journal-as-resend-store exists for. Until the ring
-    // carries the position, a post-restart ResendRequest falls back to
-    // the gap fill the session core already sends when its
-    // ResendSource cannot serve a range -- correct FIX behaviour, but
-    // not the behaviour §8.12 promises.
+    // What a later ResendRequest needs. specification.md §8.12 reason
+    // 1: there is no outbound message store -- this records WHERE in
+    // the journal the message came from, and a resend re-reads it.
+    // That is what lets a resend survive a restart, which a copy held
+    // in memory cannot.
     SentRecord record;
+    record.journalSequenceNumber = origin.journalSequenceNumber;
+    record.outputIndex = origin.outputIndex;
     record.msgType = std::string(msgType);
     recordSent(sessionId, outboundSeqNum, record);
   }
@@ -150,7 +137,9 @@ void FixOutputTransport::start(int /*listenPort*/) {
     while (!impl_->stopping.load(std::memory_order_relaxed)) {
       std::uint64_t tag = 0;
       std::uint32_t length = 0;
-      const auto result = impl_->ring->readOne(cursor, tag, payload.data(), length);
+      sequencer::RecordOrigin origin;
+      const auto result =
+          impl_->ring->readOne(cursor, tag, payload.data(), length, origin);
       if (result == sequencer::BroadcastRing::ReadResult::Empty) {
         idle.idle();
         continue;
@@ -168,14 +157,14 @@ void FixOutputTransport::start(int /*listenPort*/) {
 
       const std::string_view body(reinterpret_cast<const char*>(payload.data()), length);
       if ((tag & sequencer::kSessionTagBit) != 0) {
-        impl_->deliver(tag & ~sequencer::kSessionTagBit, body);
+        impl_->deliver(tag & ~sequencer::kSessionTagBit, body, origin);
       } else {
         // A broadcast reaches only the sessions that asked for this
         // topic through MarketDataRequest.
         const std::string topic = impl_->topicNameFor(static_cast<std::uint32_t>(tag));
         if (!topic.empty()) {
           for (const std::uint64_t sessionId : impl_->subscribersOf(topic)) {
-            impl_->deliver(sessionId, body);
+            impl_->deliver(sessionId, body, origin);
           }
         }
       }

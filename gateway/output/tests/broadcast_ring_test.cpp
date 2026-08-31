@@ -255,4 +255,60 @@ TEST(BroadcastRing, LappedReaderSeesOverrunsButNeverTornPayloads) {
 }
 
 }  // namespace
+// The journal origin rides the same version protocol as the tag and
+// payload (broadcast_ring.hpp's publish()). gateway/fix/ uses it to
+// serve a FIX ResendRequest from the journal instead of from a message
+// store, so pairing a payload with someone else's origin would
+// attribute a resend to the wrong record -- worse than not having the
+// field.
+TEST(BroadcastRing, RecordOriginTravelsWithItsEntry) {
+  BroadcastRing ring(8, 64);
+  std::uint64_t cursor = ring.head();
+
+  for (std::uint64_t i = 1; i <= 4; ++i) {
+    const std::string payload = "record-" + std::to_string(i);
+    ring.publish(makeTopicTag(1), reinterpret_cast<const std::byte*>(payload.data()),
+                  payload.size(), RecordOrigin{100 + i, static_cast<std::uint32_t>(i % 2)});
+  }
+
+  std::vector<std::byte> buffer(ring.maxPayload());
+  for (std::uint64_t i = 1; i <= 4; ++i) {
+    std::uint64_t tag = 0;
+    std::uint32_t length = 0;
+    RecordOrigin origin;
+    ASSERT_EQ(ring.readOne(cursor, tag, buffer.data(), length, origin),
+              BroadcastRing::ReadResult::Ok);
+    EXPECT_EQ(origin.journalSequenceNumber, 100 + i);
+    EXPECT_EQ(origin.outputIndex, i % 2);
+    const std::string got(reinterpret_cast<const char*>(buffer.data()), length);
+    EXPECT_EQ(got, "record-" + std::to_string(i))
+        << "the origin must belong to THIS payload, not a neighbour's";
+  }
+}
+
+// A producer that supplies no origin gets zeroes rather than whatever
+// the previous lap left in the slot -- the three transports that do not
+// use origins publish this way.
+TEST(BroadcastRing, AnOmittedOriginDoesNotInheritThePreviousLapsValue) {
+  BroadcastRing ring(2, 64);
+  const std::string payload = "x";
+  ring.publish(makeTopicTag(1), reinterpret_cast<const std::byte*>(payload.data()),
+                payload.size(), RecordOrigin{42, 7});
+  // Lap the ring twice so the slot is reused.
+  std::uint64_t cursor = ring.head();
+  ring.publish(makeTopicTag(1), reinterpret_cast<const std::byte*>(payload.data()),
+                payload.size());
+  ring.publish(makeTopicTag(1), reinterpret_cast<const std::byte*>(payload.data()),
+                payload.size());
+
+  std::vector<std::byte> buffer(ring.maxPayload());
+  std::uint64_t tag = 0;
+  std::uint32_t length = 0;
+  RecordOrigin origin{999, 999};
+  ASSERT_EQ(ring.readOne(cursor, tag, buffer.data(), length, origin),
+            BroadcastRing::ReadResult::Ok);
+  EXPECT_EQ(origin.journalSequenceNumber, 0u);
+  EXPECT_EQ(origin.outputIndex, 0u);
+}
+
 }  // namespace sequencer

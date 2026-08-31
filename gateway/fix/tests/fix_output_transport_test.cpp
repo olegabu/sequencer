@@ -143,9 +143,11 @@ struct SessionGateway {
   }
 
   // What OutputGatewayImpl's RingFanout does: publish a tagged entry.
-  void publishToSession(std::uint64_t sessionId, const std::string& body) {
+  void publishToSession(std::uint64_t sessionId, const std::string& body,
+                         std::uint64_t journalSeq = 0, std::uint32_t outputIndex = 0) {
     ring.publish(sequencer::makeSessionTag(sessionId),
-                  reinterpret_cast<const std::byte*>(body.data()), body.size());
+                  reinterpret_cast<const std::byte*>(body.data()), body.size(),
+                  sequencer::RecordOrigin{journalSeq, outputIndex});
   }
   void publishBroadcast(const std::string& topic, const std::string& body) {
     ring.publish(sequencer::makeTopicTag(topics.idFor(topic)),
@@ -231,13 +233,27 @@ TEST(FixOutputTransport, SentMessagesAreRecordedForResend) {
   client.pumpFor(std::chrono::milliseconds(500), [&] { return gateway.requests.load() >= 1; });
   const std::uint64_t sessionId = gateway.sessionIds.front();
 
-  gateway.publishToSession(sessionId, "35=U2\0015001=7\001");
+  gateway.publishToSession(sessionId, "35=U2\0015001=7\001", /*journalSeq=*/4242,
+                            /*outputIndex=*/3);
   client.pumpFor(std::chrono::milliseconds(500), [&] { return !client.received().empty(); });
 
-  // The (session, outbound seqNum) -> what-was-sent map a ResendRequest
-  // consults. See the transport's own note on what this record does and
-  // does not yet carry.
-  EXPECT_GE(gateway.output->sentRecordCount(sessionId), 1u);
+  // The (session, outbound seqNum) -> JOURNAL POSITION map a
+  // ResendRequest consults. specification.md §8.12 reason 1: there is
+  // no outbound message store, so a resend re-reads the journal here --
+  // which is what lets it survive a restart.
+  ASSERT_GE(gateway.output->sentRecordCount(sessionId), 1u);
+  // Outbound 1 is the Logon echo; the application message follows it.
+  const SentRecord* record = nullptr;
+  for (std::uint64_t seq = 1; seq <= 4 && record == nullptr; ++seq) {
+    const SentRecord* candidate = gateway.output->sentRecord(sessionId, seq);
+    if (candidate != nullptr && candidate->journalSequenceNumber != 0) {
+      record = candidate;
+    }
+  }
+  ASSERT_NE(record, nullptr) << "the sent message must carry where it came from";
+  EXPECT_EQ(record->journalSequenceNumber, 4242u);
+  EXPECT_EQ(record->outputIndex, 3u);
+  EXPECT_EQ(record->msgType, "U2");
 }
 
 }  // namespace

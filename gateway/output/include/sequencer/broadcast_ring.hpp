@@ -86,6 +86,24 @@ class TopicRegistry {
   std::unordered_map<std::string, std::uint32_t> ids_;
 };
 
+// Where a published entry came from in the journal.
+//
+// The ring carries this because a transport cannot recover it
+// otherwise: an entry is (tag, payload), so by the time bytes reach a
+// reader the record that produced them is gone. gateway/fix/ needs it
+// to serve a FIX ResendRequest -- specification.md §8.12's reason 1 is
+// that the journal IS the resend store, and honouring that means
+// knowing which journal record each sent message came from, across a
+// restart.
+//
+// Zero means "not supplied". The producer default keeps it optional for
+// callers with nothing meaningful to record, and the three transports
+// that do not care simply use the readOne() overload without it.
+struct RecordOrigin {
+  std::uint64_t journalSequenceNumber = 0;
+  std::uint32_t outputIndex = 0;
+};
+
 class BroadcastRing {
  public:
   enum class ReadResult { Ok, Empty, Overrun };
@@ -101,6 +119,8 @@ class BroadcastRing {
         versions_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity)),
         tags_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity)),
         lengths_(std::make_unique<std::atomic<std::uint32_t>[]>(capacity)),
+        origins_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity)),
+        outputIndices_(std::make_unique<std::atomic<std::uint32_t>[]>(capacity)),
         storage_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity * wordsPerSlot_)) {
     if (capacity < 2 || (capacity & (capacity - 1)) != 0) {
       throw std::invalid_argument("BroadcastRing: capacity must be a power of two >= 2");
@@ -125,7 +145,8 @@ class BroadcastRing {
 
   // Producer side (single thread). Publishes one tagged payload;
   // never blocks, never waits on any reader.
-  void publish(std::uint64_t tag, const std::byte* data, std::size_t size) {
+  void publish(std::uint64_t tag, const std::byte* data, std::size_t size,
+                RecordOrigin origin = {}) {
     if (size > maxPayload_) {
       throw std::length_error("BroadcastRing::publish: payload exceeds maxPayload");
     }
@@ -143,6 +164,12 @@ class BroadcastRing {
     }
     tags_[i].store(tag, std::memory_order_relaxed);
     lengths_[i].store(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
+    // Inside the version protocol, exactly like the tag and length: a
+    // reader that paired a payload with a stale origin would attribute
+    // a resend to the wrong journal record, which is worse than not
+    // having the field at all.
+    origins_[i].store(origin.journalSequenceNumber, std::memory_order_relaxed);
+    outputIndices_[i].store(origin.outputIndex, std::memory_order_relaxed);
     versions_[i].store(2 * seq + 2, std::memory_order_release);  // even: holds seq
 
     head_.store(seq + 1, std::memory_order_release);
@@ -154,7 +181,17 @@ class BroadcastRing {
   // Overrun the producer has lapped this reader — the copy (if any)
   // is garbage and the reader's session should be closed; the cursor
   // is left untouched. Empty means caught up.
-  ReadResult readOne(std::uint64_t& cursor, std::uint64_t& tagOut, std::byte* buf, std::uint32_t& lengthOut) {
+  ReadResult readOne(std::uint64_t& cursor, std::uint64_t& tagOut, std::byte* buf,
+                      std::uint32_t& lengthOut) {
+    RecordOrigin ignored;
+    return readOne(cursor, tagOut, buf, lengthOut, ignored);
+  }
+
+  // The same, also reporting where the entry came from in the journal.
+  // Only gateway/fix/ needs this; the other transports use the form
+  // above and are unaffected.
+  ReadResult readOne(std::uint64_t& cursor, std::uint64_t& tagOut, std::byte* buf,
+                      std::uint32_t& lengthOut, RecordOrigin& originOut) {
     if (head_.load(std::memory_order_acquire) <= cursor) {
       return ReadResult::Empty;
     }
@@ -175,6 +212,8 @@ class BroadcastRing {
     // bounds even when stale.
     const std::uint32_t length = lengths_[i].load(std::memory_order_relaxed);
     const std::uint64_t tag = tags_[i].load(std::memory_order_relaxed);
+    const std::uint64_t origin = origins_[i].load(std::memory_order_relaxed);
+    const std::uint32_t outputIndex = outputIndices_[i].load(std::memory_order_relaxed);
     const std::atomic<std::uint64_t>* slot = storage_.get() + i * wordsPerSlot_;
     const std::size_t words = (length + 7) / 8;
     for (std::size_t w = 0; w < words; ++w) {
@@ -191,6 +230,8 @@ class BroadcastRing {
     }
     tagOut = tag;
     lengthOut = length;
+    originOut.journalSequenceNumber = origin;
+    originOut.outputIndex = outputIndex;
     ++cursor;
     return ReadResult::Ok;
   }
@@ -203,6 +244,10 @@ class BroadcastRing {
   std::unique_ptr<std::atomic<std::uint64_t>[]> versions_;
   std::unique_ptr<std::atomic<std::uint64_t>[]> tags_;
   std::unique_ptr<std::atomic<std::uint32_t>[]> lengths_;
+  // Published and re-checked under the same version protocol as the
+  // tag and length above -- see publish().
+  std::unique_ptr<std::atomic<std::uint64_t>[]> origins_;
+  std::unique_ptr<std::atomic<std::uint32_t>[]> outputIndices_;
   std::unique_ptr<std::atomic<std::uint64_t>[]> storage_;
 
   alignas(64) std::atomic<std::uint64_t> head_{0};
