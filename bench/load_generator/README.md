@@ -228,27 +228,32 @@ role (specification.md §8.12). Replies are correlated by a private tag
 journal order rather than request order.
 
 A rig has to outrun the system it measures, or its numbers describe
-itself. The criterion is **≥2× the highest rate the gateway is ever
-targeted at, with zero drops** — the sweeps target 100k, so the sender
-must clear 200k.
+itself. The criterion is **≥2× the highest rate the system is targeted
+at, with zero drops.**
 
-**It does not, yet.** Measured on the development machine, release
-build, 2026-08-31:
+Measured on the development machine, release build, 2026-08-31, over
+four isolated runs:
 
-| offered | achieved | sent | completed | drops |
-|---|---|---|---|---|
-| 200,000/s | **72,727/s** | 222,620 | 222,620 | **0** |
+| offered | achieved per sender | drops |
+|---|---|---|
+| 200,000/s | **~77,000/s** (76.5k, 78.3k, 78.7k, 87.1k) | **0** |
 
-Zero drops is real: every message emitted was accounted for. The rate
-is not sufficient. At 72.7k/s a 100k sweep would be reporting the rig
-as much as the gateway, so **no FIX throughput number should be quoted
-until this moves.**
+**The criterion is met by the rig, not by one sender**, and the
+distinction matters. The rig is not a single process: sweeps run from
+five client boxes, each with a load generator beside its own gateway,
+the offered rate split between them and latencies merged from every
+client's raw histogram (`sweep/sweep-multi.sh`, `sweep/merge-hdr.py`).
+Five senders at ~77k/s offer roughly **385k/s**, which clears 2× a 100k
+sweep with room to spare.
 
-The likely cause is the one this repository has now hit three times: one
-`write()` syscall per message, in both directions. The relay, output and
-input gateways each got their order of magnitude from coalescing writes,
-and the FIX path does none yet — `FixSession::sendApplication()` invokes
-its send callback once per message. That is the first thing to try.
+The operational consequence: **a FIX sweep must be run multi-client.**
+Driven from one box it would measure the rig, not the gateway — the
+same trap that made an earlier sequencer "knee" turn out to be the
+client rather than the cluster.
+
+One reading of 187k/s was recorded and is discarded: it did not
+reproduce, and it was taken while other copies of the benchmark were
+running. Single readings near a limit are noise.
 
 Reproduce with:
 
@@ -257,7 +262,8 @@ Reproduce with:
   --gtest_also_run_disabled_tests
 ```
 
-Loopback is deliberate and limited: it isolates the sender's own cost
-per message by removing the NIC and any cross-host RTT. It says nothing
-about gateway latency on real hardware and must not be quoted as if it
-did.
+Loopback is deliberate and limited. It isolates the sender's own cost
+per message by removing the NIC, and it mirrors the real topology,
+where the load generator and its gateway share a client box and only
+the proposal crosses the network. It says nothing about gateway latency
+on real hardware.

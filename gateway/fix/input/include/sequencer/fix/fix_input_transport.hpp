@@ -89,6 +89,8 @@ class FixInputTransport : public sequencer::InputTransport, public SessionSource
   std::vector<std::uint64_t> liveSessions() override;
   void setSubscribeFn(SubscribeFn fn) override;
   void setSessionReadyFn(SessionReadyFn fn) override;
+  void beginBatch(std::uint64_t sessionId) override;
+  void endBatch(std::uint64_t sessionId) override;
 
   struct Impl;
 

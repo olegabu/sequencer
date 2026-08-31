@@ -2,6 +2,7 @@
 
 #include <sequencer/journal/reader.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -347,41 +348,74 @@ void FixOutputTransport::start(int /*listenPort*/) {
     sequencer::IdleStrategy idle(impl_->idleSpinIterations);
     std::vector<std::byte> payload(impl_->ring->maxPayload());
 
+    // Drains a BATCH of ring entries, then flushes each session that
+    // was written to exactly once. One socket write carries however
+    // many messages were already waiting -- see SessionSource's
+    // beginBatch() for why that is safe and why it costs an idle
+    // session nothing.
+    constexpr int kMaxDrain = 1024;
+    std::vector<std::uint64_t> touched;
+
     while (!impl_->stopping.load(std::memory_order_relaxed)) {
-      std::uint64_t tag = 0;
-      std::uint32_t length = 0;
-      sequencer::RecordOrigin origin;
-      const auto result =
-          impl_->ring->readOne(cursor, tag, payload.data(), length, origin);
-      if (result == sequencer::BroadcastRing::ReadResult::Empty) {
-        idle.idle();
-        continue;
+      touched.clear();
+      int gathered = 0;
+      bool sawOverrun = false;
+
+      while (gathered < kMaxDrain) {
+        std::uint64_t tag = 0;
+        std::uint32_t length = 0;
+        sequencer::RecordOrigin origin;
+        const auto result =
+            impl_->ring->readOne(cursor, tag, payload.data(), length, origin);
+        if (result == sequencer::BroadcastRing::ReadResult::Empty) {
+          break;
+        }
+        if (result == sequencer::BroadcastRing::ReadResult::Overrun) {
+          sawOverrun = true;
+          break;
+        }
+
+        const std::string_view body(reinterpret_cast<const char*>(payload.data()), length);
+        auto deliverTo = [&](std::uint64_t sessionId) {
+          if (std::find(touched.begin(), touched.end(), sessionId) == touched.end()) {
+            impl_->sessions.beginBatch(sessionId);
+            touched.push_back(sessionId);
+          }
+          impl_->deliver(sessionId, body, origin);
+        };
+
+        if ((tag & sequencer::kSessionTagBit) != 0) {
+          deliverTo(tag & ~sequencer::kSessionTagBit);
+        } else {
+          const std::string topic = impl_->topicNameFor(static_cast<std::uint32_t>(tag));
+          if (!topic.empty()) {
+            for (const std::uint64_t sessionId : impl_->subscribersOf(topic)) {
+              deliverTo(sessionId);
+            }
+          }
+        }
+        ++gathered;
       }
-      if (result == sequencer::BroadcastRing::ReadResult::Overrun) {
+
+      // One syscall per session per drain.
+      for (const std::uint64_t sessionId : touched) {
+        impl_->sessions.endBatch(sessionId);
+      }
+
+      if (sawOverrun) {
         // Lapped by the producer. Unlike a per-subscriber transport
-        // there is no single client to disconnect, so the honest
-        // response is to resume from the current head and let the
-        // affected sessions' ResendRequests recover the hole from the
-        // journal -- which is precisely what §8.12 reason 1's
+        // there is no single client to disconnect, so resume from the
+        // current head and let the affected sessions recover the hole
+        // from the journal -- which is what §8.12 reason 1's
         // journal-as-resend-store makes possible.
         cursor = impl_->ring->head();
         continue;
       }
-
-      const std::string_view body(reinterpret_cast<const char*>(payload.data()), length);
-      if ((tag & sequencer::kSessionTagBit) != 0) {
-        impl_->deliver(tag & ~sequencer::kSessionTagBit, body, origin);
+      if (gathered == 0) {
+        idle.idle();
       } else {
-        // A broadcast reaches only the sessions that asked for this
-        // topic through MarketDataRequest.
-        const std::string topic = impl_->topicNameFor(static_cast<std::uint32_t>(tag));
-        if (!topic.empty()) {
-          for (const std::uint64_t sessionId : impl_->subscribersOf(topic)) {
-            impl_->deliver(sessionId, body, origin);
-          }
-        }
+        idle.reset();
       }
-      idle.reset();
     }
   });
 }

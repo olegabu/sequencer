@@ -193,6 +193,11 @@ struct FixConnection {
   // session gateway the OUTPUT side writes execution reports on this
   // same session, from its own thread.
   std::mutex writeMutex;
+  // Outbound coalescing buffer. Non-empty only between beginBatch() and
+  // endBatch(); see SessionSource for why session-level traffic bypasses
+  // it.
+  std::string outBuffer;
+  int batchDepth = 0;
   std::thread reader;
   std::atomic<bool> stop{false};
   std::atomic<bool> loggedOn{false};
@@ -381,11 +386,45 @@ struct FixInputTransport::Impl {
 
   void write(FixConnection& connection, std::string_view frame) {
     std::lock_guard<std::mutex> lock(connection.writeMutex);
+    if (connection.batchDepth > 0) {
+      // Inside a batch: accumulate, and let endBatch() make one syscall
+      // of the lot.
+      connection.outBuffer.append(frame.data(), frame.size());
+      return;
+    }
+    writeLocked(connection, frame);
+  }
+
+  // Caller holds connection.writeMutex.
+  void writeLocked(FixConnection& connection, std::string_view frame) {
     boost::system::error_code ec;
     net::write(connection.socket, net::buffer(frame.data(), frame.size()), ec);
     // A write failure means the peer is gone; the reader thread will
     // see the same and run the disconnect path once.
     (void)ec;
+  }
+
+  void beginBatchFor(FixConnection& connection) {
+    std::lock_guard<std::mutex> lock(connection.writeMutex);
+    ++connection.batchDepth;
+  }
+
+  void endBatchFor(FixConnection& connection) {
+    std::lock_guard<std::mutex> lock(connection.writeMutex);
+    if (connection.batchDepth > 0 && --connection.batchDepth > 0) {
+      return;  // nested; the outermost flush wins
+    }
+    if (connection.outBuffer.empty()) {
+      return;
+    }
+    writeLocked(connection, connection.outBuffer);
+    connection.outBuffer.clear();
+  }
+
+  std::shared_ptr<FixConnection> connectionFor(std::uint64_t sessionId) {
+    std::lock_guard<std::mutex> lock(connectionsMutex);
+    const auto it = connections.find(sessionId);
+    return it == connections.end() ? nullptr : it->second;
   }
 };
 
@@ -426,6 +465,18 @@ void FixInputTransport::setSubscribeFn(SessionSource::SubscribeFn fn) {
 
 void FixInputTransport::setSessionReadyFn(SessionSource::SessionReadyFn fn) {
   impl_->onSessionReady = std::move(fn);
+}
+
+void FixInputTransport::beginBatch(std::uint64_t sessionId) {
+  if (auto connection = impl_->connectionFor(sessionId)) {
+    impl_->beginBatchFor(*connection);
+  }
+}
+
+void FixInputTransport::endBatch(std::uint64_t sessionId) {
+  if (auto connection = impl_->connectionFor(sessionId)) {
+    impl_->endBatchFor(*connection);
+  }
 }
 
 void FixInputTransport::start(int listenPort) {

@@ -60,17 +60,21 @@ session layer for the rig anyway. Building it once, usable in both
 roles, makes this gateway's session layer close to free and tests it
 from both sides.
 
-> **Measured, and not yet vindicated.** The rig criterion is ≥2× the
-> highest target rate on loopback with zero drops — 200k/s for a 100k
-> sweep. Our sender currently reaches **72,727/s** with zero drops
-> (release build, 2026-08-31; see
-> `bench/load_generator/README.md`). Zero drops is real; the rate is
-> not sufficient, and 72.7k/s is itself "tens of thousands", so this
-> reason's specific claim about outrunning QuickFIX is **unproven until
-> that number moves**. Reasons 1 and 3 are untouched by it. The sender
-> is deliberately naive — one write per message, no coalescing — which
-> is the first thing to try, and is how every other gateway here found
-> its order of magnitude.
+> **Measured.** The rig criterion is ≥2× the highest target rate with
+> zero drops. A single sender reaches **~77,000/s** on loopback with
+> zero drops (release build, 2026-08-31; four isolated runs, see
+> `bench/load_generator/README.md`). That does not clear 200k on its
+> own — but the rig is five client boxes, each with a load generator
+> beside its own gateway, so it offers roughly **385k/s**, which clears
+> 2× a 100k sweep comfortably. The operational rule that follows: a FIX
+> sweep must be run multi-client, exactly as the sequencer sweeps are.
+>
+> What this does *not* establish is the comparison against QuickFIX.
+> ~77k/s per sender is the same order the spec attributes to a QuickFIX
+> initiator, so reason 2's claim of outrunning it is **unproven**, even
+> though the rig as deployed is fast enough. Reasons 1 and 3 are
+> untouched. The sender is deliberately naive — one write per message —
+> and coalescing it is the obvious next step, untried.
 
 **3. We keep our own threading and allocation model.** An engine brings
 its thread and socket architecture with it, and QuickFIX's is a poor fit

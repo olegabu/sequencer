@@ -43,6 +43,30 @@ class SessionSource {
   // be too late.
   using SessionReadyFn = std::function<void(std::uint64_t sessionId, FixSession& session)>;
   virtual void setSessionReadyFn(SessionReadyFn fn) = 0;
+
+  // Write coalescing. Between beginBatch() and endBatch() a session's
+  // outbound messages accumulate into one buffer and leave as a SINGLE
+  // socket write; endBatch() flushes.
+  //
+  // TCP carries a byte stream with no message boundaries of its own, so
+  // several FIX messages in one write are indistinguishable to a
+  // receiver from several writes -- a parser finds each message by
+  // BodyLength and walks to its CheckSum. Verified from the other
+  // direction by FixSession.PartialAndCoalescedFramesAreBothHandled.
+  //
+  // The rule this follows, which the relay, output and input gateways
+  // all arrived at independently: gather whatever is available NOW,
+  // send once, never delay a send to wait for more. A message that
+  // arrives alone leaves alone, so an idle session pays nothing;
+  // batches only form when messages are already queued, which is
+  // exactly when the syscall saving matters.
+  //
+  // Session-level traffic -- heartbeats, TestRequest replies, Logon
+  // echoes -- deliberately does NOT pass through here. Holding a
+  // heartbeat behind a burst of execution reports would risk tripping
+  // the peer's silence timer, so those keep writing immediately.
+  virtual void beginBatch(std::uint64_t sessionId) = 0;
+  virtual void endBatch(std::uint64_t sessionId) = 0;
 };
 
 }  // namespace sequencer::fix
