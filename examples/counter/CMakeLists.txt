@@ -98,6 +98,7 @@ add_executable(counter_load_generator_main load_generator_main.cpp)
 # target, not sequencer::node -- this wants the wire format, not a node
 # harness (see node/CMakeLists.txt on why that distinction is load-bearing).
 target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::node_proto
+                                                            sequencer::bench_fix_requester
                                                             sequencer::bench_load_generator
                                                             sequencer::bench_relay_observer
                                                             sequencer::bench_output_observer

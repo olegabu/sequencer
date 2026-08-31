@@ -318,7 +318,10 @@ bool FixSession::checkSequence(const hffix::message_reader& message, char /*msgT
   }
 
   sequences_.nextInbound = *seqNum + 1;
-  persist();
+  // Throttled for the same reason as the journal position: this runs on
+  // every inbound message, and a filesystem write there is what capped
+  // the gateway near 750 messages/sec.
+  persistThrottled();
   return true;
 }
 
@@ -652,7 +655,18 @@ void FixSession::disconnect(DisconnectReason reason) {
   }
 }
 
-void FixSession::persist() { sequences_store_.store(sessionKey_, sequences_); }
+void FixSession::persist() {
+  sequences_store_.store(sessionKey_, sequences_);
+  lastPersistUs_ = clock_();
+}
+
+void FixSession::persistThrottled() {
+  const std::uint64_t now = clock_();
+  if (now - lastPersistUs_ < kPersistIntervalUs) {
+    return;
+  }
+  persist();
+}
 
 std::string FixSession::timestampNow() const {
   // FIX UTCTimestamp with milliseconds, from the WALL clock. Not from

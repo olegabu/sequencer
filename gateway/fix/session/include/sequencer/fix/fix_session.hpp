@@ -254,7 +254,7 @@ class FixSession {
       return;  // out-of-order or replayed; the high-water mark only rises
     }
     sequences_.lastJournalSequence = journalSequenceNumber;
-    persist();
+    persistThrottled();
   }
   const std::string& sessionKey() const noexcept { return sessionKey_; }
   DisconnectReason disconnectReason() const noexcept { return disconnectReason_; }
@@ -310,7 +310,34 @@ class FixSession {
                       bool isPossDup = false, std::string_view origSendingTime = {});
 
   void disconnect(DisconnectReason reason);
+
+  // Writes the counters through to the store, unconditionally.
   void persist();
+
+  // The same, but at most once every kPersistIntervalUs.
+  //
+  // The counters were persisted on EVERY message in both directions,
+  // and the store writes a temp file and renames it -- two filesystem
+  // round trips per message. Measured against examples/counter's FIX
+  // gateway, that capped the whole path near 750 messages/sec with
+  // latency climbing into seconds, while the sender alone manages ~77k
+  // on loopback. It is the single worst bottleneck this gateway had.
+  //
+  // What a throttle costs is bounded and worth naming: an ungraceful
+  // crash can lose up to one interval's advance, so a session may
+  // resume slightly behind and re-deliver a few messages it had
+  // already sent. FIX is built for exactly that -- they arrive as
+  // ordinary messages the peer's own sequence check discards as
+  // duplicates -- whereas the alternative is a gateway that cannot
+  // carry a thousand messages a second.
+  //
+  // Logon, Logout, sequence resets and disconnect still persist
+  // immediately: those are rare, and each one changes the counters in a
+  // way a stale file would make unrecoverable rather than merely
+  // duplicated.
+  void persistThrottled();
+
+  static constexpr std::uint64_t kPersistIntervalUs = 100'000;  // 100ms
   std::string timestampNow() const;
 
   SessionConfig config_;
@@ -338,6 +365,7 @@ class FixSession {
 
   std::uint64_t lastReceivedUs_ = 0;
   std::uint64_t lastSentUs_ = 0;
+  std::uint64_t lastPersistUs_ = 0;
   // Acceptor with no configured peer: the counters cannot be loaded
   // until the Logon names it. See adoptIdentity().
   bool identityPending_ = false;

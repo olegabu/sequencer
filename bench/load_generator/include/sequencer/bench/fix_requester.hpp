@@ -28,6 +28,9 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
 
+#include <sys/socket.h>
+#include <sys/time.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -103,6 +106,16 @@ class FixRequester : public LoadGeneratorRequester {
     }
   }
 
+  // Subscribes to a broadcast topic by its FIX-standard mechanism: a
+  // MarketDataRequest naming the topic as a Symbol (tag 55). Needed
+  // whenever the application under test broadcasts its replies rather
+  // than addressing the submitting session -- examples/counter does,
+  // for the reason its codec header gives.
+  void subscribe(const std::string& symbol) {
+    std::lock_guard<std::mutex> lock(sendMutex_);
+    session_->sendApplication("V", "262=loadgen\001263=1\001146=1\00155=" + symbol + "\001");
+  }
+
   void send(std::int64_t sequence, std::int64_t /*sendTimeUs*/,
              std::function<void(bool ok)> onDone) override {
     {
@@ -128,18 +141,41 @@ class FixRequester : public LoadGeneratorRequester {
             std::string(it->value().begin(), it->value().size()).c_str(), nullptr, 10);
       }
     }
-    if (correlation < 0) {
-      return;  // not one of ours
-    }
     std::function<void(bool)> done;
     {
       std::lock_guard<std::mutex> lock(pendingMutex_);
-      const auto it = pending_.find(correlation);
-      if (it == pending_.end()) {
-        return;  // already completed, or a duplicate
+      if (correlation >= 0) {
+        const auto it = pending_.find(correlation);
+        if (it == pending_.end()) {
+          return;  // already completed, or a duplicate
+        }
+        done = std::move(it->second);
+        pending_.erase(it);
+      } else {
+        // FIFO fallback: the reply carries no correlation tag, so
+        // complete the OLDEST outstanding request.
+        //
+        // This exists because an application's reply cannot always
+        // carry one. examples/counter is the case in point: its input
+        // is exactly eight bytes -- a delta and nothing else -- so the
+        // journal record holds no correlation id and its OutputCodec
+        // has none to echo (see counter_fix_codecs.hpp).
+        //
+        // VALID ONLY FOR ONE SESSION AT A TIME, and that condition is
+        // load-bearing. Outputs arrive in journal order and a single
+        // session submits in order, so the k-th reply belongs to the
+        // k-th request. Across several sessions sharing a broadcast
+        // topic it is simply wrong -- each would complete requests
+        // against other clients' replies -- so a multi-session FIX
+        // sweep needs an application whose reply echoes a correlation
+        // tag, which is what kCorrelationTag is for.
+        if (pending_.empty()) {
+          return;
+        }
+        const auto oldest = pending_.begin();
+        done = std::move(oldest->second);
+        pending_.erase(oldest);
       }
-      done = std::move(it->second);
-      pending_.erase(it);
     }
     if (done) {
       done(true);
@@ -147,6 +183,18 @@ class FixRequester : public LoadGeneratorRequester {
   }
 
   void receiveLoop() {
+    // A receive timeout so the blocking read returns periodically and
+    // the loop can see stopping_. Closing the socket from another
+    // thread does NOT reliably wake a thread parked in read_some --
+    // the same trap that deadlocked FixInputTransport::stop() earlier,
+    // reproduced here because this file was written from the same
+    // assumption. Without it the load generator ran fine and then hung
+    // forever at shutdown, never printing its summary.
+    struct timeval timeout {};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 200000;
+    ::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
     std::vector<char> buffer(64 * 1024);
     while (!stopping_.load(std::memory_order_relaxed)) {
       boost::system::error_code ec;
@@ -182,7 +230,11 @@ class FixRequester : public LoadGeneratorRequester {
   std::mutex writeMutex_;
   std::mutex sendMutex_;
   std::mutex pendingMutex_;
-  std::unordered_map<std::int64_t, std::function<void(bool)>> pending_;
+  // std::map, not unordered_map: the FIFO fallback above needs
+  // begin() to be the OLDEST outstanding request, and the harness's
+  // sequence numbers are monotonic, so ordered-by-key is ordered by
+  // age.
+  std::map<std::int64_t, std::function<void(bool)>> pending_;
 };
 
 }  // namespace sequencer::bench

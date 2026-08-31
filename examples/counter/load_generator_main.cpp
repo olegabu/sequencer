@@ -15,6 +15,7 @@
 
 #include <sequencer/bench/brpc_output_observer.hpp>
 #include <sequencer/bench/grpc_output_observer.hpp>
+#include <sequencer/bench/fix_requester.hpp>
 #include <sequencer/bench/load_generator.hpp>
 #include <sequencer/bench/relay_observer.hpp>
 #include <sequencer/bench/websocket_output_observer.hpp>
@@ -48,6 +49,24 @@ DEFINE_string(node_addr, "",
               "Bypass the input gateway: call the node's own ProposeService at this \"ip:port\" "
               "directly. Comma-separated endpoints are allowed; the first one that answers "
               "without a redirect is used for the whole run.");
+// The FIX arm. Unlike --input_gateway_addr and --node_addr, this is a
+// SESSION gateway: the same FIX session carries the submission and the
+// reply, so there is no separate observer to configure -- the round
+// trip is measured on one socket (specification.md §8.11, §8.12).
+//
+// Run it MULTI-CLIENT. A single sender reaches ~77k/s on loopback
+// (bench/load_generator/README.md), so one box cannot offer 2x a 100k
+// sweep and would measure the rig; five client boxes can. The same
+// discipline sweep-multi.sh already applies to the other arms.
+DEFINE_string(fix_gateway_addr, "",
+              "A FIX session gateway's \"ip:port\". Submits U1 and measures the U2 that comes "
+              "back from the journal on the same session");
+DEFINE_string(fix_sender_comp_id, "LOADGEN", "This sender's FIX CompID; must be unique per client");
+DEFINE_string(fix_target_comp_id, "SEQUENCER", "The gateway's FIX CompID");
+DEFINE_string(fix_subscribe_symbol, "TOTALS",
+              "Subscribe to this broadcast topic by MarketDataRequest before sending; empty "
+              "skips it. examples/counter broadcasts its totals, so this is required there");
+
 DEFINE_string(mode, "open", "closed: keep thread_num outstanding. open: emit at rate");
 DEFINE_int64(rate, 0, "Target requests per second (open mode)");
 DEFINE_int32(burst, 1, "Requests per scheduled instant, sharing its scheduled time (open mode)");
@@ -287,8 +306,10 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  if (FLAGS_input_gateway_addr.empty() && FLAGS_node_addr.empty()) {
-    LOG(ERROR) << "load_generator: one of --input_gateway_addr or --node_addr is required";
+  if (FLAGS_input_gateway_addr.empty() && FLAGS_node_addr.empty() &&
+      FLAGS_fix_gateway_addr.empty()) {
+    LOG(ERROR) << "load_generator: one of --input_gateway_addr, --node_addr or "
+                  "--fix_gateway_addr is required";
     return 1;
   }
 
@@ -358,7 +379,29 @@ int main(int argc, char** argv) {
   // Propose. See ProposeRequester's own comment for what the direct
   // arm skips beyond the network hop.
   std::unique_ptr<sequencer::bench::LoadGeneratorRequester> requesterOwner;
-  if (!FLAGS_node_addr.empty()) {
+  if (!FLAGS_fix_gateway_addr.empty()) {
+    const std::size_t colon = FLAGS_fix_gateway_addr.rfind(':');
+    if (colon == std::string::npos) {
+      LOG(ERROR) << "load_generator: --fix_gateway_addr must be \"ip:port\"";
+      return 1;
+    }
+    auto fix = std::make_unique<sequencer::bench::FixRequester>(
+        FLAGS_fix_gateway_addr.substr(0, colon),
+        std::stoi(FLAGS_fix_gateway_addr.substr(colon + 1)), FLAGS_fix_sender_comp_id,
+        FLAGS_fix_target_comp_id);
+    if (!fix->start()) {
+      LOG(ERROR) << "load_generator: FIX session did not establish against "
+                 << FLAGS_fix_gateway_addr;
+      return 1;
+    }
+    if (!FLAGS_fix_subscribe_symbol.empty()) {
+      // The counter broadcasts its totals, so without this the sender
+      // would submit happily and never see a reply.
+      fix->subscribe(FLAGS_fix_subscribe_symbol);
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    requesterOwner = std::move(fix);
+  } else if (!FLAGS_node_addr.empty()) {
     requesterOwner = std::make_unique<ProposeRequester>(FLAGS_node_addr, relayObserver.get(),
                                                           outputObserver.get());
   } else {
