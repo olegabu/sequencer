@@ -106,3 +106,73 @@ sequence-number order, delivered by the output side. The synchronous
 receipt from `Propose` is consumed internally — admission confirmation
 and the sequence number for gap and timeout handling — and discarded.
 Each output reaches a session exactly once, by that path, never both.
+
+## Recovery: three mechanisms, and which one to reach for
+
+These get conflated, and conflating them produces bugs that look like
+protocol failures. They are distinct, and only two of them live here.
+
+**`ResendRequest` — session-scoped recovery.** A client asks for
+outbound `MsgSeqNum` 7 through 12. Content-blind and protocol-level, so
+it applies to any FIX session, order entry and market data alike. Served
+from the journal: the gateway knows which record produced each message
+it sent, re-reads that record, and re-runs the codec over it. The same
+record through the same codec is the same bytes, which is why no
+outbound message store is needed. Resent messages carry `PossDupFlag`
+and their original `SendingTime`, as FIX 4.4 requires.
+
+**Catch-up — what the gateway could not send.** An output addressed to a
+session that is disconnected is never sent, so the outbound sequence
+number never advances for it. The returning client therefore has *no gap
+to detect*, and `ResendRequest` — which only replays numbers the gateway
+actually sent — correctly has nothing to offer. On Logon the gateway
+re-reads the journal from the session's last persisted position and
+sends what it missed as **new** messages.
+
+These messages are deliberately **not** flagged `PossDup`: that flag
+means "a retransmission of a message previously sent", and the gateway
+never sent these. Flagging them would invite a client to discard a real
+fill as a duplicate.
+
+Catch-up is bounded (10000 records). A session away for a long time
+would otherwise stall its own Logon replaying the whole journal onto it;
+past the bound the client resumes from a later point, the same guarantee
+FIX gives after an operator-forced reset.
+
+**Journal replay from an arbitrary point — not this gateway's job.**
+"Stream me everything from sequence N" is the relay gateway's contract
+(§8.2): `Subscribe(fromSequenceNumber)`, byte-identical records, any
+number of concurrent subscribers, no codec, shipped as a stock binary.
+Point clients there. Adding a user-defined FIX tag for it here would
+duplicate a component that already does it — and does it better, since
+the relay interprets nothing and so cannot alter what it replays. It
+would also need a non-standard tag no off-the-shelf FIX client could
+use, and a day-long replay would compete with live delivery on the same
+socket.
+
+The dividing line: **`ResendRequest` and catch-up are session-scoped and
+belong here; journal-scoped replay belongs to the relay.**
+
+## Two deployment shapes
+
+**Order entry** runs `input/` and `output/` in one process over one
+session-core instance, because FIX delivers every execution report for a
+session's orders — the aggressive fill on the order just sent, and the
+passive fill on one resting since this morning — on the order-entry
+session that owns them. Two independent gateways could not: the output
+side would have no way to reach the socket the order arrived on.
+
+**Market data** is output-only, fed by `Fanout::broadcast`, with no
+`InputCodec` and no raft endpoint — so it can be deployed where an
+order-entry gateway should not be, and a compromise of it can submit
+nothing. Subscription is FIX's own `MarketDataRequest`.
+
+Both shapes need the journal for recovery. A market-data session is a
+FIX session: it drops, reconnects, and recovers by exactly the two
+mechanisms above. It is not "tail the journal only".
+
+**Not yet implemented:** `MarketDataRequest`'s `SubscriptionRequestType`
+(263) is read as a subscription regardless of its value, so a client
+sending `263=0` (snapshot only) is registered for updates and gets no
+snapshot. A snapshot is an application-level query the codec or state
+machine must answer; the subscription half is what is built.
