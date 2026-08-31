@@ -123,6 +123,34 @@ struct FixOutputTransport::Impl {
     sent[sessionKey][seqNum] = record;
   }
 
+  // Per-session high-water mark of what has actually gone out, as
+  // (journal record, output index). In memory only: it exists to settle
+  // the narrow catch-up/live-reader race within one process. Across a
+  // restart the persisted lastJournalSequence is what matters, and
+  // catch-up resumes from there.
+  bool alreadyDelivered(const std::string& sessionKey, const sequencer::RecordOrigin& origin) {
+    std::lock_guard<std::mutex> lock(highWaterMutex);
+    const auto it = highWater.find(sessionKey);
+    if (it == highWater.end()) {
+      return false;
+    }
+    const auto& [seq, index] = it->second;
+    return origin.journalSequenceNumber < seq ||
+           (origin.journalSequenceNumber == seq && origin.outputIndex <= index);
+  }
+
+  void markDelivered(const std::string& sessionKey, const sequencer::RecordOrigin& origin) {
+    std::lock_guard<std::mutex> lock(highWaterMutex);
+    auto& mark = highWater[sessionKey];
+    if (origin.journalSequenceNumber > mark.first ||
+        (origin.journalSequenceNumber == mark.first && origin.outputIndex > mark.second)) {
+      mark = {origin.journalSequenceNumber, origin.outputIndex};
+    }
+  }
+
+  std::mutex highWaterMutex;
+  std::map<std::string, std::pair<std::uint64_t, std::uint32_t>> highWater;
+
   std::set<std::uint64_t> subscribersOf(const std::string& topic) {
     std::lock_guard<std::mutex> lock(subscriptionsMutex);
     const auto it = topicSubscribers.find(topic);
@@ -158,7 +186,26 @@ struct FixOutputTransport::Impl {
         rest = body.substr(soh + 1);
       }
     }
+    // Skip what catch-up already sent. Both paths can see the same
+    // record in the narrow window between catch-up reading the journal's
+    // committed count and the session becoming live on the ring, and a
+    // duplicate execution report is worse than a late one.
+    //
+    // Compared as (record, output index), NOT record alone: ONE record
+    // may emit SEVERAL outputs -- an aggressive fill and the passive
+    // fill it caused, in the order-entry case -- and a record-only
+    // comparison drops every output after the first, which is exactly
+    // what it did when first written.
+    if (origin.journalSequenceNumber != 0 &&
+        alreadyDelivered(session->sessionKey(), origin)) {
+      return;
+    }
+
     const std::uint64_t outboundSeqNum = session->sendApplication(msgType, rest);
+    if (origin.journalSequenceNumber != 0) {
+      markDelivered(session->sessionKey(), origin);
+      session->setLastJournalSequence(origin.journalSequenceNumber);
+    }
 
     // What a later ResendRequest needs. specification.md §8.12 reason
     // 1: there is no outbound message store -- this records WHERE in
@@ -187,6 +234,59 @@ FixOutputTransport::FixOutputTransport(SessionSource& sessions)
 
 FixOutputTransport::~FixOutputTransport() { stop(); }
 
+void FixOutputTransport::catchUp(FixSession& session) {
+  if (impl_->journal == nullptr || impl_->codec == nullptr) {
+    return;
+  }
+  const std::uint64_t from = session.sequences().lastJournalSequence + 1;
+  const std::uint64_t through = impl_->journal->committedCount();
+  if (from > through) {
+    return;  // nothing missed
+  }
+
+  // Bounded on purpose: a session away for a long time could otherwise
+  // block its own Logon while the whole journal is replayed onto it.
+  // Beyond this the client is told nothing special -- it simply starts
+  // from a later point, which is the same guarantee a FIX session gives
+  // after an operator-forced reset. A deployment that needs full
+  // history points the client at the relay (§8.2), which exists for
+  // exactly that and serves it without competing with live delivery.
+  constexpr std::uint64_t kMaxCatchUpRecords = 10000;
+  const std::uint64_t start =
+      (through - from + 1) > kMaxCatchUpRecords ? (through - kMaxCatchUpRecords + 1) : from;
+
+  for (std::uint64_t seq = start; seq <= through; ++seq) {
+    if (!impl_->journal->contains(seq)) {
+      continue;
+    }
+    CapturingFanout captured;
+    impl_->codec->toOutput(impl_->journal->record(seq), captured);
+    std::uint32_t outputIndex = 0;
+    for (const sequencer::Bytes& body : captured.outputs) {
+      const std::string_view raw(reinterpret_cast<const char*>(body.data()), body.size());
+      std::string_view msgType = "U2";
+      std::string_view rest = raw;
+      if (raw.size() > 3 && raw.compare(0, 3, "35=") == 0) {
+        const std::size_t soh = raw.find('\001');
+        if (soh != std::string_view::npos) {
+          msgType = raw.substr(3, soh - 3);
+          rest = raw.substr(soh + 1);
+        }
+      }
+      const std::uint64_t outboundSeqNum = session.sendApplication(msgType, rest);
+      SentRecord record;
+      record.journalSequenceNumber = seq;
+      record.outputIndex = outputIndex;
+      record.msgType = std::string(msgType);
+      impl_->recordSent(session.sessionKey(), outboundSeqNum, record);
+      impl_->markDelivered(session.sessionKey(),
+                            sequencer::RecordOrigin{seq, outputIndex});
+      ++outputIndex;
+    }
+    session.setLastJournalSequence(seq);
+  }
+}
+
 void FixOutputTransport::attachJournal(const std::filesystem::path& dataDir,
                                         sequencer::OutputCodec& codec) {
   impl_->journal = std::make_unique<sequencer::journal::JournalReader>(dataDir / "journal");
@@ -202,6 +302,14 @@ void FixOutputTransport::attachJournal(const std::filesystem::path& dataDir,
     // The session's own key, captured now that Logon has adopted the
     // peer's identity -- which is why this runs on session-ready and not
     // at accept time.
+    // Catch the session up on what it missed while away, BEFORE it can
+    // be sent anything live. specification.md §8.12: re-read the journal
+    // from the session's last persisted position. These go out as NEW
+    // messages, not resends -- the gateway never sent them, so there is
+    // no sequence number to replay (see SequenceNumbers::
+    // lastJournalSequence for why ResendRequest cannot do this).
+    catchUp(session);
+
     auto source = std::make_unique<JournalResendSource>(*this, session.sessionKey(),
                                                          *impl_->journal, *impl_->codec);
     session.setResendSource(source.get());

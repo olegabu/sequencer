@@ -104,6 +104,19 @@ struct SessionConfig {
 struct SequenceNumbers {
   std::uint64_t nextOutbound = 1;  // MsgSeqNum to put on the next message we send
   std::uint64_t nextInbound = 1;   // MsgSeqNum we expect to receive next
+
+  // The highest JOURNAL sequence number whose outputs this session has
+  // been sent. Not a FIX concept -- it is what specification.md §8.12
+  // calls "the session's last persisted position", and it is what makes
+  // a returning client catchable-up.
+  //
+  // It is needed because a resend cannot do that job: an output
+  // addressed to a disconnected session is never sent, so the outbound
+  // MsgSeqNum never advances for it, so the client has no gap to detect
+  // and ResendRequest -- which only replays numbers actually sent --
+  // has nothing to offer. Catch-up re-reads the journal from here and
+  // sends what was missed as NEW messages.
+  std::uint64_t lastJournalSequence = 0;
 };
 
 // Persistence for SequenceNumbers. An interface rather than a concrete
@@ -213,6 +226,17 @@ class FixSession {
   using IdentityGuard = std::function<bool(const std::string& sessionKey)>;
   void setIdentityGuard(IdentityGuard guard) { identityGuard_ = std::move(guard); }
   const SequenceNumbers& sequences() const noexcept { return sequences_; }
+
+  // Records how far through the journal this session has been caught
+  // up, and persists it. Called by the output side after a successful
+  // send; see SequenceNumbers::lastJournalSequence.
+  void setLastJournalSequence(std::uint64_t journalSequenceNumber) {
+    if (journalSequenceNumber <= sequences_.lastJournalSequence) {
+      return;  // out-of-order or replayed; the high-water mark only rises
+    }
+    sequences_.lastJournalSequence = journalSequenceNumber;
+    persist();
+  }
   const std::string& sessionKey() const noexcept { return sessionKey_; }
   DisconnectReason disconnectReason() const noexcept { return disconnectReason_; }
 

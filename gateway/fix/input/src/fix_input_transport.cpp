@@ -67,7 +67,7 @@ class FileSequenceStore : public SequenceStore {
     }
     std::ifstream in(pathFor(sessionKey));
     SequenceNumbers numbers;
-    if (in >> numbers.nextOutbound >> numbers.nextInbound) {
+    if (in >> numbers.nextOutbound >> numbers.nextInbound >> numbers.lastJournalSequence) {
       return numbers;
     }
     return SequenceNumbers{};
@@ -86,7 +86,8 @@ class FileSequenceStore : public SequenceStore {
     const std::filesystem::path tempPath = finalPath.string() + ".tmp";
     {
       std::ofstream out(tempPath, std::ios::trunc);
-      out << numbers.nextOutbound << ' ' << numbers.nextInbound << '\n';
+      out << numbers.nextOutbound << ' ' << numbers.nextInbound << ' '
+          << numbers.lastJournalSequence << '\n';
       out.flush();
     }
     std::filesystem::rename(tempPath, finalPath);

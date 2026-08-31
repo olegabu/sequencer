@@ -334,33 +334,19 @@ TEST(FixSessionGateway, ExecutionReportsArriveFromTheJournalInOrderNeverSynchron
 // sent map exist for. Keyed by connection instead, the returning
 // session could not see its own history and the resend degraded to a
 // gap fill exactly when it mattered most.
-// DISABLED, with the reason stated precisely rather than the test
-// deleted. The identity re-keying this needed IS done -- the sent map
-// is keyed by CompID pair now, so a returning session sees its own
-// history -- and that was necessary. It is not sufficient.
+// specification.md §8.12 end to end: a client that misses an execution
+// report while disconnected is caught up FROM THE JOURNAL when it
+// returns -- the record re-read and the codec re-run, with no outbound
+// message store anywhere.
 //
-// What is missing is CATCH-UP ON RECONNECT, which is a different
-// mechanism from ResendRequest and the rest of what step 2.5 asks for:
-// "reconstruct it on restart by re-reading the journal via the relay
-// from the session's last persisted position".
-//
-// The gap this test kept running into: an output addressed to a session
-// that is currently disconnected is dropped by deliver(), so the
-// gateway's outbound sequence number never advances for it. A client
-// that was away therefore has NO gap to detect when it returns -- from
-// the session layer's point of view nothing was ever sent to it -- and
-// ResendRequest, which only ever replays numbers the gateway did send,
-// correctly has nothing to offer. Catching such a client up means
-// re-reading the journal from its last persisted position and sending
-// what it missed as NEW messages, not as resends.
-//
-// ResendRequest itself works and is covered by fix_session_test.cpp's
-// direct tests: the source is consulted, finds the journal position,
-// re-reads the record, re-runs the codec, and emits with PossDupFlag
-// and the original SendingTime.
-//
-// Re-enable once reconnect catch-up lands.
-TEST(FixSessionGateway, DISABLED_AResendRequestIsServedFromTheJournal) {
+// This is catch-up, NOT ResendRequest, and the difference is the whole
+// lesson of getting here. The report was never sent to the absent
+// session, so no outbound sequence number exists to replay and the
+// client has no gap to detect. Catch-up re-reads the journal from the
+// session's last persisted position and sends what it missed as new
+// messages. ResendRequest covers the other case -- messages the gateway
+// did send -- and is tested directly in fix_session_test.cpp.
+TEST(FixSessionGateway, AClientIsCaughtUpFromTheJournalAfterReconnecting) {
   const std::filesystem::path dir = makeTempDir();
 
   node::detail::NodeConfig nodeConfig;
@@ -420,14 +406,26 @@ TEST(FixSessionGateway, DISABLED_AResendRequestIsServedFromTheJournal) {
     TestClient client(29612, "ACME", &clientStore);
     client.logon();
     // Its Logon carries the sequence number it left off at, so the
-    // gateway accepts it; the gateway's echo is ahead of what the
-    // client expects, so the client asks for the range and is caught up
-    // FROM THE JOURNAL.
+    // gateway accepts it and then catches it up from the journal --
+    // unprompted, because the client has no way to know what it missed.
     client.pumpFor(std::chrono::milliseconds(2000), [&] { return !client.received().empty(); });
 
     ASSERT_FALSE(client.received().empty())
         << "the reconnecting client must be caught up from the journal";
-    EXPECT_TRUE(client.sawPossDup()) << "FIX 4.4 requires a resent message carry PossDupFlag";
+    EXPECT_NE(client.received().back().find("AGGRESSIVE"), std::string::npos)
+        << "the missed execution report is what must arrive";
+
+    // NOT PossDup, and this is the assertion that distinguishes catch-up
+    // from a resend. PossDupFlag means "a retransmission of a message
+    // previously sent"; the gateway never sent this one, because the
+    // session was gone when it was published. Flagging it would tell
+    // the client to treat a message it has never seen as a possible
+    // duplicate, which is how a client ends up discarding a real fill.
+    //
+    // An earlier version of this test asserted the opposite, and was
+    // wrong in the same way the code would have been.
+    EXPECT_FALSE(client.sawPossDup())
+        << "catch-up sends messages the gateway never sent before; they are new, not duplicates";
   }
 
   std::raise(SIGTERM);

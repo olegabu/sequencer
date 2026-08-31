@@ -77,6 +77,16 @@ class FixOutputTransport : public sequencer::OutputTransport {
   // `codec` must outlive this transport; the session gateway owns it.
   void attachJournal(const std::filesystem::path& dataDir, sequencer::OutputCodec& codec);
 
+  // Sends a session everything addressed to it since its last persisted
+  // journal position, as NEW messages. Called automatically when a
+  // session completes Logon; exposed for tests.
+  //
+  // This is NOT a resend, and the distinction matters: an output
+  // addressed to a disconnected session was never sent, so no outbound
+  // sequence number exists to replay. ResendRequest recovers messages
+  // the gateway DID send; catch-up delivers the ones it could not.
+  void catchUp(FixSession& session);
+
   // The (FIX session, outbound MsgSeqNum) -> journal position mapping
   // that ResendRequest handling needs. There is no message store: a
   // resend re-reads the record named here.
