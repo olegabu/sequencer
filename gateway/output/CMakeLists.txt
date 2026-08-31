@@ -16,6 +16,27 @@ add_library(sequencer_gateway_output STATIC
 )
 add_library(sequencer::gateway_output ALIAS sequencer_gateway_output)
 
+# The application-facing INTERFACE an output codec is written against:
+# OutputCodec is a pure-virtual class in a header, so implementing one
+# needs no compiled code at all.
+#
+# It is separate from sequencer::gateway_output because that library
+# also contains run_output_gateway.cpp, whose DEFINE_string(data_dir,
+# ...) is a program-level gflag at namespace scope. node/ defines the
+# same flag for its own binary, so any target that pulled in both
+# libraries got two definitions of one symbol. That is exactly what
+# examples/counter's codec unit test did -- it needs both codecs, so it
+# transitively linked both gateways -- and it broke CI's linker
+# (binutils 2.38 on ubuntu-22.04 rejects the duplicate; 2.34 silently
+# merged it, which is why local builds kept passing).
+add_library(sequencer_output_codec_api INTERFACE)
+add_library(sequencer::output_codec_api ALIAS sequencer_output_codec_api)
+target_include_directories(sequencer_output_codec_api INTERFACE
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(sequencer_output_codec_api INTERFACE sequencer::journal)
+target_compile_features(sequencer_output_codec_api INTERFACE cxx_std_20)
+
 target_include_directories(sequencer_gateway_output
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"

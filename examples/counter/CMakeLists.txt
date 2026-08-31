@@ -26,7 +26,7 @@ add_library(counter::input_codec ALIAS counter_input_codec)
 target_include_directories(counter_input_codec PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
 )
-target_link_libraries(counter_input_codec PUBLIC sequencer::gateway_input)
+target_link_libraries(counter_input_codec PUBLIC sequencer::input_codec_api)
 target_compile_features(counter_input_codec PUBLIC cxx_std_20)
 
 add_library(counter_output_codec STATIC counter_output_codec.cpp)
@@ -34,11 +34,18 @@ add_library(counter::output_codec ALIAS counter_output_codec)
 target_include_directories(counter_output_codec PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
 )
-target_link_libraries(counter_output_codec PUBLIC sequencer::gateway_output)
+target_link_libraries(counter_output_codec PUBLIC sequencer::output_codec_api)
 target_compile_features(counter_output_codec PUBLIC cxx_std_20)
 
-# Convenience for anything that genuinely wants both sides (the codec
-# unit test, the input gateway mains).
+# Convenience for anything that genuinely wants both sides -- in
+# practice only the codec unit test, which exercises both directions.
+#
+# This is safe now only because the two codec libraries depend on the
+# codec INTERFACES rather than on the compiled gateway libraries. When
+# they linked the latter, this aggregate transitively pulled in both
+# run_output_gateway.cpp and run_node.cpp, each defining a
+# program-level DEFINE_string(data_dir, ...) -- one symbol, two
+# definitions, which CI's linker rejected.
 add_library(counter_codecs INTERFACE)
 add_library(counter::codecs ALIAS counter_codecs)
 target_link_libraries(counter_codecs INTERFACE counter::input_codec counter::output_codec)
@@ -86,9 +93,11 @@ target_link_libraries(counter_output_gateway_main PRIVATE counter::output_codec
 set_target_properties(counter_output_gateway_main PROPERTIES OUTPUT_NAME counter_output_gateway)
 
 add_executable(counter_load_generator_main load_generator_main.cpp)
-# sequencer::node for node.pb.h: --node_addr submits straight to a
-# node's own ProposeService, bypassing the input gateway.
-target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::node
+# sequencer::node_proto for node.pb.h: --node_addr submits straight to
+# a node's own ProposeService, bypassing the input gateway. The proto
+# target, not sequencer::node -- this wants the wire format, not a node
+# harness (see node/CMakeLists.txt on why that distinction is load-bearing).
+target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::node_proto
                                                             sequencer::bench_load_generator
                                                             sequencer::bench_relay_observer
                                                             sequencer::bench_output_observer
