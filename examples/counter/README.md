@@ -505,6 +505,29 @@ directory (colocated — see
   --websocket_port=8300
 ```
 
+A FIX session gateway runs alongside them, on its own port
+(specification.md §8.12). It is one process for both directions: orders
+in, totals out, on the same FIX session.
+
+```sh
+./build/debug/examples/counter/counter_fix_gateway \
+  --node_peers=127.0.0.1:8100 --listen_port=8500 \
+  --data_dir=/tmp/counter-node-0 \
+  --resume_file=/tmp/counter-node-0/fix-resume \
+  --sequence_store_dir=/tmp/counter-node-0/fix-seq
+```
+
+Send `U1` with tag 5001 carrying a signed delta; subscribe with a
+`MarketDataRequest` naming Symbol `TOTALS` and the new total comes back
+as `U2`. The total arrives **from the journal**, never as the reply to
+the order, even though `CounterStateMachine` designates it — that is
+§8.11's rule for a session transport, and
+`tests/fix_gateway_test.cpp` asserts it on the wire.
+
+`--sequence_store_dir` is worth setting: without it the per-session FIX
+sequence counters live in memory, and a restarted gateway cannot resume
+a client's session where it left off.
+
 Submit a delta and watch the total accumulate: with the load generator
 — a real open/closed-loop, HDR-histogram benchmark harness now (see
 [bench/load_generator/README.md](../../bench/load_generator/README.md)),

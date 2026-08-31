@@ -41,7 +41,7 @@ class RequestPipeline {
   void handle(std::shared_ptr<sequencer::RequestContext> request) {
     // acceptClientRequest() (generic) — the raw body, whatever protocol
     // delivered it.
-    const sequencer::ClientRequest clientRequest{request->body()};
+    const sequencer::ClientRequest clientRequest{request->body(), request->session()};
 
     // codec->toInput(request) — the one line that needs application
     // knowledge.

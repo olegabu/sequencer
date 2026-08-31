@@ -183,3 +183,23 @@ find_package(boost_beast CONFIG REQUIRED)
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
+
+# specification.md §10, §8.12: the counter over FIX. One binary, one
+# port, order entry and execution reports on the same session.
+add_library(counter_fix_codecs STATIC counter_fix_codecs.cpp)
+add_library(counter::fix_codecs ALIAS counter_fix_codecs)
+target_include_directories(counter_fix_codecs PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
+)
+target_link_libraries(counter_fix_codecs PUBLIC
+  sequencer::input_codec_api
+  sequencer::output_codec_api
+  sequencer::fix_session
+)
+target_compile_features(counter_fix_codecs PUBLIC cxx_std_20)
+
+add_executable(counter_fix_gateway_main fix_gateway_main.cpp)
+target_link_libraries(counter_fix_gateway_main PRIVATE counter::fix_codecs
+                                                        sequencer::fix_gateway
+                                                        gflags::gflags_static glog::glog)
+set_target_properties(counter_fix_gateway_main PROPERTIES OUTPUT_NAME counter_fix_gateway)

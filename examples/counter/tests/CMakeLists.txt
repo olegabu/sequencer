@@ -56,3 +56,16 @@ target_compile_definitions(counter_grpc_input_gateway_test PRIVATE
 )
 add_dependencies(counter_grpc_input_gateway_test counter_node_main counter_grpc_input_gateway_main)
 gtest_discover_tests(counter_grpc_input_gateway_test PROPERTIES TIMEOUT 90)
+
+# The counter over FIX, as real processes: §10 and §8.11's exactly-once
+# rule observed on the wire.
+add_executable(counter_fix_gateway_test fix_gateway_test.cpp)
+target_link_libraries(counter_fix_gateway_test PRIVATE counter::fix_codecs
+                                                        sequencer::fix_session
+                                                        GTest::gtest GTest::gtest_main Threads::Threads)
+target_compile_definitions(counter_fix_gateway_test PRIVATE
+  COUNTER_NODE_MAIN_PATH="$<TARGET_FILE:counter_node_main>"
+  COUNTER_FIX_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_fix_gateway_main>"
+)
+add_dependencies(counter_fix_gateway_test counter_node_main counter_fix_gateway_main)
+gtest_discover_tests(counter_fix_gateway_test PROPERTIES TIMEOUT 120)

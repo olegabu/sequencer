@@ -25,6 +25,18 @@ namespace sequencer {
 // whether the client spoke HTTP+JSON, gRPC, or baidu_std.
 struct ClientRequest {
   Payload body;
+
+  // The session this arrived on, or 0 for a sessionless transport
+  // (brpc, REST, gRPC unary -- there is nothing to correlate a later
+  // output with, because the reply goes back on the request).
+  //
+  // An application that wants its outputs addressed back to the
+  // submitting session must carry this into the input it proposes: the
+  // journal record is all an OutputCodec sees, so a session id that is
+  // not in the record cannot be recovered from it. See
+  // examples/counter/counter_fix_codecs.hpp for a worked account of
+  // what that costs and why the counter example does not do it.
+  std::uint64_t sessionId = 0;
 };
 
 // Enough for InputCodec::onDisconnect (specification.md §8.1: "propose
