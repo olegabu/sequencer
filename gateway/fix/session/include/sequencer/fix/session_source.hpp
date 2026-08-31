@@ -35,6 +35,14 @@ class SessionSource {
   // The input side sees the request; the output side acts on it.
   using SubscribeFn = std::function<void(std::uint64_t sessionId, const std::string& topic)>;
   virtual void setSubscribeFn(SubscribeFn fn) = 0;
+
+  // Called once a session has completed Logon and before it can be
+  // asked for anything. The output side uses it to install that
+  // session's ResendSource: a ResendRequest may be the very first
+  // message after Logon, so installing lazily on first delivery would
+  // be too late.
+  using SessionReadyFn = std::function<void(std::uint64_t sessionId, FixSession& session)>;
+  virtual void setSessionReadyFn(SessionReadyFn fn) = 0;
 };
 
 }  // namespace sequencer::fix

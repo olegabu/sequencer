@@ -196,6 +196,7 @@ struct FixInputTransport::Impl {
   // the output half is what acts on it (§8.10's topic question,
   // resolved FIX's own way).
   std::function<void(std::uint64_t, const std::string&)> onSubscribe;
+  SessionSource::SessionReadyFn onSessionReady;
 
   net::io_context ioContext;
   std::unique_ptr<tcp::acceptor> acceptor;
@@ -287,6 +288,9 @@ struct FixInputTransport::Impl {
         [this, connection](SessionEvent event, DisconnectReason reason) {
           if (event == SessionEvent::LogonComplete) {
             connection->loggedOn.store(true, std::memory_order_relaxed);
+            if (this->onSessionReady) {
+              this->onSessionReady(connection->sessionId, *connection->session);
+            }
             return;
           }
           if (event != SessionEvent::Disconnected &&
@@ -345,6 +349,13 @@ struct FixInputTransport::Impl {
       }
       std::lock_guard<std::mutex> lock(this->connectionsMutex);
       this->connections.erase(connection->sessionId);
+      // Release the FIX identity too, or the client can never
+      // reconnect: the guard would refuse its next Logon as a duplicate
+      // of a session that no longer exists. Missing this made a
+      // perfectly ordinary reconnect look like a resend failure.
+      if (!connection->identityKey.empty()) {
+        this->liveIdentities.erase(connection->identityKey);
+      }
     });
     {
       std::lock_guard<std::mutex> lock(readersMutex);
@@ -395,6 +406,10 @@ std::vector<std::uint64_t> FixInputTransport::liveSessions() {
 
 void FixInputTransport::setSubscribeFn(SessionSource::SubscribeFn fn) {
   impl_->onSubscribe = std::move(fn);
+}
+
+void FixInputTransport::setSessionReadyFn(SessionSource::SessionReadyFn fn) {
+  impl_->onSessionReady = std::move(fn);
 }
 
 void FixInputTransport::start(int listenPort) {

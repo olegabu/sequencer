@@ -31,6 +31,7 @@
 // the input side deliberately answers an order with nothing.
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -38,6 +39,7 @@
 
 #include <sequencer/fix/fix_session.hpp>
 #include <sequencer/fix/session_source.hpp>
+#include <sequencer/output_codec.hpp>
 #include <sequencer/output_transport.hpp>
 
 namespace sequencer::fix {
@@ -64,6 +66,16 @@ class FixOutputTransport : public sequencer::OutputTransport {
               int idleSpinIterations) override;
   void start(int listenPort) override;
   void stop() override;
+
+  // Serves FIX ResendRequests from the JOURNAL, which is
+  // specification.md §8.12's reason 1 made real: there is no outbound
+  // message store, so a resend re-reads the record that produced the
+  // message and re-runs the codec over it. Deterministic by
+  // construction -- the same record through the same codec is the same
+  // bytes -- which is why no second copy is needed.
+  //
+  // `codec` must outlive this transport; the session gateway owns it.
+  void attachJournal(const std::filesystem::path& dataDir, sequencer::OutputCodec& codec);
 
   // The (session, outbound MsgSeqNum) -> journal position mapping that
   // ResendRequest handling needs. Kept in memory per live session and

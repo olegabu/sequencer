@@ -369,10 +369,17 @@ void FixSession::handleLogon(const hffix::message_reader& message) {
     config_.heartBtInt = static_cast<int>(*heartBt);
   }
 
-  if (!checkSequence(message, 'A')) {
-    return;
-  }
-
+  // ACCEPT THE LOGON FIRST, then check the sequence. FIX 4.4 is
+  // explicit that a Logon whose sequence number is HIGHER than expected
+  // must still be processed, with a ResendRequest sent afterwards --
+  // the session is established and the gap is filled inside it.
+  //
+  // Doing it the other way round, as this first did, deadlocks a
+  // perfectly ordinary reconnect: a client returning with fresh
+  // counters sees the acceptor's persisted outbound number, reports a
+  // gap, and the logon never completes -- so the resend that would have
+  // closed the gap can never be requested. checkSequence() still
+  // rejects a number that is too LOW, which remains fatal.
   if (config_.role == Role::Acceptor) {
     sendLogon();  // the echo
   }
@@ -380,6 +387,10 @@ void FixSession::handleLogon(const hffix::message_reader& message) {
   if (onEvent_) {
     onEvent_(SessionEvent::LogonComplete, DisconnectReason::None);
   }
+
+  // Runs last: on a gap this sends the ResendRequest, and on a
+  // too-low number it disconnects, both from an established session.
+  checkSequence(message, 'A');
 }
 
 void FixSession::handleLogout(const hffix::message_reader& /*message*/) {

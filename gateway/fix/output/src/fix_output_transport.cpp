@@ -1,5 +1,7 @@
 #include <sequencer/fix/fix_output_transport.hpp>
 
+#include <sequencer/journal/reader.hpp>
+
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -10,6 +12,76 @@
 #include <vector>
 
 namespace sequencer::fix {
+
+// Collects what a codec publishes for one record, so a resend can pick
+// out the single output it needs by index.
+class CapturingFanout final : public sequencer::Fanout {
+ public:
+  void toSession(sequencer::SessionId, sequencer::Bytes bytes) override {
+    outputs.push_back(std::move(bytes));
+  }
+  void broadcast(const std::string&, sequencer::Bytes bytes) override {
+    outputs.push_back(std::move(bytes));
+  }
+  std::vector<sequencer::Bytes> outputs;
+};
+
+// Serves a ResendRequest for one session by re-reading the journal.
+class JournalResendSource final : public ResendSource {
+ public:
+  JournalResendSource(FixOutputTransport& transport, std::uint64_t sessionId,
+                       sequencer::journal::JournalReader& reader, sequencer::OutputCodec& codec)
+      : transport_(transport), sessionId_(sessionId), reader_(reader), codec_(codec) {}
+
+  bool resend(std::uint64_t begin, std::uint64_t end, const Emit& emit) override {
+    bool servedAny = false;
+    for (std::uint64_t seqNum = begin; seqNum <= end; ++seqNum) {
+      const SentRecord* record = transport_.sentRecord(sessionId_, seqNum);
+      if (record == nullptr || record->journalSequenceNumber == 0) {
+        // Nothing was sent at this outbound number, or it was an
+        // administrative message -- neither is resent, and the session
+        // core gap-fills the hole.
+        continue;
+      }
+      if (!reader_.contains(record->journalSequenceNumber)) {
+        continue;  // journal no longer holds it
+      }
+
+      // The same record through the same codec is the same bytes --
+      // which is what makes an outbound message store unnecessary
+      // (§8.12 reason 1). This is the one place that determinism is
+      // load-bearing outside replay (§11).
+      CapturingFanout captured;
+      codec_.toOutput(reader_.record(record->journalSequenceNumber), captured);
+      if (record->outputIndex >= captured.outputs.size()) {
+        continue;
+      }
+      const sequencer::Bytes& body = captured.outputs[record->outputIndex];
+      const std::string_view raw(reinterpret_cast<const char*>(body.data()), body.size());
+
+      // Strip the codec's leading MsgType so the session core can place
+      // it where FIX requires -- the same split deliver() does.
+      std::string_view msgType = record->msgType;
+      std::string_view rest = raw;
+      if (raw.size() > 3 && raw.compare(0, 3, "35=") == 0) {
+        const std::size_t soh = raw.find('\001');
+        if (soh != std::string_view::npos) {
+          msgType = raw.substr(3, soh - 3);
+          rest = raw.substr(soh + 1);
+        }
+      }
+      emit(seqNum, msgType, rest, record->sendingTime);
+      servedAny = true;
+    }
+    return servedAny;
+  }
+
+ private:
+  FixOutputTransport& transport_;
+  std::uint64_t sessionId_;
+  sequencer::journal::JournalReader& reader_;
+  sequencer::OutputCodec& codec_;
+};
 
 struct FixOutputTransport::Impl {
   explicit Impl(SessionSource& s) : sessions(s) {}
@@ -36,6 +108,12 @@ struct FixOutputTransport::Impl {
   // at these positions rather than replaying a saved copy.
   mutable std::mutex sentMutex;
   std::unordered_map<std::uint64_t, std::map<std::uint64_t, SentRecord>> sent;
+
+  // Set by attachJournal(): what a resend re-reads.
+  std::unique_ptr<sequencer::journal::JournalReader> journal;
+  sequencer::OutputCodec* codec = nullptr;
+  std::vector<std::unique_ptr<JournalResendSource>> resendSources;
+  std::mutex resendMutex;
 
   void recordSent(std::uint64_t sessionId, std::uint64_t seqNum, const SentRecord& record) {
     std::lock_guard<std::mutex> lock(sentMutex);
@@ -104,6 +182,26 @@ FixOutputTransport::FixOutputTransport(SessionSource& sessions)
 }
 
 FixOutputTransport::~FixOutputTransport() { stop(); }
+
+void FixOutputTransport::attachJournal(const std::filesystem::path& dataDir,
+                                        sequencer::OutputCodec& codec) {
+  impl_->journal = std::make_unique<sequencer::journal::JournalReader>(dataDir / "journal");
+  impl_->codec = &codec;
+
+  // Install a ResendSource on each session AS IT LOGS ON, not lazily on
+  // first delivery: a ResendRequest is commonly the first thing a
+  // reconnecting client sends, so it must already be servable.
+  impl_->sessions.setSessionReadyFn([this](std::uint64_t sessionId, FixSession& session) {
+    if (impl_->journal == nullptr || impl_->codec == nullptr) {
+      return;
+    }
+    auto source = std::make_unique<JournalResendSource>(*this, sessionId, *impl_->journal,
+                                                         *impl_->codec);
+    session.setResendSource(source.get());
+    std::lock_guard<std::mutex> lock(impl_->resendMutex);
+    impl_->resendSources.push_back(std::move(source));
+  });
+}
 
 void FixOutputTransport::attach(sequencer::BroadcastRing& ring, sequencer::TopicRegistry& topics,
                                  int idleSpinIterations) {
