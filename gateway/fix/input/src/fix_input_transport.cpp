@@ -84,13 +84,28 @@ class FileSequenceStore : public SequenceStore {
     // from without an operator resetting both sides.
     const std::filesystem::path finalPath = pathFor(sessionKey);
     const std::filesystem::path tempPath = finalPath.string() + ".tmp";
-    {
-      std::ofstream out(tempPath, std::ios::trunc);
-      out << numbers.nextOutbound << ' ' << numbers.nextInbound << ' '
-          << numbers.lastJournalSequence << '\n';
-      out.flush();
+    // Never throws out of here. This runs on a session's reader thread,
+    // deep inside message handling, and an escaping exception takes the
+    // whole gateway down -- which a full disk or a vanished directory
+    // should not do.
+    //
+    // A lost counter write is not harmless: the session may resume at a
+    // stale sequence number and need an operator reset. But that is
+    // recoverable and affects one session, whereas terminating the
+    // process drops every session on the gateway. Losing one is
+    // strictly better than losing all of them.
+    try {
+      {
+        std::ofstream out(tempPath, std::ios::trunc);
+        out << numbers.nextOutbound << ' ' << numbers.nextInbound << ' '
+            << numbers.lastJournalSequence << '\n';
+        out.flush();
+      }
+      std::filesystem::rename(tempPath, finalPath);
+    } catch (const std::exception&) {
+      // Deliberately swallowed; see above. Worth surfacing through a
+      // counter or log once this component has either.
     }
-    std::filesystem::rename(tempPath, finalPath);
   }
 
  private:

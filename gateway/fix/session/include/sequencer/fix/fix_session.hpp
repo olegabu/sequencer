@@ -170,11 +170,30 @@ class FixSession {
   // specification.md §4.
   using AppMessageFn = std::function<void(const hffix::message_reader& message)>;
   using EventFn = std::function<void(SessionEvent event, DisconnectReason reason)>;
-  // Monotonic microseconds. Injected so tests advance time instead of
-  // sleeping; the transports pass a steady_clock reader.
+  // Monotonic microseconds, for INTERVALS -- heartbeats, TestRequest,
+  // peer silence. Injected so tests advance time instead of sleeping;
+  // the transports pass a steady_clock reader.
   using ClockFn = std::function<std::uint64_t()>;
 
-  FixSession(SessionConfig config, SequenceStore& sequences, ClockFn clock);
+  // UTC wall-clock microseconds, for the SendingTime field only.
+  //
+  // Deliberately a SECOND clock, and the distinction is not academic:
+  // deriving SendingTime from the monotonic clock put 1970 on the wire,
+  // because steady_clock's epoch is arbitrary (time since boot). Our
+  // own initiator accepted it happily -- it shared the mistake -- and
+  // QuickFIX rejected every message with "SendingTime accuracy
+  // problem", which is what the conformance suite exists to catch.
+  //
+  // They cannot be one clock. Intervals need a monotonic source that
+  // an NTP correction cannot move; SendingTime needs real UTC, which
+  // NTP does move.
+  using WallClockFn = std::function<std::uint64_t()>;
+
+  // `wallClock` defaults to the system clock, which is what a
+  // deployment wants; tests override it to put a fixed time on the
+  // wire.
+  FixSession(SessionConfig config, SequenceStore& sequences, ClockFn clock,
+              WallClockFn wallClock = {});
 
   void setSendFn(SendFn fn) { send_ = std::move(fn); }
   void setAppMessageFn(AppMessageFn fn) { onApp_ = std::move(fn); }
@@ -297,6 +316,7 @@ class FixSession {
   SessionConfig config_;
   SequenceStore& sequences_store_;
   ClockFn clock_;
+  WallClockFn wallClock_;
   SendFn send_;
   AppMessageFn onApp_;
   EventFn onEvent_;

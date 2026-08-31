@@ -149,8 +149,17 @@ bool isSessionLevel(std::string_view msgType) {
 
 }  // namespace
 
-FixSession::FixSession(SessionConfig config, SequenceStore& sequences, ClockFn clock)
-    : config_(std::move(config)), sequences_store_(sequences), clock_(std::move(clock)) {
+FixSession::FixSession(SessionConfig config, SequenceStore& sequences, ClockFn clock,
+                        WallClockFn wallClock)
+    : config_(std::move(config)),
+      sequences_store_(sequences),
+      clock_(std::move(clock)),
+      wallClock_(wallClock ? std::move(wallClock) : WallClockFn([] {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+      })) {
   // The key both sides of a session agree on, and what the sequence
   // store is keyed by. Direction matters: an acceptor's sender is the
   // initiator's target.
@@ -646,10 +655,11 @@ void FixSession::disconnect(DisconnectReason reason) {
 void FixSession::persist() { sequences_store_.store(sessionKey_, sequences_); }
 
 std::string FixSession::timestampNow() const {
-  // FIX UTCTimestamp with milliseconds. Derived from the injected
-  // clock, not from the wall clock directly, so a test's scripted time
-  // appears on the wire.
-  const std::uint64_t us = clock_();
+  // FIX UTCTimestamp with milliseconds, from the WALL clock. Not from
+  // clock_, which is monotonic and whose epoch is arbitrary -- doing
+  // that put 1970 on the wire and every message was rejected by a real
+  // engine for SendingTime accuracy.
+  const std::uint64_t us = wallClock_();
   const std::time_t seconds = static_cast<std::time_t>(us / 1'000'000ULL);
   const int millis = static_cast<int>((us % 1'000'000ULL) / 1000ULL);
   std::tm tm{};
