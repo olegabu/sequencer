@@ -61,7 +61,7 @@ help:
 	@echo "  make test TEST_FILTER=RelayGateway   filter to matching test names (ctest -R)"
 	@echo ""
 	@echo "  make benchmark         run journal/'s micro-benchmarks (debug preset)"
-	@echo "  make demo              examples/counter/demo.sh — curl + websocat, debug preset"
+	@echo "  make demo              examples/counter/demo_rest_websocket.sh — curl + websocat, debug preset"
 	@echo ""
 	@echo "  make clean             remove build/\$$(PRESET) (all three if PRESET is unset: 'make clean')"
 	@echo "  make prune             reclaim disk from already-built presets without an expensive"
@@ -117,7 +117,7 @@ benchmark: debug
 	./build/debug/journal/benchmarks/journal_benchmark
 
 demo: debug
-	./examples/counter/demo.sh
+	./examples/counter/demo_rest_websocket.sh
 
 demo-grpc: debug
 	./examples/counter/demo_grpc.sh

@@ -1,25 +1,46 @@
 #!/usr/bin/env bash
-# examples/counter/demo_grpc.sh — the real-gRPC counterpart to demo.sh:
-# the same single-node raft group, but submission and dissemination
-# both go over real gRPC (grpc-go/grpc-java/grpcurl-compatible, unlike
-# brpc's own Streaming RPC), driven entirely by grpcurl — no brpc, no
-# custom client code, no `.proto` file needed on the grpcurl command
-# line either, since both gRPC services here enable server reflection.
+# examples/counter/demo_grpc.sh — the real-gRPC counterpart to
+# demo_rest_websocket.sh: the same single-node raft group, but
+# submission and dissemination both go over real gRPC
+# (grpc-go/grpc-java/grpcurl-compatible, unlike brpc's own Streaming
+# RPC), driven entirely by grpcurl — no brpc, no custom client code, no
+# `.proto` file needed on the grpcurl command line either, since both
+# gRPC services here enable server reflection.
+#
+# READ THIS BEFORE COMPARING THE TWO DEMOS. They differ on TWO axes at
+# once, and only one of them is in this script's name:
+#
+#                    demo_rest_websocket.sh      demo_grpc.sh
+#   input gateway    generic chassis, opaque     typed, own schema
+#   submit wire      HTTP + JSON (curl)          gRPC (grpcurl)
+#   output transport WebSocket                   real gRPC
+#   receive wire     WebSocket (websocat)        gRPC (grpcurl)
+#
+# So a difference you notice between them may come from the INPUT
+# GATEWAY ARCHITECTURE rather than from gRPC. Both gateways propose
+# identically underneath -- same NodeProposer, same async handoff, same
+# batching -- so the difference is in the client-facing contract, not
+# the path to the raft group.
 #
 # Two parallel patterns, on purpose (see README.md for the tradeoff):
 #   - Output: sequencer::GrpcOutputTransport (gateway/output/) — the
 #     *generic*, reusable gRPC OutputTransport, "just like" the
-#     WebSocket one demo.sh uses. It wraps whatever bytes
-#     CounterOutputCodec already produces (the same JSON demo.sh shows
-#     you over WebSocket) in a generic bytes envelope
-#     (OutputRecord.payload) — so grpcurl prints it base64-encoded,
-#     which this script decodes for you.
+#     WebSocket one demo_rest_websocket.sh uses. It wraps whatever
+#     bytes CounterOutputCodec already produces (the same JSON that
+#     demo shows you over WebSocket) in a generic bytes envelope — so
+#     grpcurl prints it base64-encoded, which this script decodes for
+#     you. One message is an OutputRecordBatch carrying a REPEATED
+#     payloads field, because every output transport batches whatever
+#     the subscriber's reader found available; how many records land in
+#     one message is not something a subscriber controls.
 #   - Input: a small, counter-specific gRPC service
 #     (CounterSubmitService, proto/counter_input_grpc.proto) with real,
 #     distinct fields (delta in, sequence_number/total out) — the
 #     fully-typed alternative pattern, demonstrating how an application
 #     goes further than the generic envelope when it wants grpcurl to
-#     print real business fields directly.
+#     print real business fields directly. Note this is the CLIENT
+#     contract only: one delta per call. The batching above happens
+#     between gateway and node, invisibly to this client.
 #
 # Usage: examples/counter/demo_grpc.sh [build_dir]   (default: build/debug)
 
@@ -131,7 +152,7 @@ echo "   JSON mapping for a \"bytes\" field, not something specific to this tran
 cat "$DATA_DIR/grpc_output.log"
 
 echo
-echo "== decoded payloads (the same JSON demo.sh's WebSocket path shows you, unwrapped) =="
+echo "== decoded payloads (the same JSON demo_rest_websocket.sh's WebSocket path shows you) =="
 python3 - "$DATA_DIR/grpc_output.log" <<'PYEOF'
 import base64
 import json

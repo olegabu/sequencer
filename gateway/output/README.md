@@ -436,10 +436,10 @@ nothing.
 `RunOutputGateway`; `--websocket_port` selects `WebSocketOutputTransport` — see
 [examples/counter/README.md](../../examples/counter/README.md) for
 flags and a full worked example alongside its input gateway
-counterpart, or `examples/counter/demo.sh` for a live walkthrough
+counterpart, or `examples/counter/demo_rest_websocket.sh` for a live walkthrough
 driven entirely by `curl` and `websocat`. The same binary with
 `--grpc_port` is the same codec and same journal wired to
 `GrpcOutputTransport` instead — see `examples/counter/demo_grpc.sh` for
-the `grpcurl` counterpart to `demo.sh` — and `--brpc_port` selects the
+the `grpcurl` counterpart to `demo_rest_websocket.sh` — and `--brpc_port` selects the
 built-in `BrpcOutputTransport`. Setting several serves them all at
 once from one journal tail.

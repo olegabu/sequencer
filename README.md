@@ -226,7 +226,7 @@ configures standalone.
 | `make tsan` / `make test-tsan` | `... PRESET=tsan` | ThreadSanitizer — the journal's §6.3 cross-thread protocol |
 | `make configure` | `cmake --preset $(PRESET)` | Configure only, no build |
 | `make test TEST_FILTER=<regex>` | adds `-R "<regex>"` to the `ctest` call | Run only matching test names, e.g. `TEST_FILTER=RelayGateway` |
-| `make demo` | `make debug`, then `./examples/counter/demo.sh` | The curl + websocat walkthrough |
+| `make demo` | `make debug`, then `./examples/counter/demo_rest_websocket.sh` | The curl + websocat walkthrough |
 | `make benchmark` | `make debug`, then `./build/debug/journal/benchmarks/journal_benchmark` | |
 | `make clean` | `rm -rf build/debug build/release build/tsan` | `make clean PRESET=release` removes just that one preset's directory |
 | `make distclean` | `make clean`, plus wiping vcpkg's `buildtrees`/`downloads`/`packages` | Forces every dependency to rebuild from source next configure — see the from-scratch cost noted in Build above |
