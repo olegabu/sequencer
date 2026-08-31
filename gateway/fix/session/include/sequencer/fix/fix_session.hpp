@@ -234,6 +234,17 @@ class FixSession {
 
   bool isLoggedOn() const noexcept { return state_ == State::LoggedOn; }
 
+  // Writes the counters through unconditionally, bypassing the
+  // throttle. A transport MUST call this when a connection ends by any
+  // route that does not go through the session -- a socket drop, or a
+  // gateway shutdown -- or the last interval's advance is lost and the
+  // session resumes behind where it actually got to.
+  //
+  // This became load-bearing when persistence was throttled off the
+  // per-message path: before that, every message wrote through, so a
+  // drop could not lose anything.
+  void flushSequences() { persist(); }
+
   // Called by an acceptor before completing a Logon, to refuse a second
   // concurrent connection claiming an identity that is already live.
   // Returning false makes the session reject the Logon and disconnect.

@@ -363,6 +363,11 @@ struct FixInputTransport::Impl {
         connection->session->poll();
       }
 
+      // Persist before anything else: the counters are throttled on the
+      // message path, so this is what stops a dropped session resuming
+      // behind where it actually got to.
+      connection->session->flushSequences();
+
       // A socket drop with no FIX Logout: still a session loss.
       if (connection->loggedOn.exchange(false, std::memory_order_relaxed) &&
           this->onDisconnect) {

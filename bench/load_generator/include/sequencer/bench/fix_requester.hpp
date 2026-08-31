@@ -99,7 +99,15 @@ class FixRequester : public LoadGeneratorRequester {
     if (stopping_.exchange(true)) {
       return;
     }
+    // shutdown() BEFORE close(), and the order matters. close() alone
+    // does not reliably wake a thread parked in a read on Linux -- it
+    // drops this process's handle without disturbing the blocked call
+    // -- whereas shutdown() tears down the connection itself and makes
+    // the pending read return at once. Closing alone left the load
+    // generator printing its summary and then hanging forever on the
+    // join below, which a sweep script would wait on indefinitely.
     boost::system::error_code ec;
+    ::shutdown(socket_.native_handle(), SHUT_RDWR);
     socket_.close(ec);
     if (reader_.joinable()) {
       reader_.join();
