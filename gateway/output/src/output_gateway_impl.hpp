@@ -167,6 +167,12 @@ class OutputGatewayImpl {
     // One record may emit several outputs; the index distinguishes them
     // so a resend can name exactly one.
     sequencer::RecordOrigin origin() {
+      // Stamped only when the ring-wait timer will read it. static so
+      // the getenv happens once, not per output.
+      static const bool timed = std::getenv("FIX_STAGE_TIMERS") != nullptr;
+      if (!timed) {
+        return sequencer::RecordOrigin{journalSequenceNumber_, outputIndex_++, 0};
+      }
       const auto nowUs = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch())
@@ -187,6 +193,11 @@ class OutputGatewayImpl {
     std::uint64_t persistedThrough = seq;
     auto lastPersist = std::chrono::steady_clock::now();
     sequencer::IdleStrategy idle(config_.idleSpinIterations);
+    // Same lesson as the FIX ring reader: this loop spins, and timing
+    // every iteration unconditionally made clock_gettime the single
+    // largest CPU consumer in the process (47.8% on a profile) while
+    // inflating the wait% it reported. No clock is read unless asked.
+    const bool timed = std::getenv("FIX_STAGE_TIMERS") != nullptr;
     while (!stopRequested_.load(std::memory_order_relaxed)) {
       if (!reader) {
         try {
@@ -202,6 +213,10 @@ class OutputGatewayImpl {
         // half of the journal-to-wire gap: if the tail loop spends its
         // time here, records are arriving slowly; if it spends its time
         // in the codec below, the gateway is the cost.
+        if (!timed) {
+          idle.idle();
+          continue;
+        }
         const auto waitStart = std::chrono::steady_clock::now();
         idle.idle();
         tailWaitNs_ += static_cast<std::uint64_t>(
@@ -223,13 +238,16 @@ class OutputGatewayImpl {
       int processed = 0;
       while (processed < kMaxBurst && reader->contains(seq) &&
              !stopRequested_.load(std::memory_order_relaxed)) {
-        const auto codecStart = std::chrono::steady_clock::now();
+        const auto codecStart = timed ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
         ringFanout_.beginRecord(seq);
         codec_->toOutput(reader->record(seq), ringFanout_);
-        tailCodecNs_ += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - codecStart)
-                .count());
+        if (timed) {
+          tailCodecNs_ += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - codecStart)
+                  .count());
+        }
         ++tailRecords_;
         ++seq;
         ++processed;
@@ -238,7 +256,7 @@ class OutputGatewayImpl {
 
       // Reported on the same cadence and behind the same switch as the
       // FIX transports' own timers, so one run gives the whole path.
-      if (std::getenv("FIX_STAGE_TIMERS") != nullptr) {
+      if (timed) {
         const auto sinceReport = std::chrono::steady_clock::now() - lastTailReport_;
         if (sinceReport >= std::chrono::seconds(2) && tailRecords_ > 0) {
           const double windowNs = static_cast<double>(

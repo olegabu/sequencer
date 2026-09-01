@@ -161,23 +161,51 @@ struct FixOutputTransport::Impl {
     return true;
   }
 
+  // One output's identity, packed so a set can hold it cheaply.
+  static std::uint64_t packOrigin(const sequencer::RecordOrigin& origin) {
+    return (origin.journalSequenceNumber << 16) | (origin.outputIndex & 0xFFFFu);
+  }
+
+  // MEMBERSHIP, not a high-water mark.
+  //
+  // A mark alone is correct only if outputs are offered in order, which
+  // is true of the journal path and false of the inline one: propose
+  // callbacks complete out of order, so record 101 could claim before
+  // record 100. With a mark, 101 raised it and then BOTH of record
+  // 100's copies -- inline and journal -- tested "below the mark" and
+  // were suppressed, so that reply was never sent at all. At 20k that
+  // lost 2 replies per run and the rig sat out its whole drain timeout
+  // waiting for them; at 100k out-of-order completion is the norm and
+  // it lost most of them.
+  //
+  // `mark` survives only as a pruning floor: everything at or below it
+  // is assumed delivered, which lets `claimed` stay bounded.
   bool alreadyDeliveredLocked(const std::string& sessionKey,
                                const sequencer::RecordOrigin& origin) {
-    const auto it = highWater.find(sessionKey);
-    if (it == highWater.end()) {
+    const auto it = claims.find(sessionKey);
+    if (it == claims.end()) {
       return false;
     }
-    const auto& [seq, index] = it->second;
-    return origin.journalSequenceNumber < seq ||
-           (origin.journalSequenceNumber == seq && origin.outputIndex <= index);
+    const std::uint64_t packed = packOrigin(origin);
+    return packed <= it->second.mark || it->second.claimed.count(packed) != 0;
   }
 
   void markDeliveredLocked(const std::string& sessionKey,
                             const sequencer::RecordOrigin& origin) {
-    auto& mark = highWater[sessionKey];
-    if (origin.journalSequenceNumber > mark.first ||
-        (origin.journalSequenceNumber == mark.first && origin.outputIndex > mark.second)) {
-      mark = {origin.journalSequenceNumber, origin.outputIndex};
+    Claims& c = claims[sessionKey];
+    const std::uint64_t packed = packOrigin(origin);
+    if (packed <= c.mark) {
+      return;
+    }
+    c.claimed.insert(packed);
+    // Bounded: the two paths are only ever a few hundred microseconds
+    // apart, so the live set is tiny. The window is orders of magnitude
+    // larger than that, and dropping the smallest entry into the mark
+    // is safe because it HAS been delivered.
+    while (c.claimed.size() > kClaimWindow) {
+      const auto oldest = c.claimed.begin();
+      c.mark = *oldest;
+      c.claimed.erase(oldest);
     }
   }
 
@@ -187,7 +215,12 @@ struct FixOutputTransport::Impl {
   }
 
   std::mutex highWaterMutex;
-  std::map<std::string, std::pair<std::uint64_t, std::uint32_t>> highWater;
+  struct Claims {
+    std::uint64_t mark = 0;             // everything at or below is delivered
+    std::set<std::uint64_t> claimed;    // delivered outputs above the mark
+  };
+  static constexpr std::size_t kClaimWindow = 65536;
+  std::map<std::string, Claims> claims;
 
   std::set<std::uint64_t> subscribersOf(const std::string& topic) {
     std::lock_guard<std::mutex> lock(subscriptionsMutex);
@@ -403,7 +436,20 @@ void FixOutputTransport::start(int /*listenPort*/) {
     // bvar, because this gateway runs no brpc server and so has no
     // /vars page to read them from.
     using Ns = std::chrono::nanoseconds;
+    // Off unless asked for -- and off means NO clock read at all, not
+    // just no printing.
+    //
+    // This loop turns ~3.9M drains/sec. Reading the clock ~5 times per
+    // iteration regardless of the switch cost ~19M clock_gettime/sec,
+    // which a profile put at 47.8% of the gateway's CPU -- the timers
+    // were the single largest consumer in the thing they were added to
+    // measure, and they inflated the very idle/wait percentages they
+    // reported. Every now() below is now behind `timed`.
+    const bool timed = std::getenv("FIX_STAGE_TIMERS") != nullptr;
     const auto now = [] { return std::chrono::steady_clock::now(); };
+    const auto nowIfTimed = [&timed, &now] {
+      return timed ? now() : std::chrono::steady_clock::time_point{};
+    };
     std::uint64_t idleNs = 0, deliverNs = 0, flushNs = 0;
     std::uint64_t entries = 0, drains = 0, emptyDrains = 0;
     // How long an entry sat in the ring before this reader picked it
@@ -445,14 +491,14 @@ void FixOutputTransport::start(int /*listenPort*/) {
           impl_->deliver(sessionId, body, origin);
         };
 
-        if (origin.publishTimeUs != 0) {
+        if (timed && origin.publishTimeUs != 0) {
           const auto nowUs = static_cast<std::uint64_t>(
               std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now().time_since_epoch())
                   .count());
           ringWaitUs += (nowUs > origin.publishTimeUs) ? (nowUs - origin.publishTimeUs) : 0;
         }
-        const auto deliverStart = now();
+        const auto deliverStart = nowIfTimed();
         if ((tag & sequencer::kSessionTagBit) != 0) {
           deliverTo(tag & ~sequencer::kSessionTagBit);
         } else {
@@ -463,19 +509,23 @@ void FixOutputTransport::start(int /*listenPort*/) {
             }
           }
         }
-        deliverNs += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<Ns>(now() - deliverStart).count());
+        if (timed) {
+          deliverNs += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<Ns>(now() - deliverStart).count());
+        }
         ++gathered;
         ++entries;
       }
 
       // One syscall per session per drain.
-      const auto flushStart = now();
+      const auto flushStart = nowIfTimed();
       for (const std::uint64_t sessionId : touched) {
         impl_->sessions.endBatch(sessionId);
       }
-      flushNs += static_cast<std::uint64_t>(
-          std::chrono::duration_cast<Ns>(now() - flushStart).count());
+      if (timed) {
+        flushNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<Ns>(now() - flushStart).count());
+      }
       ++drains;
 
       if (sawOverrun) {
@@ -489,14 +539,20 @@ void FixOutputTransport::start(int /*listenPort*/) {
       }
       if (gathered == 0) {
         ++emptyDrains;
-        const auto idleStart = now();
+        const auto idleStart = nowIfTimed();
         idle.idle();
-        idleNs += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<Ns>(now() - idleStart).count());
+        if (timed) {
+          idleNs += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<Ns>(now() - idleStart).count());
+        }
       } else {
         idle.reset();
       }
 
+      // The report cadence check was itself a per-iteration clock read.
+      if (!timed) {
+        continue;
+      }
       const auto sinceReport = static_cast<std::uint64_t>(
           std::chrono::duration_cast<Ns>(now() - lastReport).count());
       if (stageTimers && sinceReport >= kReportIntervalNs &&

@@ -339,6 +339,10 @@ class FixSession {
   // handlers (onBytes -> handleLogon -> emit -> persist -> sessionKey).
   mutable std::recursive_mutex mutex_;
 
+  // Application messages parsed in the current onBytes() call, run
+  // after the lock is released.
+  std::vector<std::string> deferredApp_;
+
   void handleMessage(const hffix::message_reader& message);
   bool checkSequence(const hffix::message_reader& message, char msgType);
   void adoptIdentity(const hffix::message_reader& message);

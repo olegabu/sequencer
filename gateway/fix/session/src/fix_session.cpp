@@ -204,7 +204,21 @@ void FixSession::start() {
 }
 
 void FixSession::onBytes(std::string_view bytes) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  // Application messages are PARSED under the lock but DISPATCHED
+  // without it.
+  //
+  // onApp_ is where the gateway runs the codec and starts a proposal,
+  // and a 16KB read holds several messages. Holding the session lock
+  // across all of that put the inbound reader in direct contention with
+  // every propose-completion thread trying to answer inline: the
+  // gateway stopped reading its client sockets, the load generator
+  // could not push its offered rate, and throughput sat at ~12k/s with
+  // the gateway's CPU IDLE and 2.3% of it in sched_yield. The lock was
+  // never expensive -- it was held across the wrong work.
+  std::vector<std::string> deferred;
+  {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    deferredApp_.clear();
 
   receive_.append(bytes.data(), bytes.size());
   lastReceivedUs_ = clock_();
@@ -221,6 +235,7 @@ void FixSession::onBytes(std::string_view bytes) {
       // sequence number cannot be trusted); the session drops.
       disconnect(DisconnectReason::MalformedFraming);
       receive_.clear();
+      deferredApp_.clear();
       return;
     }
     // message_size(), NOT buffer_size(): the latter is the size of the
@@ -232,6 +247,7 @@ void FixSession::onBytes(std::string_view bytes) {
     consumed += messageSize;
     if (state_ == State::Disconnected) {
       receive_.clear();
+      deferredApp_.clear();
       return;
     }
   }
@@ -240,6 +256,18 @@ void FixSession::onBytes(std::string_view bytes) {
   // a move of the remainder, which is bounded by one message.
   if (consumed > 0) {
     receive_.erase(0, consumed);
+  }
+    deferred.swap(deferredApp_);
+  }
+
+  if (!onApp_) {
+    return;
+  }
+  for (const std::string& raw : deferred) {
+    hffix::message_reader reader(raw.data(), raw.size());
+    if (reader.is_complete() && reader.is_valid()) {
+      onApp_(reader);
+    }
   }
 }
 
@@ -296,8 +324,10 @@ void FixSession::handleMessage(const hffix::message_reader& message) {
   if (isSessionLevel(type)) {
     return;
   }
+  // Queued rather than dispatched: onBytes runs these once it has let
+  // go of the session lock. See its comment.
   if (onApp_) {
-    onApp_(message);
+    deferredApp_.emplace_back(message.message_begin(), message.message_size());
   }
 }
 

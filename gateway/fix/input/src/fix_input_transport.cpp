@@ -5,7 +5,10 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/write.hpp>
 
+#include <sys/socket.h>
+
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -209,6 +212,10 @@ class FixRequestContext : public sequencer::RequestContext {
  private:
   std::string body_;
   void recordProposeLatency() {
+    static const bool timed = std::getenv("FIX_STAGE_TIMERS") != nullptr;
+    if (!timed) {
+      return;
+    }
     g_proposeNs.fetch_add(static_cast<std::uint64_t>(
                               std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - submittedAt_)
@@ -255,6 +262,10 @@ struct FixConnection {
   std::atomic<bool> stop{false};
   std::atomic<bool> loggedOn{false};
 };
+
+// A session allowed to fall this far behind is dropped rather than
+// buffered without limit.
+constexpr std::size_t kMaxPendingBytes = 8u * 1024u * 1024u;
 
 struct FixInputTransport::Impl {
   explicit Impl(FixInputConfig cfg)
@@ -431,6 +442,7 @@ struct FixInputTransport::Impl {
         if (ec) {
           if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) {
             connection->session->poll();
+            this->flushFor(*connection);
             continue;
           }
           break;  // peer gone
@@ -438,6 +450,8 @@ struct FixInputTransport::Impl {
         const auto processStart = tick();
         connection->session->onBytes(std::string_view(buffer.data(), n));
         connection->session->poll();
+        // Backstop for anything a full socket left in outBuffer.
+        this->flushFor(*connection);
         processNs += static_cast<std::uint64_t>(
             std::chrono::duration_cast<Ns>(tick() - processStart).count());
 
@@ -494,24 +508,68 @@ struct FixInputTransport::Impl {
     }
   }
 
+  // Every outbound byte goes through outBuffer, including outside a
+  // batch. Writing a frame straight to the socket while buffered bytes
+  // were still pending would put it on the wire AHEAD of them, which on
+  // a FIX session means MsgSeqNums arriving out of order.
   void write(FixConnection& connection, std::string_view frame) {
     std::lock_guard<std::mutex> lock(connection.writeMutex);
+    connection.outBuffer.append(frame.data(), frame.size());
     if (connection.batchDepth > 0) {
-      // Inside a batch: accumulate, and let endBatch() make one syscall
-      // of the lot.
-      connection.outBuffer.append(frame.data(), frame.size());
-      return;
+      return;  // endBatch() drains the lot in one go
     }
-    writeLocked(connection, frame);
+    drainLocked(connection);
   }
 
   // Caller holds connection.writeMutex.
-  void writeLocked(FixConnection& connection, std::string_view frame) {
-    boost::system::error_code ec;
-    net::write(connection.socket, net::buffer(frame.data(), frame.size()), ec);
-    // A write failure means the peer is gone; the reader thread will
-    // see the same and run the disconnect path once.
-    (void)ec;
+  //
+  // NON-BLOCKING, and that is the whole point. This used to be a
+  // blocking net::write, which stalls the calling thread whenever the
+  // client's socket send buffer is full. Two callers cannot afford
+  // that:
+  //
+  //   - the propose-completion thread, when answering inline. A
+  //     blocking write there turns one slow FIX client into
+  //     back-pressure on the consensus pipeline itself; measured, it
+  //     cost ~8x throughput (100k/s collapsed to ~12k/s).
+  //   - the output side's single ring reader, which serves EVERY
+  //     session. One slow client blocking it stalls delivery to all of
+  //     them.
+  //
+  // MSG_DONTWAIT rather than putting the socket in non-blocking mode:
+  // the reader thread wants its blocking read with SO_RCVTIMEO, and
+  // O_NONBLOCK is a property of the file description, not of one
+  // direction.
+  void drainLocked(FixConnection& connection) {
+    while (!connection.outBuffer.empty()) {
+      const ssize_t written =
+          ::send(connection.socket.native_handle(), connection.outBuffer.data(),
+                 connection.outBuffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+      if (written > 0) {
+        connection.outBuffer.erase(0, static_cast<std::size_t>(written));
+        continue;
+      }
+      if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        // Socket full. Whoever writes next drains the remainder, and
+        // the reader thread's own loop is the backstop if nobody does.
+        if (connection.outBuffer.size() > kMaxPendingBytes) {
+          // A consumer this far behind is not going to catch up, and an
+          // unbounded buffer would take the gateway down with it. Same
+          // choice the broadcast ring makes for a lapped reader.
+          std::fprintf(stderr,
+                       "[fix] session %llu is %zu bytes behind; dropping it as a slow "
+                       "consumer\n",
+                       (unsigned long long)connection.sessionId, connection.outBuffer.size());
+          connection.outBuffer.clear();
+          connection.stop.store(true, std::memory_order_relaxed);
+        }
+        return;
+      }
+      // Peer gone; the reader thread sees the same and runs the
+      // disconnect path exactly once.
+      connection.outBuffer.clear();
+      return;
+    }
   }
 
   void beginBatchFor(FixConnection& connection) {
@@ -524,11 +582,17 @@ struct FixInputTransport::Impl {
     if (connection.batchDepth > 0 && --connection.batchDepth > 0) {
       return;  // nested; the outermost flush wins
     }
-    if (connection.outBuffer.empty()) {
+    drainLocked(connection);
+  }
+
+  // Pushes out anything a full socket left behind. Called from the
+  // reader thread, which wakes on inbound data or every SO_RCVTIMEO.
+  void flushFor(FixConnection& connection) {
+    std::lock_guard<std::mutex> lock(connection.writeMutex);
+    if (connection.outBuffer.empty() || connection.batchDepth > 0) {
       return;
     }
-    writeLocked(connection, connection.outBuffer);
-    connection.outBuffer.clear();
+    drainLocked(connection);
   }
 
   std::shared_ptr<FixConnection> connectionFor(std::uint64_t sessionId) {
