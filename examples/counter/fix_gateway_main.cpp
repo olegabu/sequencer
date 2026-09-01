@@ -35,6 +35,12 @@ DEFINE_string(sequence_store_dir, "",
               "which loses a session's numbers across a restart");
 DEFINE_string(sender_comp_id, "SEQUENCER", "This gateway's own FIX CompID");
 DEFINE_int32(heartbeat_interval, 30, "FIX HeartBtInt, in seconds");
+DEFINE_bool(inline_designated_outputs, false,
+            "Answer each order from the propose receipt instead of from the journal. Saves the "
+            "journal-to-wire hop (~200us) but gives up reproducing transmission order from the "
+            "journal, which is what a ResendRequest replays; sound only where every output a "
+            "session receives originates in its own inputs. Default false = specification.md "
+            "§8.11.");
 
 namespace {
 
@@ -71,9 +77,11 @@ int main(int argc, char** argv) {
   config.senderCompId = FLAGS_sender_comp_id;
   config.heartBtInt = FLAGS_heartbeat_interval;
   config.sequenceStoreDir = FLAGS_sequence_store_dir;
+  config.inlineDesignatedOutputs = FLAGS_inline_designated_outputs;
 
   LOG(INFO) << "counter FIX session gateway starting: listen_port=" << FLAGS_listen_port
-            << " node_peers=" << FLAGS_node_peers;
+            << " node_peers=" << FLAGS_node_peers
+            << " inline_designated_outputs=" << FLAGS_inline_designated_outputs;
 
   return sequencer::fix::RunFixSessionGateway(
       std::move(config),

@@ -16,6 +16,8 @@
 #include <sequencer/bench/brpc_output_observer.hpp>
 #include <sequencer/bench/grpc_output_observer.hpp>
 #include <sequencer/bench/fix_requester.hpp>
+
+#include "counter_fix_codecs.hpp"
 #include <sequencer/bench/load_generator.hpp>
 #include <sequencer/bench/relay_observer.hpp>
 #include <sequencer/bench/websocket_output_observer.hpp>
@@ -33,6 +35,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -59,10 +62,19 @@ DEFINE_string(node_addr, "",
 // sweep and would measure the rig; five client boxes can. The same
 // discipline sweep-multi.sh already applies to the other arms.
 DEFINE_string(fix_gateway_addr, "",
-              "A FIX session gateway's \"ip:port\". Submits U1 and measures the U2 that comes "
-              "back from the journal on the same session");
+              "A FIX session gateway's \"ip:port\", or a COMMA-SEPARATED list of them. One "
+              "session is opened per address and requests are spread round-robin across them, "
+              "which is what keeps gateways evenly loaded: with one session per client and an "
+              "odd client count, some gateway always gets more clients than another, and the "
+              "merged latency then blends a busy gateway with a quiet one");
 DEFINE_string(fix_sender_comp_id, "LOADGEN", "This sender's FIX CompID; must be unique per client");
 DEFINE_string(fix_target_comp_id, "SEQUENCER", "The gateway's FIX CompID");
+DEFINE_int64(fix_client_id, 0,
+             "This client's id, carried in the high bits of the application payload. It both "
+             "correlates replies and selects the per-client topic replies are published on, so "
+             "a session receives only its own. MUST DIFFER PER CLIENT: sharing it makes clients "
+             "complete each other's requests AND collapses them onto one topic, which shows up "
+             "as impossibly low latency followed by collapse rather than as an error");
 DEFINE_string(fix_subscribe_symbol, "TOTALS",
               "Subscribe to this broadcast topic by MarketDataRequest before sending; empty "
               "skips it. examples/counter broadcasts its totals, so this is required there");
@@ -302,6 +314,23 @@ class SubmitRequester : public sequencer::bench::LoadGeneratorRequester {
 
 }  // namespace
 
+namespace {
+
+// Splits "a,b,c" -- used for the FIX endpoint list.
+std::vector<std::string> splitCommaSeparated(const std::string& value) {
+  std::vector<std::string> parts;
+  std::stringstream stream(value);
+  std::string part;
+  while (std::getline(stream, part, ',')) {
+    if (!part.empty()) {
+      parts.push_back(part);
+    }
+  }
+  return parts;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -380,27 +409,38 @@ int main(int argc, char** argv) {
   // arm skips beyond the network hop.
   std::unique_ptr<sequencer::bench::LoadGeneratorRequester> requesterOwner;
   if (!FLAGS_fix_gateway_addr.empty()) {
-    const std::size_t colon = FLAGS_fix_gateway_addr.rfind(':');
-    if (colon == std::string::npos) {
-      LOG(ERROR) << "load_generator: --fix_gateway_addr must be \"ip:port\"";
+    const std::vector<std::string> addrs = splitCommaSeparated(FLAGS_fix_gateway_addr);
+    if (addrs.empty()) {
+      LOG(ERROR) << "load_generator: --fix_gateway_addr must be \"ip:port\" or a list of them";
       return 1;
     }
-    auto fix = std::make_unique<sequencer::bench::FixRequester>(
-        FLAGS_fix_gateway_addr.substr(0, colon),
-        std::stoi(FLAGS_fix_gateway_addr.substr(colon + 1)), FLAGS_fix_sender_comp_id,
-        FLAGS_fix_target_comp_id);
-    if (!fix->start()) {
-      LOG(ERROR) << "load_generator: FIX session did not establish against "
-                 << FLAGS_fix_gateway_addr;
-      return 1;
+    auto fan = std::make_unique<sequencer::bench::FixFanoutRequester>();
+    for (std::size_t i = 0; i < addrs.size(); ++i) {
+      const std::size_t colon = addrs[i].rfind(':');
+      if (colon == std::string::npos) {
+        LOG(ERROR) << "load_generator: bad FIX address \"" << addrs[i] << "\"";
+        return 1;
+      }
+      // Every SESSION gets its own id, not just every client: sessions
+      // share a gateway's broadcast fan-out, so two sessions on one id
+      // would each receive the other's replies.
+      const std::int64_t sessionId =
+          FLAGS_fix_client_id * 100 + static_cast<std::int64_t>(i);
+      auto one = std::make_unique<sequencer::bench::FixRequester>(
+          addrs[i].substr(0, colon), std::stoi(addrs[i].substr(colon + 1)),
+          FLAGS_fix_sender_comp_id + "-" + std::to_string(i), FLAGS_fix_target_comp_id,
+          sessionId, sequencer::examples::counter::kClientIdShift);
+      if (!one->start()) {
+        LOG(ERROR) << "load_generator: FIX session did not establish against " << addrs[i];
+        return 1;
+      }
+      // Its OWN topic, so it receives only its own replies.
+      one->subscribe(sequencer::examples::counter::counterTopicFor(sessionId));
+      fan->add(std::move(one));
     }
-    if (!FLAGS_fix_subscribe_symbol.empty()) {
-      // The counter broadcasts its totals, so without this the sender
-      // would submit happily and never see a reply.
-      fix->subscribe(FLAGS_fix_subscribe_symbol);
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-    requesterOwner = std::move(fix);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    LOG(INFO) << "FIX: " << addrs.size() << " session(s) established";
+    requesterOwner = std::move(fan);
   } else if (!FLAGS_node_addr.empty()) {
     requesterOwner = std::make_unique<ProposeRequester>(FLAGS_node_addr, relayObserver.get(),
                                                           outputObserver.get());

@@ -54,6 +54,14 @@ struct SessionGatewayConfig {
   // Where the per-session sequence counters are persisted -- the only
   // session state that must outlive the process (§8.12).
   std::filesystem::path sequenceStoreDir;
+
+  // Answer each order from the propose receipt instead of waiting for
+  // the output half to deliver the same execution report from the
+  // journal. Saves that hop (~200us measured) at the cost of the
+  // property that makes the journal a resend store: see
+  // InputGatewayConfig::inlineDesignatedOnSession for exactly what is
+  // traded and when it is sound. Default off = specification.md §8.11.
+  bool inlineDesignatedOutputs = false;
 };
 
 // Runs until stopped. Blocks.

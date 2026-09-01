@@ -102,6 +102,11 @@ class TopicRegistry {
 struct RecordOrigin {
   std::uint64_t journalSequenceNumber = 0;
   std::uint32_t outputIndex = 0;
+  // steady_clock microseconds at publish. Lets a reader measure how
+  // long an entry waited in the ring before it was delivered, which is
+  // the one hop between the journal and the wire that no other counter
+  // covers. Zero when the producer did not supply it.
+  std::uint64_t publishTimeUs = 0;
 };
 
 class BroadcastRing {
@@ -121,6 +126,7 @@ class BroadcastRing {
         lengths_(std::make_unique<std::atomic<std::uint32_t>[]>(capacity)),
         origins_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity)),
         outputIndices_(std::make_unique<std::atomic<std::uint32_t>[]>(capacity)),
+        publishTimes_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity)),
         storage_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity * wordsPerSlot_)) {
     if (capacity < 2 || (capacity & (capacity - 1)) != 0) {
       throw std::invalid_argument("BroadcastRing: capacity must be a power of two >= 2");
@@ -170,6 +176,7 @@ class BroadcastRing {
     // having the field at all.
     origins_[i].store(origin.journalSequenceNumber, std::memory_order_relaxed);
     outputIndices_[i].store(origin.outputIndex, std::memory_order_relaxed);
+    publishTimes_[i].store(origin.publishTimeUs, std::memory_order_relaxed);
     versions_[i].store(2 * seq + 2, std::memory_order_release);  // even: holds seq
 
     head_.store(seq + 1, std::memory_order_release);
@@ -214,6 +221,7 @@ class BroadcastRing {
     const std::uint64_t tag = tags_[i].load(std::memory_order_relaxed);
     const std::uint64_t origin = origins_[i].load(std::memory_order_relaxed);
     const std::uint32_t outputIndex = outputIndices_[i].load(std::memory_order_relaxed);
+    const std::uint64_t publishTime = publishTimes_[i].load(std::memory_order_relaxed);
     const std::atomic<std::uint64_t>* slot = storage_.get() + i * wordsPerSlot_;
     const std::size_t words = (length + 7) / 8;
     for (std::size_t w = 0; w < words; ++w) {
@@ -232,6 +240,7 @@ class BroadcastRing {
     lengthOut = length;
     originOut.journalSequenceNumber = origin;
     originOut.outputIndex = outputIndex;
+    originOut.publishTimeUs = publishTime;
     ++cursor;
     return ReadResult::Ok;
   }
@@ -248,6 +257,7 @@ class BroadcastRing {
   // tag and length above -- see publish().
   std::unique_ptr<std::atomic<std::uint64_t>[]> origins_;
   std::unique_ptr<std::atomic<std::uint32_t>[]> outputIndices_;
+  std::unique_ptr<std::atomic<std::uint64_t>[]> publishTimes_;
   std::unique_ptr<std::atomic<std::uint64_t>[]> storage_;
 
   alignas(64) std::atomic<std::uint64_t> head_{0};

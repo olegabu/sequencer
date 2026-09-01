@@ -44,14 +44,37 @@
 
 namespace sequencer::bench {
 
-// The private tag carrying the harness's correlation id.
+// The tag a reply carries its correlation value in. The application's
+// output codec must echo it; examples/counter does
+// (kCounterEchoTag in counter_fix_codecs.hpp).
 inline constexpr int kCorrelationTag = 5000;
+
+// The tag this sender puts its payload in. For examples/counter that is
+// the delta, and the delta doubles as the correlation value -- see
+// send().
+inline constexpr int kCounterPayloadTag = 5001;
 
 class FixRequester : public LoadGeneratorRequester {
  public:
+  // `clientId` identifies THIS session among all of them. It goes in
+  // the HIGH BITS of the value sent as the application payload:
+  //
+  //     payload = (clientId << clientIdShift) | sequence
+  //
+  // which does two jobs at once. The reply echoes the whole value back,
+  // so the low bits correlate a reply to its request; and the
+  // application's output codec recovers the high bits to publish on
+  // this session's OWN topic, so a session receives only its own
+  // replies. Without that second part every session receives every
+  // reply and a gateway's delivery load becomes (rate x sessions).
+  //
+  // Must be unique per session in a multi-session run. Sharing it
+  // silently makes sessions complete each other's requests, which reads
+  // as impossibly good latency rather than as an error.
   FixRequester(const std::string& host, int port, std::string senderCompId,
-                std::string targetCompId)
-      : socket_(ioContext_) {
+                std::string targetCompId, std::int64_t clientId = 0,
+                int clientIdShift = 40)
+      : socket_(ioContext_), clientId_(clientId), clientIdShift_(clientIdShift) {
     boost::asio::ip::tcp::resolver resolver(ioContext_);
     boost::asio::connect(socket_, resolver.resolve(host, std::to_string(port)));
 
@@ -162,8 +185,10 @@ class FixRequester : public LoadGeneratorRequester {
   void send(std::int64_t sequence, std::int64_t /*sendTimeUs*/,
              std::function<void(bool ok)> onDone) override {
     {
+      // Keyed by the nonce, which is what comes back, rather than by
+      // the harness sequence.
       std::lock_guard<std::mutex> lock(pendingMutex_);
-      pending_[sequence] = std::move(onDone);
+      pending_[(clientId_ << clientIdShift_) | sequence] = std::move(onDone);
     }
     // One message. The body is the correlation tag and a delta of 1 --
     // the smallest thing the counter state machine accepts, so what is
@@ -173,8 +198,24 @@ class FixRequester : public LoadGeneratorRequester {
     // emit bytes in one order, so sendApplication() has to be
     // serialized, but nothing else does. Formatting the body under the
     // lock made every sender wait on every other sender's string work.
-    const std::string body = std::to_string(kCorrelationTag) + "=" + std::to_string(sequence) +
-                              "\001" + "5001=1\001";
+    // The payload IS the correlation value, not a constant.
+    //
+    // examples/counter's input is eight bytes of delta and nothing
+    // else, and its state machine rejects any other size, so there is
+    // nowhere to put a separate nonce without changing the state
+    // machine and the journaled encoding. Its output codec therefore
+    // echoes the submitted delta back (kCounterEchoTag), and this
+    // sends a distinct delta per request so the echo identifies it.
+    //
+    // Sending a constant 1 -- which this did -- makes every reply
+    // indistinguishable, so correlation falls through to matching by
+    // arrival order. With several clients on one broadcast topic that
+    // is simply wrong, and it produced a measured p50 of 75us on a
+    // fleet whose leader-to-follower RTT alone is 500us. An impossible
+    // number was the only thing that gave it away.
+    const std::int64_t nonce = (clientId_ << clientIdShift_) | sequence;
+    const std::string body = std::to_string(kCounterPayloadTag) + "=" +
+                              std::to_string(nonce) + "\001";
     {
       // The critical section is now encode-and-append only: no syscall,
       // no allocation of the body, no formatting. The writer thread
@@ -314,6 +355,8 @@ class FixRequester : public LoadGeneratorRequester {
   std::mutex sendMutex_;   // serializes MsgSeqNum assignment and encoding
   std::mutex outMutex_;    // guards the encoded-bytes buffer
   std::string outBuffer_;
+  const std::int64_t clientId_ = 0;
+  const int clientIdShift_ = 40;
   std::thread writer_;
   std::mutex pendingMutex_;
   // std::map, not unordered_map: the FIFO fallback above needs
@@ -321,6 +364,34 @@ class FixRequester : public LoadGeneratorRequester {
   // sequence numbers are monotonic, so ordered-by-key is ordered by
   // age.
   std::map<std::int64_t, std::function<void(bool)>> pending_;
+};
+
+// Spreads one harness's requests round-robin across several FIX
+// sessions.
+//
+// It exists to keep gateways EVENLY loaded. With one session per client
+// and an odd number of clients, some gateway always draws more clients
+// than another -- five clients over two gateways is a 3/2 split, so one
+// carries 60% of the offered rate -- and the merged latency then blends
+// a busy gateway with a quiet one, which is neither gateway's real
+// number. Giving every client a session on every gateway makes the
+// split exact.
+class FixFanoutRequester : public LoadGeneratorRequester {
+ public:
+  void add(std::unique_ptr<FixRequester> session) { sessions_.push_back(std::move(session)); }
+
+  void send(std::int64_t sequence, std::int64_t sendTimeUs,
+             std::function<void(bool ok)> onDone) override {
+    // By sequence, not by a shared counter: the harness's sequence is
+    // already monotonic, so this needs no synchronization of its own
+    // and distributes exactly evenly.
+    const std::size_t which =
+        static_cast<std::size_t>(sequence) % sessions_.size();
+    sessions_[which]->send(sequence, sendTimeUs, std::move(onDone));
+  }
+
+ private:
+  std::vector<std::unique_ptr<FixRequester>> sessions_;
 };
 
 }  // namespace sequencer::bench

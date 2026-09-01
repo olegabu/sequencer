@@ -134,6 +134,35 @@ struct FixOutputTransport::Impl {
   // catch-up resumes from there.
   bool alreadyDelivered(const std::string& sessionKey, const sequencer::RecordOrigin& origin) {
     std::lock_guard<std::mutex> lock(highWaterMutex);
+    return alreadyDeliveredLocked(sessionKey, origin);
+  }
+
+  // Check and mark as ONE atomic step, returning true to the single
+  // caller that won the right to send this output.
+  //
+  // Testing alreadyDelivered() and then calling markDelivered() after
+  // the send is a check-then-act race: two threads both pass the test
+  // before either marks, and the client gets the message twice. That
+  // was always reachable between catch-up and the live ring reader --
+  // the window the comment in deliver() describes -- but rare enough
+  // never to be seen. Answering inline (deliverInline) puts a second
+  // thread on this path for EVERY message and it reproduced in 1 run
+  // in 6.
+  //
+  // Marking before the send means a send that throws still counts as
+  // delivered. That is the right way round: a lost message is
+  // recoverable by ResendRequest, a duplicate MsgSeqNum is not.
+  bool claimDelivery(const std::string& sessionKey, const sequencer::RecordOrigin& origin) {
+    std::lock_guard<std::mutex> lock(highWaterMutex);
+    if (alreadyDeliveredLocked(sessionKey, origin)) {
+      return false;
+    }
+    markDeliveredLocked(sessionKey, origin);
+    return true;
+  }
+
+  bool alreadyDeliveredLocked(const std::string& sessionKey,
+                               const sequencer::RecordOrigin& origin) {
     const auto it = highWater.find(sessionKey);
     if (it == highWater.end()) {
       return false;
@@ -143,13 +172,18 @@ struct FixOutputTransport::Impl {
            (origin.journalSequenceNumber == seq && origin.outputIndex <= index);
   }
 
-  void markDelivered(const std::string& sessionKey, const sequencer::RecordOrigin& origin) {
-    std::lock_guard<std::mutex> lock(highWaterMutex);
+  void markDeliveredLocked(const std::string& sessionKey,
+                            const sequencer::RecordOrigin& origin) {
     auto& mark = highWater[sessionKey];
     if (origin.journalSequenceNumber > mark.first ||
         (origin.journalSequenceNumber == mark.first && origin.outputIndex > mark.second)) {
       mark = {origin.journalSequenceNumber, origin.outputIndex};
     }
+  }
+
+  void markDelivered(const std::string& sessionKey, const sequencer::RecordOrigin& origin) {
+    std::lock_guard<std::mutex> lock(highWaterMutex);
+    markDeliveredLocked(sessionKey, origin);
   }
 
   std::mutex highWaterMutex;
@@ -201,13 +235,12 @@ struct FixOutputTransport::Impl {
     // comparison drops every output after the first, which is exactly
     // what it did when first written.
     if (origin.journalSequenceNumber != 0 &&
-        alreadyDelivered(session->sessionKey(), origin)) {
+        !claimDelivery(session->sessionKey(), origin)) {
       return;
     }
 
     const std::uint64_t outboundSeqNum = session->sendApplication(msgType, rest);
     if (origin.journalSequenceNumber != 0) {
-      markDelivered(session->sessionKey(), origin);
       session->setLastJournalSequence(origin.journalSequenceNumber);
     }
 
@@ -373,6 +406,11 @@ void FixOutputTransport::start(int /*listenPort*/) {
     const auto now = [] { return std::chrono::steady_clock::now(); };
     std::uint64_t idleNs = 0, deliverNs = 0, flushNs = 0;
     std::uint64_t entries = 0, drains = 0, emptyDrains = 0;
+    // How long an entry sat in the ring before this reader picked it
+    // up. This is the hop between the journal and the wire that no
+    // other counter covers -- if it is large, the reader is not
+    // noticing work promptly; if it is small, the latency is upstream.
+    std::uint64_t ringWaitUs = 0;
     auto lastReport = now();
     constexpr std::uint64_t kReportIntervalNs = 2'000'000'000ULL;
       // Off unless asked for: these are diagnostics, and a sweep
@@ -407,6 +445,13 @@ void FixOutputTransport::start(int /*listenPort*/) {
           impl_->deliver(sessionId, body, origin);
         };
 
+        if (origin.publishTimeUs != 0) {
+          const auto nowUs = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count());
+          ringWaitUs += (nowUs > origin.publishTimeUs) ? (nowUs - origin.publishTimeUs) : 0;
+        }
         const auto deliverStart = now();
         if ((tag & sequencer::kSessionTagBit) != 0) {
           deliverTo(tag & ~sequencer::kSessionTagBit);
@@ -462,7 +507,8 @@ void FixOutputTransport::start(int /*listenPort*/) {
         std::fprintf(stderr,
                      "[fix-out] window=%.2fs entries=%llu drains=%llu empty=%llu "
                      "idle=%.1f%% deliver=%.1f%% flush=%.1f%% "
-                     "deliver_per_entry=%.1fus flush_per_drain=%.1fus\n",
+                     "deliver_per_entry=%.1fus flush_per_drain=%.1fus "
+                     "ring_wait_per_entry=%.1fus\n",
                      static_cast<double>(sinceReport) / 1e9,
                      (unsigned long long)entries, (unsigned long long)drains,
                      (unsigned long long)emptyDrains,
@@ -470,9 +516,11 @@ void FixOutputTransport::start(int /*listenPort*/) {
                      100.0 * static_cast<double>(deliverNs) / static_cast<double>(sinceReport),
                      100.0 * static_cast<double>(flushNs) / static_cast<double>(sinceReport),
                      entries ? static_cast<double>(deliverNs) / entries / 1000.0 : 0.0,
-                     drains ? static_cast<double>(flushNs) / drains / 1000.0 : 0.0);
+                     drains ? static_cast<double>(flushNs) / drains / 1000.0 : 0.0,
+                     entries ? static_cast<double>(ringWaitUs) / entries : 0.0);
         idleNs = deliverNs = flushNs = 0;
         entries = drains = emptyDrains = 0;
+        ringWaitUs = 0;
         lastReport = now();
       }
     }
@@ -486,6 +534,20 @@ void FixOutputTransport::stop() {
   if (impl_->reader.joinable()) {
     impl_->reader.join();
   }
+}
+
+void FixOutputTransport::deliverInline(std::uint64_t sessionId, std::string_view body,
+                                        std::uint64_t journalSequenceNumber,
+                                        std::uint32_t lastOutputIndex) {
+  // The session must be logged on: an inline answer to an order that
+  // arrived before Logon completed would jump the session's own
+  // handshake. deliver() also tolerates a session that vanished.
+  //
+  // Batching is deliberately not used here. One request produces one
+  // message and the client is waiting for it -- coalescing would trade
+  // the very latency this path exists to save.
+  impl_->deliver(sessionId, body,
+                 sequencer::RecordOrigin{journalSequenceNumber, lastOutputIndex, 0});
 }
 
 const SentRecord* FixOutputTransport::sentRecord(const std::string& sessionKey,

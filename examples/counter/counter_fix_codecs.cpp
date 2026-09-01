@@ -52,6 +52,28 @@ sequencer::Result<sequencer::Bytes> CounterFixInputCodec::toInput(
 }
 
 sequencer::Bytes CounterFixInputCodec::toOutput(
+    const sequencer::Receipt& receipt, std::span<const sequencer::Payload> designatedOutputs,
+    sequencer::Payload input) {
+  // --inline_designated_outputs. The chassis withholds designated
+  // outputs unless that flag is on, so an empty span here IS the
+  // default §8.11 path and must stay silent.
+  if (designatedOutputs.empty() || designatedOutputs[0].size() != sizeof(std::int64_t) ||
+      input.size() != sizeof(std::int64_t)) {
+    return toOutput(receipt, designatedOutputs);
+  }
+  std::int64_t total = 0;
+  std::memcpy(&total, designatedOutputs[0].data(), sizeof(total));
+  std::int64_t submitted = 0;
+  std::memcpy(&submitted, input.data(), sizeof(submitted));
+
+  // Byte-identical to what CounterFixOutputCodec builds for this same
+  // record -- see counterTotalsBody.
+  const std::string body = counterTotalsBody(submitted, total);
+  return sequencer::Bytes(reinterpret_cast<const std::byte*>(body.data()),
+                           reinterpret_cast<const std::byte*>(body.data()) + body.size());
+}
+
+sequencer::Bytes CounterFixInputCodec::toOutput(
     const sequencer::Receipt& /*receipt*/,
     std::span<const sequencer::Payload> /*designatedOutputs*/) {
   // Nothing goes back on the propose path for a session transport
@@ -77,12 +99,50 @@ void CounterFixOutputCodec::toOutput(const sequencer::journal::RecordView& recor
     std::int64_t total = 0;
     std::memcpy(&total, output.data(), sizeof(total));
 
+    // Echo the SUBMITTED DELTA back alongside the total, from
+    // record.input() -- the journal stores the input beside the outputs,
+    // so this is reading a field that was always there.
+    //
+    // It exists for correlation, and the reasoning is worth keeping
+    // because it looks like a hack until you see what it replaces. A
+    // FIX client needs to match a reply to the order that caused it.
+    // The natural mechanisms cannot work here: Fanout::toSession needs
+    // the owning session id, and a per-session topic needs the same
+    // thing, and NEITHER is in the record -- the counter's input is
+    // eight bytes of delta and nothing else. Carrying a session id or a
+    // nonce BESIDE the delta would widen the input to sixteen bytes,
+    // which CounterStateMachine::apply rejects outright, so it would
+    // mean changing the state machine and leaving journals that older
+    // code cannot replay.
+    //
+    // Echoing the delta avoids all of that: the input encoding, the
+    // state machine and §11 replay are untouched. A benchmark client
+    // then sends a DISTINCT delta per request and matches on it (see
+    // bench/load_generator's FIX arm), which is what makes a
+    // multi-client measurement valid -- with every client sharing this
+    // broadcast topic, matching replies by arrival order silently
+    // completes each client's requests against other clients' totals.
+    //
+    // The cost is honest and bounded: a benchmark's running total
+    // becomes a meaningless sum of nonces. Nobody reads the counter's
+    // value, so that is acceptable HERE and is not a pattern to copy. A
+    // real order-entry application carries a ClOrdID and addresses
+    // toSession.
+    std::int64_t submitted = 0;
+    const sequencer::Payload in = record.input();
+    if (in.size() == sizeof(submitted)) {
+      std::memcpy(&submitted, in.data(), sizeof(submitted));
+    }
+
     // The body only: FixOutputTransport adds MsgSeqNum, SendingTime and
     // CheckSum through the session core, so a codec never touches
     // sequence numbers.
-    const std::string body =
-        "35=U2\001" + std::to_string(kCounterValueTag) + "=" + std::to_string(total) + "\001";
-    fanout.broadcast(kTotalsTopic,
+    const std::string body = counterTotalsBody(submitted, total);
+    // The submitting client's own topic, recovered from the delta's high
+    // bits, so only that client receives this -- see kClientIdShift for
+    // why a single shared topic could not carry a multi-client run.
+    const std::int64_t clientId = counterClientIdOf(submitted);
+    fanout.broadcast(counterTopicFor(clientId),
                       sequencer::Bytes(reinterpret_cast<const std::byte*>(body.data()),
                                         reinterpret_cast<const std::byte*>(body.data()) +
                                             body.size()));

@@ -77,6 +77,17 @@ class FixOutputTransport : public sequencer::OutputTransport {
   // `codec` must outlive this transport; the session gateway owns it.
   void attachJournal(const std::filesystem::path& dataDir, sequencer::OutputCodec& codec);
 
+  // Sends one output on a session from the INPUT half's propose receipt
+  // rather than from the ring (InputGatewayConfig::
+  // inlineDesignatedOnSession). Routed through the same deliver() the
+  // ring reader uses, so it takes the same MsgSeqNum assignment, the
+  // same (journal record, output index) high-water mark, and the same
+  // recordSent() bookkeeping a resend needs. Marking the high-water
+  // mark here is what makes the journal copy of this output a no-op
+  // when it arrives a couple of hundred microseconds later.
+  void deliverInline(std::uint64_t sessionId, std::string_view body,
+                     std::uint64_t journalSequenceNumber, std::uint32_t lastOutputIndex);
+
   // Sends a session everything addressed to it since its last persisted
   // journal position, as NEW messages. Called automatically when a
   // session completes Logon; exposed for tests.

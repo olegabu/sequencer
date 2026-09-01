@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -247,7 +248,10 @@ class FixSession {
   // Begin an orderly Logout handshake.
   void logout(std::string_view text = {});
 
-  bool isLoggedOn() const noexcept { return state_ == State::LoggedOn; }
+  bool isLoggedOn() const noexcept {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return state_ == State::LoggedOn;
+  }
 
   // Writes the counters through unconditionally, bypassing the
   // throttle. A transport MUST call this when a connection ends by any
@@ -258,7 +262,10 @@ class FixSession {
   // This became load-bearing when persistence was throttled off the
   // per-message path: before that, every message wrote through, so a
   // drop could not lose anything.
-  void flushSequences() { persist(); }
+  void flushSequences() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    persist();
+  }
 
   // Called by an acceptor before completing a Logon, to refuse a second
   // concurrent connection claiming an identity that is already live.
@@ -272,10 +279,17 @@ class FixSession {
   void setIdentityGuard(IdentityGuard guard) { identityGuard_ = std::move(guard); }
   const SequenceNumbers& sequences() const noexcept { return sequences_; }
 
+  // Snapshot, for callers on another thread than the session's reader.
+  SequenceNumbers sequencesSnapshot() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return sequences_;
+  }
+
   // Records how far through the journal this session has been caught
   // up, and persists it. Called by the output side after a successful
   // send; see SequenceNumbers::lastJournalSequence.
   void setLastJournalSequence(std::uint64_t journalSequenceNumber) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (journalSequenceNumber <= sequences_.lastJournalSequence) {
       return;  // out-of-order or replayed; the high-water mark only rises
     }
@@ -309,6 +323,22 @@ class FixSession {
   };
 
   // --- message handling ---
+  // Serializes every mutation of session state.
+  //
+  // Two threads already reach emit() on the same session: the
+  // connection's reader thread (heartbeats, TestRequest replies,
+  // ResendRequest, Logout) and the output side's single ring reader
+  // (deliver() -> sendApplication). emit() read-modify-writes
+  // sequences_.nextOutbound and formats into the shared buffer_, so
+  // without this two messages could take the SAME MsgSeqNum or tear
+  // into one another's buffer -- both session-fatal in FIX. The window
+  // is microseconds and heartbeats are 30s apart, which is why a
+  // benchmark run never hit it.
+  //
+  // Recursive because the public entry points nest through the private
+  // handlers (onBytes -> handleLogon -> emit -> persist -> sessionKey).
+  mutable std::recursive_mutex mutex_;
+
   void handleMessage(const hffix::message_reader& message);
   bool checkSequence(const hffix::message_reader& message, char msgType);
   void adoptIdentity(const hffix::message_reader& message);

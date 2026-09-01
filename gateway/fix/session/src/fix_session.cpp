@@ -191,6 +191,8 @@ FixSession::~FixSession() {
 }
 
 void FixSession::start() {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
   lastReceivedUs_ = clock_();
   lastSentUs_ = clock_();
   if (config_.role == Role::Initiator) {
@@ -202,6 +204,8 @@ void FixSession::start() {
 }
 
 void FixSession::onBytes(std::string_view bytes) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
   receive_.append(bytes.data(), bytes.size());
   lastReceivedUs_ = clock_();
 
@@ -504,6 +508,8 @@ void FixSession::handleSequenceReset(const hffix::message_reader& message) {
 }
 
 void FixSession::poll() {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
   if (state_ != State::LoggedOn) {
     return;
   }
@@ -533,6 +539,8 @@ void FixSession::poll() {
 }
 
 std::uint64_t FixSession::sendApplication(std::string_view msgType, std::string_view body) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
   return emit(msgType, [&](hffix::message_writer& writer) {
     // The body arrives already encoded as FIX fields by the codec and
     // is re-pushed field by field between header and trailer -- see
@@ -543,6 +551,8 @@ std::uint64_t FixSession::sendApplication(std::string_view msgType, std::string_
 }
 
 void FixSession::logout(std::string_view text) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
   sendLogout(text);
   state_ = State::LogoutSent;
 }

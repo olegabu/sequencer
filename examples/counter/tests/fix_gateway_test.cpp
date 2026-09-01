@@ -87,7 +87,10 @@ class FixClient {
     pumpFor(std::chrono::milliseconds(1500), [this] { return session_->isLoggedOn(); });
   }
   void subscribeToTotals() {
-    session_->sendApplication("V", std::string("262=req1\00110155=1\00155=") + kTotalsTopic + "\001");
+    // This test submits with delta 5 and -2, so the client id in the
+    // high bits is 0 and its topic is TOTALS-0.
+    session_->sendApplication(
+        "V", "262=req1\00110155=1\00155=" + counterTopicFor(0) + "\001");
   }
   void submit(std::int64_t delta) {
     session_->sendApplication("U1", std::to_string(kCounterValueTag) + "=" +
@@ -172,6 +175,62 @@ TEST(CounterFixGateway, TotalsArriveAsU2FromTheJournalNotAsTheSynchronousReply) 
   EXPECT_EQ(client.totals().size(), 2u)
       << "each total must arrive exactly once: designated outputs are withheld on a "
           "session transport, so nothing is delivered twice";
+
+  std::filesystem::remove_all(dir);
+}
+
+
+// The mirror of the test above, with --inline_designated_outputs on.
+//
+// Same observable result -- each total exactly once -- reached by the
+// opposite path: the reply is built from the propose receipt and the
+// journal copy is suppressed, rather than the reply being withheld and
+// the journal copy delivered. Four totals here would mean the dedup
+// failed and both paths delivered; zero would mean the flag turned the
+// reply off without turning the inline path on.
+TEST(CounterFixGateway, InlineDesignatedOutputsAnswerOnceNotTwice) {
+  const std::filesystem::path dir = makeTempDir();
+  const std::string nodePeer = "127.0.0.1:29711:0";
+
+  ChildProcess node(COUNTER_NODE_MAIN_PATH,
+                     {"--peer=" + nodePeer, "--peers=" + nodePeer,
+                      "--data_dir=" + dir.string(), "--election_timeout_ms=300"});
+  std::this_thread::sleep_for(std::chrono::milliseconds(900));
+
+  ChildProcess gateway(COUNTER_FIX_GATEWAY_MAIN_PATH,
+                        {"--node_peers=127.0.0.1:29711", "--listen_port=29712",
+                         "--data_dir=" + dir.string(),
+                         "--resume_file=" + (dir / "fix-resume").string(),
+                         "--sequence_store_dir=" + (dir / "fix-seq").string(),
+                         "--inline_designated_outputs=true"});
+  std::this_thread::sleep_for(std::chrono::milliseconds(900));
+
+  FixClient client(29712, "ACME");
+  client.logon();
+  ASSERT_TRUE(client.isLoggedOn()) << "the counter FIX gateway did not accept a session";
+
+  // Subscribed exactly as in the journal-path test: the subscription is
+  // what would deliver the second copy, so leaving it out would make
+  // the exactly-once assertion below prove nothing.
+  client.subscribeToTotals();
+  client.pumpFor(std::chrono::milliseconds(500));
+
+  client.submit(5);
+  client.pumpFor(std::chrono::milliseconds(2000), [&] { return !client.totals().empty(); });
+  client.submit(-2);
+  client.pumpFor(std::chrono::milliseconds(2000), [&] { return client.totals().size() >= 2; });
+
+  ASSERT_GE(client.totals().size(), 2u) << "the inline path must answer both orders";
+  EXPECT_EQ(client.totals()[0].type, "U2");
+  EXPECT_EQ(client.totals()[0].value, "5");
+  EXPECT_EQ(client.totals()[1].value, "3") << "the counter must accumulate: 5 + (-2)";
+
+  // Give the journal's own copy time to arrive, so this asserts the
+  // dedup worked rather than that the test looked too early.
+  client.pumpFor(std::chrono::milliseconds(1000));
+  EXPECT_EQ(client.totals().size(), 2u)
+      << "each total must arrive exactly once: the inline reply marks the journal position "
+          "delivered, so the output side skips its copy";
 
   std::filesystem::remove_all(dir);
 }

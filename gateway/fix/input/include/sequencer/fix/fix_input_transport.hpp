@@ -79,6 +79,17 @@ class FixInputTransport : public sequencer::InputTransport, public SessionSource
   // business (§8.12).
   void setAuthenticator(Authenticator authenticator);
 
+  // Opt-in inline answering (InputGatewayConfig::
+  // inlineDesignatedOnSession). When set, respond() hands the codec's
+  // bytes straight back on the client's own session instead of dropping
+  // them, tagged with the journal position they came from so the output
+  // half can skip its copy. Unset (the default) keeps §8.11's rule:
+  // respond() delivers nothing and the journal is the only path.
+  using InlineResponseFn = std::function<void(std::uint64_t sessionId, std::string_view body,
+                                               std::uint64_t journalSequenceNumber,
+                                               std::uint32_t lastOutputIndex)>;
+  void setInlineResponseFn(InlineResponseFn fn);
+
   // --- SessionSource (gateway/fix/output/) ---
   //
   // Implemented here so an order-entry gateway shares ONE session core

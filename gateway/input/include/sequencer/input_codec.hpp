@@ -118,6 +118,20 @@ class InputCodec {
   virtual Bytes toOutput(const Receipt& receipt,
                           std::span<const Payload> designatedOutputs) = 0;
 
+  // As above, plus the input bytes this reply answers.
+  //
+  // Only needed by a codec serving a SessionStream transport with
+  // InputGatewayConfig::inlineDesignatedOnSession on. There the reply
+  // must be BYTE-IDENTICAL to what the output codec would build from
+  // the journal record, because a ResendRequest re-runs the output
+  // codec to reproduce it -- and the output codec can see the record's
+  // input while this one, by default, cannot. Defaults to the
+  // two-argument form, so existing codecs are unaffected.
+  virtual Bytes toOutput(const Receipt& receipt, std::span<const Payload> designatedOutputs,
+                          Payload /*input*/) {
+    return toOutput(receipt, designatedOutputs);
+  }
+
   // Called when a stateful session ends (specification.md §8.1). May
   // return input bytes to propose as a disconnect notification, or
   // std::nullopt if the state machine has no notion of one — the

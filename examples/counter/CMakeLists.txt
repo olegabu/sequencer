@@ -99,6 +99,7 @@ add_executable(counter_load_generator_main load_generator_main.cpp)
 # harness (see node/CMakeLists.txt on why that distinction is load-bearing).
 target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_input sequencer::node_proto
                                                             sequencer::bench_fix_requester
+                                                            counter::fix_codecs
                                                             sequencer::bench_load_generator
                                                             sequencer::bench_relay_observer
                                                             sequencer::bench_output_observer

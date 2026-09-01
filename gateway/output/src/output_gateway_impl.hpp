@@ -18,6 +18,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -165,7 +167,11 @@ class OutputGatewayImpl {
     // One record may emit several outputs; the index distinguishes them
     // so a resend can name exactly one.
     sequencer::RecordOrigin origin() {
-      return sequencer::RecordOrigin{journalSequenceNumber_, outputIndex_++};
+      const auto nowUs = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+      return sequencer::RecordOrigin{journalSequenceNumber_, outputIndex_++, nowUs};
     }
 
     sequencer::BroadcastRing& ring_;
@@ -192,7 +198,16 @@ class OutputGatewayImpl {
         }
       }
       if (!reader->contains(seq)) {
+        // Waiting for the next record. Timed because this is the other
+        // half of the journal-to-wire gap: if the tail loop spends its
+        // time here, records are arriving slowly; if it spends its time
+        // in the codec below, the gateway is the cost.
+        const auto waitStart = std::chrono::steady_clock::now();
         idle.idle();
+        tailWaitNs_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - waitStart)
+                .count());
         continue;
       }
       idle.reset();
@@ -208,11 +223,36 @@ class OutputGatewayImpl {
       int processed = 0;
       while (processed < kMaxBurst && reader->contains(seq) &&
              !stopRequested_.load(std::memory_order_relaxed)) {
+        const auto codecStart = std::chrono::steady_clock::now();
         ringFanout_.beginRecord(seq);
         codec_->toOutput(reader->record(seq), ringFanout_);
+        tailCodecNs_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - codecStart)
+                .count());
+        ++tailRecords_;
         ++seq;
         ++processed;
         nextSeq_.store(seq, std::memory_order_relaxed);
+      }
+
+      // Reported on the same cadence and behind the same switch as the
+      // FIX transports' own timers, so one run gives the whole path.
+      if (std::getenv("FIX_STAGE_TIMERS") != nullptr) {
+        const auto sinceReport = std::chrono::steady_clock::now() - lastTailReport_;
+        if (sinceReport >= std::chrono::seconds(2) && tailRecords_ > 0) {
+          const double windowNs = static_cast<double>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(sinceReport).count());
+          std::fprintf(stderr,
+                       "[tail] window=%.2fs records=%llu wait=%.1f%% codec=%.1f%% "
+                       "codec_per_record=%.1fus\n",
+                       windowNs / 1e9, (unsigned long long)tailRecords_,
+                       100.0 * static_cast<double>(tailWaitNs_) / windowNs,
+                       100.0 * static_cast<double>(tailCodecNs_) / windowNs,
+                       static_cast<double>(tailCodecNs_) / tailRecords_ / 1000.0);
+          tailWaitNs_ = tailCodecNs_ = tailRecords_ = 0;
+          lastTailReport_ = std::chrono::steady_clock::now();
+        }
       }
 
       // Persisting the resume position is not free — ResumePosition::
@@ -253,6 +293,10 @@ class OutputGatewayImpl {
   sequencer::TopicRegistry topics_;
   sequencer::BroadcastRing ring_;
   RingFanout ringFanout_;
+  std::uint64_t tailWaitNs_ = 0;
+  std::uint64_t tailCodecNs_ = 0;
+  std::uint64_t tailRecords_ = 0;
+  std::chrono::steady_clock::time_point lastTailReport_ = std::chrono::steady_clock::now();
   std::atomic<std::uint64_t> nextSeq_{1};  // mirrors tailLoop()'s own seq, readable from stop()
   std::thread tailThread_;
   std::atomic<bool> stopRequested_{false};

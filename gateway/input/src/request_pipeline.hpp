@@ -32,8 +32,13 @@ namespace sequencer::gateway::input::detail {
 class RequestPipeline {
  public:
   RequestPipeline(sequencer::InputCodec& codec, NodeProposer& proposer,
-                   sequencer::SignatureVerifier verifier, sequencer::TransportShape shape)
-      : codec_(codec), proposer_(proposer), verifier_(std::move(verifier)), shape_(shape) {}
+                   sequencer::SignatureVerifier verifier, sequencer::TransportShape shape,
+                   bool inlineDesignatedOnSession = false)
+      : codec_(codec),
+        proposer_(proposer),
+        verifier_(std::move(verifier)),
+        shape_(shape),
+        inlineDesignatedOnSession_(inlineDesignatedOnSession) {}
 
   RequestPipeline(const RequestPipeline&) = delete;
   RequestPipeline& operator=(const RequestPipeline&) = delete;
@@ -61,7 +66,14 @@ class RequestPipeline {
 
     // proposeToLeader(input) (generic) — asynchronous, so the calling
     // thread is free the moment the RPC is on the wire.
-    proposer_.proposeAsync(input, [this, request](NodeProposer::Outcome outcome) {
+    // Only the inline path needs the input bytes to survive into the
+    // callback, and copying them per request is not free -- so the copy
+    // is made only when that path is on. Empty otherwise.
+    sequencer::Bytes inputForReply =
+        inlineDesignatedOnSession_ ? inputBytes : sequencer::Bytes();
+
+    proposer_.proposeAsync(input, [this, request, inputForReply = std::move(inputForReply)](
+                                       NodeProposer::Outcome outcome) {
       if (!outcome.ok) {
         request->fail(outcome.errorMessage);
         return;
@@ -75,8 +87,15 @@ class RequestPipeline {
       // order -- so the codec is handed an empty span rather than each
       // transport being trusted to remember. A future FIX transport
       // cannot double-deliver by omission.
+      //
+      // inlineDesignatedOnSession_ is the deliberate, flagged exception
+      // (see InputGatewayConfig). It lets a SessionStream transport
+      // answer from the receipt, and makes the transport responsible for
+      // suppressing the journal copy of the same output. It is NOT the
+      // default, and it is only sound for sessions whose every output
+      // originates in their own inputs -- see the flag's comment.
       std::vector<sequencer::Payload> designated;
-      if (shape_ == sequencer::TransportShape::RequestResponse) {
+      if (shape_ == sequencer::TransportShape::RequestResponse || inlineDesignatedOnSession_) {
         designated.reserve(outcome.designatedOutputs.size());
         for (const sequencer::Bytes& output : outcome.designatedOutputs) {
           designated.emplace_back(output.data(), output.size());
@@ -87,7 +106,14 @@ class RequestPipeline {
       // knowledge again.
       const sequencer::Bytes responseBytes = codec_.toOutput(
           outcome.receipt,
-          std::span<const sequencer::Payload>(designated.data(), designated.size()));
+          std::span<const sequencer::Payload>(designated.data(), designated.size()),
+          sequencer::Payload(inputForReply.data(), inputForReply.size()));
+
+      // The journal position this input landed at, so a transport that
+      // answers inline can tell the output side exactly which record and
+      // how many outputs it has already sent. sequenceNumber is on the
+      // receipt already -- no application-level execution id is needed.
+      request->noteReceipt(outcome.receipt, outcome.designatedOutputs.size());
 
       // sendClientResponse(response) (generic).
       request->respond(sequencer::Payload(responseBytes.data(), responseBytes.size()));
@@ -113,6 +139,7 @@ class RequestPipeline {
   NodeProposer& proposer_;
   sequencer::SignatureVerifier verifier_;
   const sequencer::TransportShape shape_;
+  const bool inlineDesignatedOnSession_ = false;
 };
 
 }  // namespace sequencer::gateway::input::detail

@@ -47,6 +47,26 @@ struct InputGatewayConfig {
   // SessionStream semantics onto a request/response transport for
   // testing the guard.
   sequencer::TransportShape transportShape = sequencer::TransportShape::RequestResponse;
+
+  // Answer a SessionStream transport's client from the propose receipt
+  // instead of waiting for the output side to deliver the same output
+  // from the journal, saving that hop's latency.
+  //
+  // OFF by default, because it trades away a property §8.12 depends on.
+  // With it on, a session's own replies leave ~200us before outputs
+  // that the journal ordered around them, so the order a client was
+  // sent messages in is no longer the order the journal reproduces --
+  // and the journal IS the resend store, so a ResendRequest would
+  // replay a different sequence than was originally transmitted.
+  //
+  // It is sound only where every output a session receives originates
+  // in that session's own inputs (order entry with no market data and
+  // no fills caused by other clients). There, propose order and journal
+  // order coincide and nothing can overtake anything.
+  //
+  // The transport must suppress the journal copy of what it sent
+  // inline; noteReceipt() gives it the journal position to do that.
+  bool inlineDesignatedOnSession = false;
 };
 
 // Builds the transport a gateway will serve. Mirrors
@@ -76,7 +96,8 @@ class InputGatewayImpl {
         pipeline_(*codec_, proposer_, std::move(verifier),
                    transport_->shape() == sequencer::TransportShape::SessionStream
                        ? sequencer::TransportShape::SessionStream
-                       : config_.transportShape) {}
+                       : config_.transportShape,
+                   config_.inlineDesignatedOnSession) {}
 
   InputGatewayImpl(const InputGatewayImpl&) = delete;
   InputGatewayImpl& operator=(const InputGatewayImpl&) = delete;

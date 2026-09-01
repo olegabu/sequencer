@@ -126,6 +126,20 @@ class FileSequenceStore : public SequenceStore {
   std::map<std::string, SequenceNumbers> memory_;
 };
 
+// Propose-receipt timing (FIX_STAGE_TIMERS).
+//
+// This is the measurement that separates the two costs in a session
+// transport's latency. The receipt arrives when consensus has committed
+// the record and the state machine has applied it -- exactly the moment
+// a RequestResponse gateway would have answered the client. Everything
+// after it is what §8.11's journal-ordered delivery adds on top.
+//
+// Both halves are timed in the same process, on the same run, against
+// the same clients, so the comparison carries no cross-topology
+// assumption: it is one clock, one host, one load.
+std::atomic<std::uint64_t> g_proposeNs{0};
+std::atomic<std::uint64_t> g_proposeCount{0};
+
 // One inbound FIX application message.
 //
 // respond() DELIBERATELY SENDS NOTHING. specification.md §8.11: on a
@@ -138,8 +152,14 @@ class FileSequenceStore : public SequenceStore {
 // session, which is the cross-order ordering hazard §8.11 describes.
 class FixRequestContext : public sequencer::RequestContext {
  public:
-  FixRequestContext(std::string body, std::uint64_t sessionId)
-      : body_(std::move(body)), sessionId_(sessionId) {}
+  using InlineFn = std::function<void(std::uint64_t, std::string_view, std::uint64_t,
+                                      std::uint32_t)>;
+
+  FixRequestContext(std::string body, std::uint64_t sessionId, InlineFn inlineResponse)
+      : body_(std::move(body)),
+        sessionId_(sessionId),
+        inlineResponse_(std::move(inlineResponse)),
+        submittedAt_(std::chrono::steady_clock::now()) {}
 
   sequencer::Payload body() const override {
     return sequencer::Payload(reinterpret_cast<const std::byte*>(body_.data()), body_.size());
@@ -147,13 +167,30 @@ class FixRequestContext : public sequencer::RequestContext {
 
   std::uint64_t session() const override { return sessionId_; }
 
-  void respond(sequencer::Payload /*response*/) override {
+  void noteReceipt(const sequencer::Receipt& receipt, std::size_t designatedOutputs) override {
+    journalSequenceNumber_ = receipt.sequenceNumber;
+    // The codec collapses however many designated outputs there were
+    // into one message, so the whole span is accounted for by marking
+    // the LAST index delivered -- marking only index 0 would let the
+    // journal copy of a second output through as a duplicate.
+    lastOutputIndex_ =
+        designatedOutputs > 0 ? static_cast<std::uint32_t>(designatedOutputs - 1) : 0;
+  }
+
+  void respond(sequencer::Payload response) override {
     // Consumed, not sent. The chassis has already withheld the
     // designated outputs (§8.11 guard in request_pipeline.hpp), so
     // whatever the codec produced here is a receipt-shaped
     // acknowledgement with nothing in it for the client; the client's
     // answer is the execution report the output side will deliver.
     accepted_ = true;
+    recordProposeLatency();
+    if (inlineResponse_ && response.size() > 0) {
+      inlineResponse_(sessionId_,
+                      std::string_view(reinterpret_cast<const char*>(response.data()),
+                                       response.size()),
+                      journalSequenceNumber_, lastOutputIndex_);
+    }
   }
 
   void fail(const std::string& message) override {
@@ -162,6 +199,7 @@ class FixRequestContext : public sequencer::RequestContext {
     // it into a session-level Reject.
     rejected_ = true;
     failure_ = message;
+    recordProposeLatency();
   }
 
   bool rejected() const { return rejected_; }
@@ -170,7 +208,20 @@ class FixRequestContext : public sequencer::RequestContext {
 
  private:
   std::string body_;
+  void recordProposeLatency() {
+    g_proposeNs.fetch_add(static_cast<std::uint64_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - submittedAt_)
+                                  .count()),
+                          std::memory_order_relaxed);
+    g_proposeCount.fetch_add(1, std::memory_order_relaxed);
+  }
+
   std::uint64_t sessionId_;
+  InlineFn inlineResponse_;
+  std::uint64_t journalSequenceNumber_ = 0;
+  std::uint32_t lastOutputIndex_ = 0;
+  std::chrono::steady_clock::time_point submittedAt_;
   bool accepted_ = false;
   bool rejected_ = false;
   std::string failure_;
@@ -212,6 +263,8 @@ struct FixInputTransport::Impl {
   FixInputConfig config;
   FileSequenceStore sequences;
   Authenticator authenticator = acceptAnyCredentials();
+  // Empty unless the gateway opted into inline answering.
+  FixInputTransport::InlineResponseFn inlineResponse;
 
   RequestFn onRequest;
   DisconnectFn onDisconnect;
@@ -305,7 +358,8 @@ struct FixInputTransport::Impl {
       // Otherwise the transport hands the message to the codec exactly
       // as it arrived, uninterpreted (§8.10).
       this->onRequest(std::make_shared<FixRequestContext>(
-          std::string(message.message_begin(), message.message_size()), connection->sessionId));
+          std::string(message.message_begin(), message.message_size()), connection->sessionId,
+          this->inlineResponse));
     });
     connection->session->setEventFn(
         [this, connection](SessionEvent event, DisconnectReason reason) {
@@ -390,18 +444,25 @@ struct FixInputTransport::Impl {
         const auto sinceReport = static_cast<std::uint64_t>(
             std::chrono::duration_cast<Ns>(tick() - lastReport).count());
         if (stageTimers && sinceReport >= kReportIntervalNs && reads > 0) {
+          // Drained together so the mean covers this window only.
+          const std::uint64_t proposeNs = g_proposeNs.exchange(0, std::memory_order_relaxed);
+          const unsigned long long proposeCount = static_cast<unsigned long long>(
+              g_proposeCount.exchange(0, std::memory_order_relaxed));
+          const double proposeMeanUs =
+              proposeCount > 0 ? static_cast<double>(proposeNs) / proposeCount / 1000.0 : 0.0;
           // read% high means this thread is waiting for the client.
           // process% high means the per-message chassis work -- codec,
           // signature, proposeAsync -- is what costs.
           std::fprintf(stderr,
                        "[fix-in] window=%.2fs reads=%llu bytes=%llu read=%.1f%% process=%.1f%% "
-                       "process_per_read=%.1fus bytes_per_read=%.0f\n",
+                       "process_per_read=%.1fus bytes_per_read=%.0f propose_per_msg=%.0fus "
+                       "proposes=%llu\n",
                        static_cast<double>(sinceReport) / 1e9, (unsigned long long)reads,
                        (unsigned long long)bytesRead,
                        100.0 * static_cast<double>(readNs) / static_cast<double>(sinceReport),
                        100.0 * static_cast<double>(processNs) / static_cast<double>(sinceReport),
                        static_cast<double>(processNs) / reads / 1000.0,
-                       static_cast<double>(bytesRead) / reads);
+                       static_cast<double>(bytesRead) / reads, proposeMeanUs, proposeCount);
           readNs = processNs = reads = bytesRead = 0;
           lastReport = tick();
         }
@@ -486,6 +547,10 @@ FixInputTransport::~FixInputTransport() { stop(); }
 void FixInputTransport::attach(RequestFn onRequest, DisconnectFn onDisconnect) {
   impl_->onRequest = std::move(onRequest);
   impl_->onDisconnect = std::move(onDisconnect);
+}
+
+void FixInputTransport::setInlineResponseFn(InlineResponseFn fn) {
+  impl_->inlineResponse = std::move(fn);
 }
 
 void FixInputTransport::setAuthenticator(Authenticator authenticator) {

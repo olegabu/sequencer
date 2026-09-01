@@ -72,6 +72,21 @@ int RunFixSessionGateway(SessionGatewayConfig config,
   sequencer::gateway::input::detail::InputGatewayConfig inputGatewayConfig;
   inputGatewayConfig.nodeEndpoints = config.nodeEndpoints;
   inputGatewayConfig.listenPort = config.listenPort;
+  inputGatewayConfig.inlineDesignatedOnSession = config.inlineDesignatedOutputs;
+  if (config.inlineDesignatedOutputs) {
+    // The two halves are already one session core; this just lets the
+    // input half hand its answer to the output half's deliver() -- the
+    // same path, the same dedup, the same resend bookkeeping -- rather
+    // than waiting for the journal to bring the same bytes back around.
+    input->setInlineResponseFn([output](std::uint64_t sessionId, std::string_view body,
+                                        std::uint64_t journalSequenceNumber,
+                                        std::uint32_t lastOutputIndex) {
+      output->deliverInline(sessionId, body, journalSequenceNumber, lastOutputIndex);
+    });
+    LOG(WARNING) << "inline designated outputs ENABLED: answering from the propose receipt "
+                    "(specification.md §8.11 is deliberately relaxed; sound only where every "
+                    "output a session receives originates in its own inputs)";
+  }
   sequencer::gateway::input::detail::InputGatewayImpl inputGateway(
       inputGatewayConfig, std::move(inputCodec), sequencer::acceptAllSignatures,
       [ownedInput]() {

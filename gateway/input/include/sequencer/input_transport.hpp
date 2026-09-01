@@ -60,6 +60,14 @@ class RequestContext {
   // sessionId is the same value.
   virtual std::uint64_t session() const { return 0; }
 
+  // Where this input landed in the journal, and how many designated
+  // outputs the state machine produced for it. Called after the propose
+  // commits and before respond(). Default no-op: only a transport that
+  // answers inline on a session (see InputGatewayConfig::
+  // inlineDesignatedOnSession) needs it, to suppress the journal copy
+  // of an output it has already sent.
+  virtual void noteReceipt(const Receipt& /*receipt*/, std::size_t /*designatedOutputs*/) {}
+
   // Complete the request successfully with the codec's response bytes.
   // Exactly one of respond()/fail() must be called, exactly once.
   virtual void respond(Payload response) = 0;
