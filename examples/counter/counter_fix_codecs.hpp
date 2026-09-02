@@ -39,13 +39,13 @@
 
 #include <cstdint>
 #include <optional>
-#include <string>
-
-#include "counter_client_id.hpp"
 #include <span>
+#include <string>
 
 #include <sequencer/input_codec.hpp>
 #include <sequencer/output_codec.hpp>
+
+#include "counter_client_id.hpp"
 
 namespace sequencer::examples::counter {
 

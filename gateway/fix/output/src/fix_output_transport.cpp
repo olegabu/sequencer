@@ -31,6 +31,35 @@ class CapturingFanout final : public sequencer::Fanout {
 };
 
 // Serves a ResendRequest for one session by re-reading the journal.
+// Splits the codec's "35=<type>\001<fields...>" body into the MsgType
+// and the rest.
+//
+// The codec puts MsgType at the front of what it builds, because only
+// the application knows whether a message is an execution report, a
+// market-data snapshot or something else. The session core needs it
+// separately, to place it immediately after BodyLength where FIX
+// requires rather than in the middle of the body.
+//
+// One function because all three delivery routes -- live ring delivery,
+// catch-up, and resend -- have to split it IDENTICALLY. They were three
+// copies of the same six lines, and a resend that split differently
+// from the original send would put a different message on the wire than
+// the one being resent.
+struct SplitBody {
+  std::string_view msgType;
+  std::string_view rest;
+};
+
+inline SplitBody splitMsgType(std::string_view body, std::string_view fallbackType) {
+  if (body.size() > 3 && body.compare(0, 3, "35=") == 0) {
+    const std::size_t soh = body.find('\001');
+    if (soh != std::string_view::npos) {
+      return {body.substr(3, soh - 3), body.substr(soh + 1)};
+    }
+  }
+  return {fallbackType, body};
+}
+
 class JournalResendSource final : public ResendSource {
  public:
   JournalResendSource(FixOutputTransport& transport, std::string sessionKey,
@@ -63,17 +92,10 @@ class JournalResendSource final : public ResendSource {
       const sequencer::Bytes& body = captured.outputs[record->outputIndex];
       const std::string_view raw(reinterpret_cast<const char*>(body.data()), body.size());
 
-      // Strip the codec's leading MsgType so the session core can place
-      // it where FIX requires -- the same split deliver() does.
-      std::string_view msgType = record->msgType;
-      std::string_view rest = raw;
-      if (raw.size() > 3 && raw.compare(0, 3, "35=") == 0) {
-        const std::size_t soh = raw.find('\001');
-        if (soh != std::string_view::npos) {
-          msgType = raw.substr(3, soh - 3);
-          rest = raw.substr(soh + 1);
-        }
-      }
+      // Falls back to the MsgType recorded when this message was
+      // originally sent, so a resend names the same type even if the
+      // codec's output no longer carries one.
+      const auto [msgType, rest] = splitMsgType(raw, record->msgType);
       emit(seqNum, msgType, rest, record->sendingTime);
       servedAny = true;
     }
@@ -248,15 +270,7 @@ struct FixOutputTransport::Impl {
     // a market-data snapshot, or something else. Split it off so the
     // session core can place it where FIX requires -- immediately after
     // BodyLength -- rather than in the middle of the body.
-    std::string_view msgType = "U2";
-    std::string_view rest = body;
-    if (body.size() > 3 && body.compare(0, 3, "35=") == 0) {
-      const std::size_t soh = body.find('\001');
-      if (soh != std::string_view::npos) {
-        msgType = body.substr(3, soh - 3);
-        rest = body.substr(soh + 1);
-      }
-    }
+    const auto [msgType, rest] = splitMsgType(body, "U2");
     // Skip what catch-up already sent. Both paths can see the same
     // record in the narrow window between catch-up reading the journal's
     // committed count and the session becoming live on the ring, and a
@@ -334,15 +348,7 @@ void FixOutputTransport::catchUp(FixSession& session) {
     std::uint32_t outputIndex = 0;
     for (const sequencer::Bytes& body : captured.outputs) {
       const std::string_view raw(reinterpret_cast<const char*>(body.data()), body.size());
-      std::string_view msgType = "U2";
-      std::string_view rest = raw;
-      if (raw.size() > 3 && raw.compare(0, 3, "35=") == 0) {
-        const std::size_t soh = raw.find('\001');
-        if (soh != std::string_view::npos) {
-          msgType = raw.substr(3, soh - 3);
-          rest = raw.substr(soh + 1);
-        }
-      }
+      const auto [msgType, rest] = splitMsgType(raw, "U2");
       const std::uint64_t outboundSeqNum = session.sendApplication(msgType, rest);
       SentRecord record;
       record.journalSequenceNumber = seq;

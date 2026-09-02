@@ -279,11 +279,6 @@ class FixSession {
   void setIdentityGuard(IdentityGuard guard) { identityGuard_ = std::move(guard); }
   const SequenceNumbers& sequences() const noexcept { return sequences_; }
 
-  // Snapshot, for callers on another thread than the session's reader.
-  SequenceNumbers sequencesSnapshot() const {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    return sequences_;
-  }
 
   // Records how far through the journal this session has been caught
   // up, and persists it. Called by the output side after a successful
