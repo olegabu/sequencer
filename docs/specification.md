@@ -1527,14 +1527,36 @@ final hop changes, from this repository's session core to
 `FIX::Session::send`. Per-client topics, `MarketDataRequest`
 subscription and the input codec are untouched.
 
-**What it would cost, and what is not yet known.** QuickFIX is
-string-and-allocation based where hffix parses and writes in place on
-the I/O buffer, and it manages its own threads per session rather than
-sharing the gateway's. The measured FIX arm carries 400k requests/sec
-with zero drops at a 3.4ms p50; there is no basis in this repository for
-predicting where a QuickFIX-based gateway would land, and the number
-should be measured rather than argued about. Treat the throughput
-question as open.
+**What it costs.** Measured, not predicted -- same fleet, same clients,
+same ladder, one gateway each:
+
+| offered | QuickFIX p50 | dropped | hffix p50 | dropped |
+|---|---|---|---|---|
+| 10k | 740 us | 0 | 724 us | 0 |
+| 25k | **782 us** | 0 | 879 us | 0 |
+| 50k | **879 us** | 539 | 1,007 us | 0 |
+| 100k | 1,028 us | 26,014 | 1,087 us | 0 |
+| 150k | 1,657 us | 54,914 | 1,297 us | 0 |
+| 175k | 114,752 us | 648,710 | 1,525 us | 0 |
+| 250k | 160,000 us | 2,650,859 | 2,428 us | 0 |
+
+Latency is a wash below ~125k, and QuickFIX is slightly FASTER between
+25k and 50k -- which is not what "string-and-allocation based where
+hffix parses in place" predicts, and is the reason this section asked
+for a measurement instead of an argument.
+
+The cost is headroom. QuickFIX begins shedding at 50k, carries 150k at
+1.7ms, collapses by 175k and plateaus near 158k. The hffix arm reaches
+400k with zero drops throughout. Call it 2.5x the ceiling.
+
+One caveat on that number: the first measurement of this gateway
+plateaued at 140k, and the difference was not the library. It used
+FIX::SocketAcceptor, which is SINGLE-THREADED -- one thread for every
+session's parsing, session logic and sends. ThreadedSocketAcceptor
+moved 150k from a 105ms collapse to 1.7ms. A profile is what found it:
+flat, nothing above 3.2%, the node half idle, and no per-session FIX
+threads in the dump at all. Anyone quoting the ceiling should confirm
+which acceptor is in use before attributing it to QuickFIX.
 
 Two further costs are known rather than speculative. QuickFIX brings its
 own session scheduling, data dictionaries and configuration surface,
