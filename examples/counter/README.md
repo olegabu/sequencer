@@ -28,10 +28,24 @@ sent it), `onDisconnect` always returns `std::nullopt`.
 
 `CounterOutputCodec` (`counter_output_codec.hpp/.cpp`) reads a
 committed record's designated output (the new total, or `0` if the
-record has none) and broadcasts the same
-`{"sequence_number":N,"total":M}` JSON to every subscriber of the
-`"totals"` topic — the one topic this example has, since every client
-cares about the same running total.
+record has none) and broadcasts `{"sequence_number":N,"total":M}` JSON
+to the **submitting client's own** topic, `"totals-<id>"`.
+
+The id rides in the high bits of the submitted delta
+(`counter_client_id.hpp`), so a subscriber receives only the totals its
+own requests produced. This was a single shared `"totals"` topic every
+client joined, which is what the obvious implementation does and does
+not scale: every subscriber receives every output, making delivery load
+(rate × subscribers) rather than rate. On a five-client run at 100k
+that is 500k messages/sec of delivery for 100k of offered load, and
+every client parsing five times the traffic it cares about. The FIX
+codec had already moved to per-client topics for exactly this reason,
+which meant any comparison between the two was measuring the fan-out
+difference as much as the transport.
+
+A client that encodes no id — anything sending a plain `{"delta": N}`,
+including the demo scripts — is client `0` and subscribes to
+`"totals-0"`.
 
 Both codecs share `json_util.hpp`'s minimal hand-rolled field
 extraction and JSON building — specification.md's dependency list has
@@ -49,8 +63,8 @@ out WebSocket as the other zero-additional-dependency choice, this time
 for browser-facing consumers.
 
 That transport itself — its Beast implementation, thread-safety design,
-and path-based topic routing (`ws://host:port/totals` for this
-example's one topic) — now lives in
+and path-based topic routing (`ws://host:port/totals-0` for this
+example's first client) — now lives in
 [gateway/output/README.md](../../gateway/output/README.md), not here:
 it turned out to have nothing counter-specific about it once its one
 hardcoded assumption (a single implicit "totals" topic every client
@@ -175,7 +189,7 @@ ctest --preset debug --output-on-failure
 | `three_node_smoke_test.cpp` | **Three real `counter_node` subprocesses** — the actual compiled binary, not a stand-in — forming a real raft group. Proposes several deltas, following leader redirects exactly as a gateway would (§8.1), then reads all three replicas' journal files directly and asserts they are **byte-for-byte identical** — the concrete proof behind §3's "replicas lag, never diverge." |
 | `replay_test.cpp` | Records a journal with the real `CounterStateMachine`, then replays it through a completely fresh instance via `tools/replay` and asserts byte-identical output — specification.md §11's determinism gate for this example, and what `.github/workflows/ci.yml` runs on every push. Complementary to `three_node_smoke_test.cpp`: that proves cross-*replica* determinism, this proves cross-*time* (record now, replay later, possibly after a rebuild) determinism — together, §2.1's full claim: "two replicas — or one replica and a later replay — produce byte-identical journals." |
 | `counter_codec_test.cpp` | Both codecs in isolation, no gateway or process involved: `CounterInputCodec` parsing valid/negative/whitespace-tolerant/missing-field/non-JSON bodies and building its response JSON; `CounterOutputCodec` broadcasting a record's total (and defaulting to `0` for a record with no outputs) to the `"totals"` topic of a recording `Fanout` test double. |
-| `end_to_end_test.cpp` | The full pipeline, four real processes (`counter_node`, `counter_input_gateway`, `counter_output_gateway`, plus a test WebSocket client connecting to the `"totals"` topic) and one real submitting `brpc::Channel`: submits three deltas through the input gateway, asserts each synchronous response and each WebSocket broadcast carry the identical, correctly-accumulating `{"sequence_number":N,"total":M}` JSON — specification.md §15 item 6's deliverable, and the closest thing in this repository to a full deployment. Verified with 10+ consecutive clean runs beyond its first pass, following this session's pattern for anything involving subprocesses and networking. |
+| `end_to_end_test.cpp` | The full pipeline, four real processes (`counter_node`, `counter_input_gateway`, `counter_output_gateway`, plus a test WebSocket client connecting to the `"totals-0"` topic) and one real submitting `brpc::Channel`: submits three deltas through the input gateway, asserts each synchronous response and each WebSocket broadcast carry the identical, correctly-accumulating `{"sequence_number":N,"total":M}` JSON — specification.md §15 item 6's deliverable, and the closest thing in this repository to a full deployment. Verified with 10+ consecutive clean runs beyond its first pass, following this session's pattern for anything involving subprocesses and networking. |
 | `kill_leader_drill_test.cpp` | specification.md §14's acceptance-checklist items 2 and 5: a real 3-node cluster, a client proposing continuously exactly as an input gateway would (follow redirects, retry on failure), and an abrupt `SIGKILL` — of the leader in one test, of a follower in the other — while load is in flight. Verifies dense sequence numbers straight through the fault, byte-for-byte agreement between every surviving (and the killed node's own already-committed) journal, and continued commits after the kill. Deliberately never asserts an exact post-kill total — see the file's own header comment for why, given `CounterStateMachine` has no idempotency-key deduplication. |
 
 ## A real bug this test caught

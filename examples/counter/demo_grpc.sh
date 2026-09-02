@@ -124,7 +124,7 @@ echo "== connecting a grpcurl client to the output stream =="
 # grpcurl's server-streaming calls just keep printing JSON objects, one
 # per received message, until the stream ends or grpcurl is killed —
 # no special flag needed, unlike websocat's -n/--no-close.
-grpcurl -plaintext -d '{"topic":"totals"}' "127.0.0.1:$OG_PORT" \
+grpcurl -plaintext -d '{"topic":"totals-0"}' "127.0.0.1:$OG_PORT" \
   sequencer.gateway.output.grpc_proto.GenericOutputService/Subscribe \
   >"$DATA_DIR/grpc_output.log" 2>&1 &
 GRPCURL_PID=$!

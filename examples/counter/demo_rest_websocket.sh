@@ -93,7 +93,7 @@ echo "== starting the input gateway (curl target: http://127.0.0.1:$IG_PORT) =="
   >"$DATA_DIR/input_gateway.log" 2>&1 &
 IG_PID=$!
 
-echo "== starting the output gateway (websocat target: ws://127.0.0.1:$OG_PORT/totals) =="
+echo "== starting the output gateway (websocat target: ws://127.0.0.1:$OG_PORT/totals-0) =="
 "$OG_BIN" --data_dir="$DATA_DIR" --resume_file="$RESUME_FILE" --websocket_port="$OG_PORT" \
   --logtostderr --logbufsecs=0 >"$DATA_DIR/output_gateway.log" 2>&1 &
 OG_PID=$!
@@ -104,7 +104,7 @@ echo "== connecting a websocat client to the output gateway =="
 # -n (--no-close): this script gives websocat no stdin, so don't treat
 # that EOF as a request to close the WebSocket — stay connected and
 # just print whatever the server broadcasts.
-timeout 15 websocat -n "ws://127.0.0.1:$OG_PORT/totals" </dev/null >"$DATA_DIR/ws_output.log" 2>&1 &
+timeout 15 websocat -n "ws://127.0.0.1:$OG_PORT/totals-0" </dev/null >"$DATA_DIR/ws_output.log" 2>&1 &
 WS_PID=$!
 sleep 0.5  # let the WebSocket handshake complete before anything is submitted
 
@@ -125,7 +125,7 @@ wait "$WS_PID" 2>/dev/null || true
 WS_PID=""
 
 echo
-echo "== broadcasts received over the WebSocket (websocat -n ws://127.0.0.1:$OG_PORT/totals) =="
+echo "== broadcasts received over the WebSocket (websocat -n ws://127.0.0.1:$OG_PORT/totals-0) =="
 cat "$DATA_DIR/ws_output.log"
 
 expected=${#DELTAS[@]}

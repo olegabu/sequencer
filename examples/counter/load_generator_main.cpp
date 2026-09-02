@@ -17,6 +17,7 @@
 #include <sequencer/bench/grpc_output_observer.hpp>
 #include <sequencer/bench/fix_requester.hpp>
 
+#include "counter_client_id.hpp"
 #include "counter_fix_codecs.hpp"
 #include <sequencer/bench/load_generator.hpp>
 #include <sequencer/bench/relay_observer.hpp>
@@ -69,12 +70,14 @@ DEFINE_string(fix_gateway_addr, "",
               "merged latency then blends a busy gateway with a quiet one");
 DEFINE_string(fix_sender_comp_id, "LOADGEN", "This sender's FIX CompID; must be unique per client");
 DEFINE_string(fix_target_comp_id, "SEQUENCER", "The gateway's FIX CompID");
-DEFINE_int64(fix_client_id, 0,
+DEFINE_int64(client_id, 0,
              "This client's id, carried in the high bits of the application payload. It both "
              "correlates replies and selects the per-client topic replies are published on, so "
-             "a session receives only its own. MUST DIFFER PER CLIENT: sharing it makes clients "
-             "complete each other's requests AND collapses them onto one topic, which shows up "
-             "as impossibly low latency followed by collapse rather than as an error");
+             "a client receives only its own. Applies to EVERY arm -- FIX and the JSON output "
+             "gateways alike, which is why it is no longer called --fix_client_id. MUST DIFFER "
+             "PER CLIENT: sharing it makes clients complete each other's requests AND collapses "
+             "them onto one topic, which shows up as impossibly low latency followed by collapse "
+             "rather than as an error");
 DEFINE_string(fix_subscribe_symbol, "TOTALS",
               "Subscribe to this broadcast topic by MarketDataRequest before sending; empty "
               "skips it. examples/counter broadcasts its totals, so this is required there");
@@ -89,6 +92,11 @@ DEFINE_int32(measure, 30, "Seconds recorded");
 DEFINE_int32(drain_timeout, 10, "Seconds to wait for in-flight replies after the window closes");
 DEFINE_string(pace, "spin", "open mode wait strategy between sends: spin or park");
 DEFINE_string(hdr_out, "", "Write a percentile report here");
+DEFINE_string(output_hdr_raw_out, "",
+              "Write the OUTPUT observer's histogram here as value,count rows for "
+              "sweep/merge-hdr.py. A multi-client output sweep needs this: percentiles do not "
+              "average, so five clients' p99s cannot be combined -- their histograms must be. "
+              "--hdr_raw_out writes the ACK path's histogram, which is a different measurement");
 DEFINE_string(hdr_raw_out, "",
               "Write the measured histogram as mergeable \"value,count\" lines. Needed to compute a "
               "correct aggregate p50/p99 when load is split across several clients — averaging their "
@@ -112,15 +120,32 @@ DEFINE_string(output_observer, "", "Which output-gateway flavor to observe deliv
                                     "disabled), grpc, brpc, or websocket");
 DEFINE_string(output_gateway_addr, "",
               "The selected output gateway's \"ip:port\" to observe (required if --output_observer is set)");
-DEFINE_string(output_gateway_topic, "totals", "Topic to subscribe to on the output gateway");
+DEFINE_string(output_gateway_topic, "",
+              "Topic to subscribe to on the output gateway. Empty (the default) derives this "
+              "client's own topic from --client_id, which is what CounterOutputCodec publishes "
+              "to; set it only to watch some other client's stream");
 DEFINE_int64(output_ring_capacity, 0, "Same sizing rule as --relay_ring_capacity, 0 derives one");
 
 namespace {
 
 // One delta per sequence number, deterministic (not random) so that
-// concurrent closed-loop sender threads never share mutable RNG state
-// — the actual value submitted plays no role in the measurement.
-std::int64_t deltaFor(std::int64_t sequence) { return (sequence % 201) - 100; }
+// concurrent closed-loop sender threads never share mutable RNG state.
+//
+// The value DOES carry meaning now, though only routing meaning: its
+// high bits are this client's id, which is how CounterOutputCodec knows
+// whose topic to publish the total on (counter_client_id.hpp). It was
+// (sequence % 201) - 100 when every client shared one topic.
+std::int64_t deltaFor(std::int64_t sequence) {
+  return sequencer::examples::counter::counterDeltaFor(FLAGS_client_id, sequence);
+}
+
+// The topic this client's own totals arrive on, unless it was told to
+// watch a different one.
+std::string observerTopic() {
+  return FLAGS_output_gateway_topic.empty()
+             ? sequencer::examples::counter::counterTotalsTopicFor(FLAGS_client_id)
+             : FLAGS_output_gateway_topic;
+}
 
 // Submits straight to a node's ProposeService, skipping the input
 // gateway entirely — the control arm for "what is that hop worth?".
@@ -383,15 +408,15 @@ int main(int argc, char** argv) {
     };
     if (FLAGS_output_observer == "grpc") {
       outputObserver = std::make_unique<sequencer::bench::GrpcOutputObserver>(
-          FLAGS_output_gateway_addr, FLAGS_output_gateway_topic, extractor,
+          FLAGS_output_gateway_addr, observerTopic(), extractor,
           static_cast<std::size_t>(ringCapacity));
     } else if (FLAGS_output_observer == "brpc") {
       outputObserver = std::make_unique<sequencer::bench::BrpcOutputObserver>(
-          FLAGS_output_gateway_addr, FLAGS_output_gateway_topic, extractor,
+          FLAGS_output_gateway_addr, observerTopic(), extractor,
           static_cast<std::size_t>(ringCapacity));
     } else if (FLAGS_output_observer == "websocket") {
       outputObserver = std::make_unique<sequencer::bench::WebSocketOutputObserver>(
-          FLAGS_output_gateway_addr, FLAGS_output_gateway_topic, extractor,
+          FLAGS_output_gateway_addr, observerTopic(), extractor,
           static_cast<std::size_t>(ringCapacity));
     } else {
       LOG(ERROR) << "load_generator: --output_observer must be empty, grpc, brpc, or websocket, got \""
@@ -425,7 +450,7 @@ int main(int argc, char** argv) {
       // share a gateway's broadcast fan-out, so two sessions on one id
       // would each receive the other's replies.
       const std::int64_t sessionId =
-          FLAGS_fix_client_id * 100 + static_cast<std::int64_t>(i);
+          FLAGS_client_id * 100 + static_cast<std::int64_t>(i);
       auto one = std::make_unique<sequencer::bench::FixRequester>(
           addrs[i].substr(0, colon), std::stoi(addrs[i].substr(colon + 1)),
           FLAGS_fix_sender_comp_id + "-" + std::to_string(i), FLAGS_fix_target_comp_id,
@@ -505,6 +530,9 @@ int main(int argc, char** argv) {
     if (outputObserver) {
       outputObserver->stop();
       outputObserver->printSummary();
+      if (!outputObserver->writeRawHistogram(FLAGS_output_hdr_raw_out)) {
+        std::fprintf(stderr, "failed to write %s\n", FLAGS_output_hdr_raw_out.c_str());
+      }
     }
   }
 

@@ -111,6 +111,10 @@ class BrpcOutputObserver final : public OutputGatewayObserver, private brpc::Str
     correlator_.printSummary("output_brpc");
   }
 
+  bool writeRawHistogram(const std::string& path) const override {
+    return correlator_.writeRawHistogram(path);
+  }
+
  private:
   static std::int64_t nowMicros() {
     return std::chrono::duration_cast<std::chrono::microseconds>(

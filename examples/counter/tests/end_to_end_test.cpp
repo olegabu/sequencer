@@ -58,15 +58,16 @@ std::filesystem::path makeTempDir() {
 // and this is currently its only other use.
 class TestWsClient {
  public:
-  // "/totals": sequencer::WebSocketOutputTransport (gateway/output/)
+  // "/totals-0": sequencer::WebSocketOutputTransport (gateway/output/)
   // routes a connecting client's topic from the WebSocket URL's
-  // request path — CounterOutputCodec broadcasts to "totals", so that's
-  // what a client must connect to in order to receive anything.
+  // request path. CounterOutputCodec publishes to the SUBMITTING
+  // client's own topic, and a submitter that encodes no client id --
+  // this test posts plain {"delta": N} -- is client 0.
   explicit TestWsClient(int port) : ws_(ioContext_) {
     tcp::resolver resolver(ioContext_);
     const auto results = resolver.resolve("127.0.0.1", std::to_string(port));
     net::connect(ws_.next_layer(), results);
-    ws_.handshake("127.0.0.1", "/totals");
+    ws_.handshake("127.0.0.1", "/totals-0");
   }
 
   // Reads span whatever frame shape the server happened to send them

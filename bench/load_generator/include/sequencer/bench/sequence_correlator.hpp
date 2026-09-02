@@ -181,6 +181,37 @@ class SequenceCorrelator {
     std::printf("%s_mean_us=%ld\n", labelPrefix, static_cast<long>(hdr_mean(observed_)));
   }
 
+  // The OBSERVED histogram as bucket midpoints and counts, in the same
+  // "value,count" form LoadGenerator::hdrRawOut writes, so sweep/
+  // merge-hdr.py can merge several clients' files into one.
+  //
+  // This exists because a multi-client sweep cannot use the printed
+  // percentiles above: percentiles do not average. Merging the
+  // histograms is the only way to get a true p99 across five clients,
+  // and until now only the ACK path could be merged -- the output arm's
+  // latency lived solely in those _p50_us lines, which is why the
+  // output-gateway sweeps ran single-client.
+  bool writeRawHistogram(const std::string& path) const {
+    if (path.empty()) {
+      return true;
+    }
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (f == nullptr) {
+      return false;
+    }
+    std::fprintf(f, "value,count\n");
+    hdr_iter iter;
+    hdr_iter_recorded_init(&iter, observed_);
+    while (hdr_iter_next(&iter)) {
+      if (iter.count > 0) {
+        std::fprintf(f, "%lld,%lld\n", static_cast<long long>(iter.value),
+                     static_cast<long long>(iter.count));
+      }
+    }
+    std::fclose(f);
+    return true;
+  }
+
  private:
   static constexpr std::uint64_t kUnpublished = static_cast<std::uint64_t>(-1);
 
@@ -308,6 +339,11 @@ class OutputGatewayObserver {
   virtual void setMeasurementWindow(std::int64_t measureStartUs, std::int64_t measureEndUs) = 0;
   virtual void recordSend(std::uint64_t sequenceNumber, std::int64_t sendTimeUs) noexcept = 0;
   virtual void printSummary() const = 0;
+
+  // Writes the observer's own histogram in merge-hdr.py's format, so a
+  // multi-client sweep can merge the OUTPUT path's latency rather than
+  // averaging per-client percentiles (which is not a thing you can do).
+  virtual bool writeRawHistogram(const std::string& path) const = 0;
 };
 
 }  // namespace sequencer::bench

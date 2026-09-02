@@ -4,6 +4,7 @@
 // out, on both the input and output side.
 
 #include "../counter_input_codec.hpp"
+#include "../counter_client_id.hpp"
 #include "../counter_output_codec.hpp"
 
 #include <sequencer/journal/record_view.hpp>
@@ -119,9 +120,11 @@ journal::RecordView makeRecordView(std::vector<std::byte>& buffer, std::uint64_t
   return journal::RecordView(buffer.data(), static_cast<std::uint32_t>(buffer.size()));
 }
 
-TEST(CounterOutputCodec, BroadcastsSequenceNumberAndTotalToTotalsTopic) {
+TEST(CounterOutputCodec, BroadcastsSequenceNumberAndTotalToTheSubmittersTopic) {
   const std::int64_t total = 13;
   const Payload output0(reinterpret_cast<const std::byte*>(&total), sizeof(total));
+  // An input too short to carry a client id belongs to client 0, which
+  // is the case every ordinary use of the counter takes.
   std::vector<std::byte> buffer;
   const journal::RecordView record = makeRecordView(buffer, 3, payloadOf("irrelevant-input"), {output0});
 
@@ -130,8 +133,27 @@ TEST(CounterOutputCodec, BroadcastsSequenceNumberAndTotalToTotalsTopic) {
   codec.toOutput(record, fanout);
 
   EXPECT_EQ(fanout.calls, 1);
-  EXPECT_EQ(fanout.lastTopic, "totals");
+  EXPECT_EQ(fanout.lastTopic, "totals-0");
   EXPECT_EQ(fanout.lastMessage, R"({"sequence_number":3,"total":13})");
+}
+
+// The routing that makes a multi-client sweep fair: two clients'
+// records go to two different topics, so neither receives the other's
+// traffic. Without this the gateway delivers (rate x subscribers).
+TEST(CounterOutputCodec, RoutesEachClientsTotalToItsOwnTopic) {
+  CounterOutputCodec codec;
+  for (const std::int64_t clientId : {0, 1, 4}) {
+    const std::int64_t delta = counterDeltaFor(clientId, 7);
+    const std::int64_t total = 13;
+    const Payload output0(reinterpret_cast<const std::byte*>(&total), sizeof(total));
+    const Payload input(reinterpret_cast<const std::byte*>(&delta), sizeof(delta));
+    std::vector<std::byte> buffer;
+    const journal::RecordView record = makeRecordView(buffer, 3, input, {output0});
+
+    RecordingFanout fanout;
+    codec.toOutput(record, fanout);
+    EXPECT_EQ(fanout.lastTopic, "totals-" + std::to_string(clientId));
+  }
 }
 
 TEST(CounterOutputCodec, DefaultsToZeroTotalWhenRecordHasNoOutputs) {
