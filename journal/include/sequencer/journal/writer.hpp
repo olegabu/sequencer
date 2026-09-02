@@ -11,7 +11,11 @@
 // that segment's record count is reached.
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <filesystem>
 #include <span>
 #include <stdexcept>
@@ -79,9 +83,18 @@ class JournalWriter {
     } else {
       createNew(manifestPath, options);
     }
+    startWorker();
   }
 
   ~JournalWriter() {
+    // Drain first: a seal still queued means a filled segment is on disk
+    // under its in-progress name. Readers resolve that name, so it is
+    // not corruption, but leaving it that way across a restart would
+    // hand the next process a journal whose segments are inconsistently
+    // named for no reason.
+    drainSeals();
+    stopWorker();
+
     // Convenience for tooling only (§6.3) -- not required for
     // correctness. The committed-count protocol alone makes the journal
     // safe to reopen after an unclean exit.
@@ -152,6 +165,15 @@ class JournalWriter {
     committedCount_ += 1;
     // For fillPercent() only, which a monitoring thread may call.
     publishedDataOffset_.store(nextDataOffset_, std::memory_order_relaxed);
+
+    // Start building the next segment well before the roll needs it, so
+    // roll() finds it already mapped. Integer compare per record; the
+    // lock is taken only on the one record that crosses the threshold.
+    const std::uint64_t slot = slotFor(sequenceNumber);
+    if (recordsPerSegment_ > 0 && slot == recordsPerSegment_ * kPrepareAtPercent / 100) {
+      std::lock_guard<std::mutex> lock(workMutex_);
+      requestPrepareLocked(activeSegment_ + 1);
+    }
   }
 
   // How full the ACTIVE segment is, as a percentage of whichever of its
@@ -219,27 +241,73 @@ class JournalWriter {
   // which is the ordering §6.5 relies on: a reader that acquire-loads a
   // committed count reaching into this segment is guaranteed, by the
   // release-store in append(), to see everything done here first.
+  // A pointer swap and two queue operations. Nothing here touches the
+  // filesystem or waits on one.
+  //
+  // It used to do all three of the expensive things inline, on the apply
+  // thread: an msync of everything dirty in the segment just filled (up
+  // to recordsPerSegment records' worth of pages), two renames, then the
+  // creation, sizing and mapping of the next segment's file pair. Every
+  // record queued behind that waited. Once per 1,048,576 records is
+  // invisible in p90 and dominates p999: measured on a five-client
+  // fleet, every gateway flavour carried a 50-240ms p999 at every rate
+  // from 75k up while bare braft on the same hardware stayed under 2ms,
+  // and raising the segment size 16x -- making the roll 16x rarer --
+  // took p999 to 3-5ms and p99 from 17-60ms to ~2ms. That is what
+  // identified this function; making the roll rare was the diagnosis,
+  // and taking the work off this thread is the fix.
   void roll(std::uint64_t sequenceNumber) {
     const std::uint64_t sealedFirst = firstOfSegment(activeSegment_);
     const std::uint64_t sealedLast = sealedFirst + recordsPerSegment_ - 1;
+    const std::uint64_t nextSegment = segmentFor(sequenceNumber);
 
-    // Flush before sealing, so a crash just after the rename leaves the
-    // sealed segment's bytes on disk rather than only in page cache.
-    dataFile_.flush(/*async=*/false);
-    indexFile_.flush(/*async=*/false);
-
-    const std::string openStem = openSegmentStem(sealedFirst);
-    const std::string sealedStem = sealedSegmentStem(sealedFirst, sealedLast);
-    for (const char* suffix : {".data", ".index"}) {
-      std::error_code ec;
-      std::filesystem::rename(segmentPath(openStem, suffix), segmentPath(sealedStem, suffix), ec);
-      if (ec) {
-        throw JournalExhausted("JournalWriter::roll: failed to seal segment " + openStem + suffix +
-                                ": " + ec.message());
-      }
+    std::unique_lock<std::mutex> lock(workMutex_);
+    // Normally already done: preparation starts at kPrepareAtPercent of
+    // the active segment. Waiting here is the fallback for a burst that
+    // outruns it, and is still no worse than doing it inline was.
+    if (preparedSegment_ != nextSegment) {
+      requestPrepareLocked(nextSegment);
+    }
+    // The segment identity is part of the condition, not an assumption:
+    // waking on "something is ready" would adopt a mapping for a
+    // different segment as this one's.
+    workCv_.wait(lock, [&] {
+      return (preparedReady_ && preparedSegment_ == nextSegment) || preparedError_ != nullptr;
+    });
+    if (preparedError_ != nullptr) {
+      std::exception_ptr e = preparedError_;
+      preparedError_ = nullptr;
+      preparedReady_ = false;
+      preparedSegment_ = kNoSegment;
+      std::rethrow_exception(e);
     }
 
-    openSegment(segmentFor(sequenceNumber), /*create=*/true);
+    // The filled segment goes to the worker to be flushed and THEN
+    // renamed -- that order is the durability property, not the thread
+    // it runs on: a crash after the rename must not find the sealed
+    // segment's bytes only in page cache. Readers tolerate the delay by
+    // construction, trying the sealed name and falling back to the
+    // in-progress one (reader.hpp's openSegment).
+    seals_.push_back(PendingSeal{std::move(dataFile_), std::move(indexFile_), sealedFirst,
+                                  sealedLast});
+    sealsInFlight_ += 1;
+
+    dataFile_ = std::move(preparedData_);
+    indexFile_ = std::move(preparedIndex_);
+    preparedReady_ = false;
+    preparedSegment_ = kNoSegment;
+
+    // Everything openSegment() used to reset on the writer's behalf.
+    // Missing the offset let the writer keep appending at the FILLED
+    // segment's offset into a fresh mapping, straight off the end of it
+    // -- caught immediately by Concurrency.ReadersFollowTheWriterAcross-
+    // SegmentBoundaries, which is precisely the test for this path.
+    activeSegment_ = nextSegment;
+    nextDataOffset_ = 0;
+    publishedDataOffset_.store(0, std::memory_order_relaxed);
+
+    lock.unlock();
+    workCv_.notify_all();
   }
 
   // Maps segment `segment`'s file pair as the active one. `create`
@@ -252,6 +320,32 @@ class JournalWriter {
   // crash mid-record (§6.3). If the files are already there, adopt
   // them; their contents below the committed count are authoritative
   // and anything above it will simply be overwritten.
+  // Creates and maps one segment's file pair. Called either inline (the
+  // first segment) or from the worker thread, ahead of the roll that
+  // needs it -- which is why it takes its outputs by reference instead
+  // of assigning the active mappings.
+  void createSegmentFiles(std::uint64_t segment, MappedFile& data, MappedFile& index) {
+    const std::string stem = openSegmentStem(firstOfSegment(segment));
+    data = MappedFile::createNew(segmentPath(stem, ".data"), recordsPerSegment_ * maxRecordBytes_);
+    index = MappedFile::createNew(
+        segmentPath(stem, ".index"),
+        sizeof(IndexHeader) + static_cast<std::size_t>(recordsPerSegment_) * sizeof(IndexEntry));
+    // Placement-new fully and correctly starts this object's lifetime
+    // for *this* process (see reader.hpp for the pragmatic caveat when
+    // a different process later reinterprets these same mapped bytes
+    // — the well-understood gap every lock-free shared-memory format
+    // lives with).
+    //
+    // A segment's own committedCount is NOT the publication signal any
+    // more (§6.5 moved that to the manifest) and stays zero; magic and
+    // version remain so a segment file is still self-identifying.
+    new (index.data()) IndexHeader{.magic = kIndexMagic,
+                                    .version = kIndexVersion,
+                                    .closedCleanly = 0,
+                                    .reserved = 0,
+                                    .committedCount = 0};
+  }
+
   void openSegment(std::uint64_t segment, bool create) {
     const std::string stem = openSegmentStem(firstOfSegment(segment));
     const std::filesystem::path dataPath = segmentPath(stem, ".data");
@@ -268,24 +362,7 @@ class JournalWriter {
     }
     const bool present = dataExists && indexExists;
     if (create && !present) {
-      dataFile_ = MappedFile::createNew(dataPath, recordsPerSegment_ * maxRecordBytes_);
-      indexFile_ = MappedFile::createNew(
-          indexPath, sizeof(IndexHeader) +
-                          static_cast<std::size_t>(recordsPerSegment_) * sizeof(IndexEntry));
-      // Placement-new fully and correctly starts this object's lifetime
-      // for *this* process (see reader.hpp for the pragmatic caveat when
-      // a different process later reinterprets these same mapped bytes
-      // — the well-understood gap every lock-free shared-memory format
-      // lives with).
-      //
-      // A segment's own committedCount is NOT the publication signal any
-      // more (§6.5 moved that to the manifest) and stays zero; magic and
-      // version remain so a segment file is still self-identifying.
-      new (indexFile_.data()) IndexHeader{.magic = kIndexMagic,
-                                           .version = kIndexVersion,
-                                           .closedCleanly = 0,
-                                           .reserved = 0,
-                                           .committedCount = 0};
+      createSegmentFiles(segment, dataFile_, indexFile_);
     } else {
       dataFile_ = MappedFile::openExisting(dataPath, /*readOnly=*/false);
       indexFile_ = MappedFile::openExisting(indexPath, /*readOnly=*/false);
@@ -378,6 +455,153 @@ class JournalWriter {
   IndexEntry* indexEntries() noexcept {
     return reinterpret_cast<IndexEntry*>(indexFile_.data() + sizeof(IndexHeader));
   }
+
+  // --- background segment work -------------------------------------
+  //
+  // One thread doing two jobs, both formerly inline in roll(): creating
+  // and mapping the NEXT segment before it is needed, and flushing then
+  // renaming the one just filled. The apply thread never blocks on
+  // either in steady state.
+
+  static constexpr std::uint64_t kNoSegment = ~0ULL;
+  // How full the active segment must get before the next one is built.
+  // Far enough ahead that creation and mapping finish first; late enough
+  // that a short-lived journal never builds a segment it does not use.
+  static constexpr std::uint64_t kPrepareAtPercent = 90;
+
+  struct PendingSeal {
+    MappedFile data;
+    MappedFile index;
+    std::uint64_t firstSequenceNumber;
+    std::uint64_t lastSequenceNumber;
+  };
+
+  // Caller holds workMutex_.
+  //
+  // preparingSegment_ is checked as well as the other two, and that is
+  // not redundant: the worker clears pendingPrepare_ when it PICKS UP a
+  // job, so between then and the job finishing this would otherwise
+  // queue the same segment a second time -- and the second
+  // createSegmentFiles() would run MappedFile::createNew over the file
+  // pair the writer had by then adopted and was appending into.
+  void requestPrepareLocked(std::uint64_t segment) {
+    if (preparedSegment_ == segment || pendingPrepare_ == segment ||
+        preparingSegment_ == segment) {
+      return;
+    }
+    pendingPrepare_ = segment;
+    workCv_.notify_all();
+  }
+
+  void startWorker() {
+    segmentWorker_ = std::thread([this] {
+      for (;;) {
+        std::uint64_t toPrepare = kNoSegment;
+        PendingSeal seal;
+        bool haveSeal = false;
+        {
+          std::unique_lock<std::mutex> lock(workMutex_);
+          workCv_.wait(lock, [&] {
+            return stopWorker_ || pendingPrepare_ != kNoSegment || !seals_.empty();
+          });
+          if (stopWorker_ && seals_.empty() && pendingPrepare_ == kNoSegment) {
+            return;
+          }
+          if (pendingPrepare_ != kNoSegment) {
+            toPrepare = pendingPrepare_;
+            pendingPrepare_ = kNoSegment;
+            preparingSegment_ = toPrepare;
+          } else {
+            seal = std::move(seals_.front());
+            seals_.pop_front();
+            haveSeal = true;
+          }
+        }
+
+        if (toPrepare != kNoSegment) {
+          MappedFile data, index;
+          std::exception_ptr err;
+          try {
+            createSegmentFiles(toPrepare, data, index);
+          } catch (...) {
+            err = std::current_exception();
+          }
+          {
+            std::lock_guard<std::mutex> lock(workMutex_);
+            preparingSegment_ = kNoSegment;
+            if (err != nullptr) {
+              preparedError_ = err;
+            } else {
+              preparedData_ = std::move(data);
+              preparedIndex_ = std::move(index);
+              preparedSegment_ = toPrepare;
+              preparedReady_ = true;
+            }
+          }
+          workCv_.notify_all();
+          continue;
+        }
+
+        if (haveSeal) {
+          // Flush BEFORE rename: see roll().
+          seal.data.flush(/*async=*/false);
+          seal.index.flush(/*async=*/false);
+          const std::string openStem = openSegmentStem(seal.firstSequenceNumber);
+          const std::string sealedStem =
+              sealedSegmentStem(seal.firstSequenceNumber, seal.lastSequenceNumber);
+          for (const char* suffix : {".data", ".index"}) {
+            std::error_code ec;
+            std::filesystem::rename(segmentPath(openStem, suffix),
+                                     segmentPath(sealedStem, suffix), ec);
+            // A failed seal leaves the segment under its in-progress
+            // name, which readers still resolve. Losing the rename is
+            // not worth taking the node down for, and there is no
+            // caller on this thread to throw to.
+          }
+          {
+            std::lock_guard<std::mutex> lock(workMutex_);
+            sealsInFlight_ -= 1;
+          }
+          workCv_.notify_all();
+        }
+      }
+    });
+  }
+
+  // Blocks until every queued seal has been flushed and renamed.
+  void drainSeals() {
+    if (!segmentWorker_.joinable()) {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(workMutex_);
+    workCv_.wait(lock, [&] { return seals_.empty() && sealsInFlight_ == 0; });
+  }
+
+  void stopWorker() {
+    if (!segmentWorker_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(workMutex_);
+      stopWorker_ = true;
+    }
+    workCv_.notify_all();
+    segmentWorker_.join();
+  }
+
+  std::thread segmentWorker_;
+  std::mutex workMutex_;
+  std::condition_variable workCv_;
+  bool stopWorker_ = false;
+  std::uint64_t pendingPrepare_ = kNoSegment;
+  std::uint64_t preparingSegment_ = kNoSegment;
+  std::uint64_t preparedSegment_ = kNoSegment;
+  MappedFile preparedData_;
+  MappedFile preparedIndex_;
+  bool preparedReady_ = false;
+  std::exception_ptr preparedError_;
+  std::deque<PendingSeal> seals_;
+  int sealsInFlight_ = 0;
 
   std::filesystem::path dir_;
   MappedFile manifestFile_;
