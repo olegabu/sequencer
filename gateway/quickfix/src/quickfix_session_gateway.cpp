@@ -9,6 +9,7 @@
 #include "../../output/src/output_gateway_impl.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <fstream>
 #include <map>
@@ -90,16 +91,28 @@ class FileSequences : public SequenceNumberStore {
     }
   }
 
+  ~FileSequences() {
+    // Everything the throttle skipped, written once on the way out.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (directory_.empty()) {
+      return;
+    }
+    for (const auto& [key, counters] : memory_) {
+      writeLocked(key, counters.first, counters.second);
+    }
+  }
+
   void load(const std::string& sessionKey, int& nextSender, int& nextTarget) override {
     std::lock_guard<std::mutex> lock(mutex_);
     nextSender = 1;
     nextTarget = 1;
+    const auto cached = memory_.find(sessionKey);
+    if (cached != memory_.end()) {
+      nextSender = cached->second.first;
+      nextTarget = cached->second.second;
+      return;
+    }
     if (directory_.empty()) {
-      const auto it = memory_.find(sessionKey);
-      if (it != memory_.end()) {
-        nextSender = it->second.first;
-        nextTarget = it->second.second;
-      }
       return;
     }
     std::ifstream in(pathFor(sessionKey));
@@ -112,15 +125,42 @@ class FileSequences : public SequenceNumberStore {
     }
   }
 
+  // THROTTLED, and it has to be.
+  //
+  // QuickFIX calls incrNextSenderMsgSeqNum/incrNextTargetMsgSeqNum once
+  // per message in each direction, so an unthrottled save() is two file
+  // create/write/rename cycles PER MESSAGE on the delivery path. That is
+  // the same mistake this repository fixed twice in one day -- the
+  // journal's segment roll on the apply thread, and the resume position
+  // on the output thread -- and writing it a third time capped the
+  // gateway at 1,031 req/s with a 4.9 SECOND p50 against 25k offered.
+  //
+  // The counters are a recovery hint: on a crash, losing up to
+  // kPersistIntervalMs of advance means a reconnecting session may
+  // repeat or skip, which FIX's own resend machinery exists to settle.
+  // gateway/fix/ makes the same trade for the same reason
+  // (FixSession::persistThrottled).
+  static constexpr auto kPersistInterval = std::chrono::milliseconds(100);
+
   void save(const std::string& sessionKey, int nextSender, int nextTarget) override {
     std::lock_guard<std::mutex> lock(mutex_);
+    memory_[sessionKey] = {nextSender, nextTarget};
     if (directory_.empty()) {
-      memory_[sessionKey] = {nextSender, nextTarget};
       return;
     }
-    // Never throws: a store that takes the gateway down on a full disk
-    // would be worse than one that loses a counter, and gateway/fix/
-    // learned that the hard way.
+    const auto now = std::chrono::steady_clock::now();
+    auto& last = lastWrite_[sessionKey];
+    if (last.time_since_epoch().count() != 0 && now - last < kPersistInterval) {
+      return;  // memory is current; disk catches up on the next tick
+    }
+    last = now;
+    writeLocked(sessionKey, nextSender, nextTarget);
+  }
+
+  // Caller holds mutex_. Never throws: a store that takes the gateway
+  // down on a full disk would be worse than one that loses a counter,
+  // and gateway/fix/ learned that the hard way.
+  void writeLocked(const std::string& sessionKey, int nextSender, int nextTarget) {
     try {
       const std::filesystem::path tmp = pathFor(sessionKey) + ".tmp";
       {
@@ -144,6 +184,7 @@ class FileSequences : public SequenceNumberStore {
   std::filesystem::path directory_;
   std::mutex mutex_;
   std::map<std::string, std::pair<int, int>> memory_;
+  std::map<std::string, std::chrono::steady_clock::time_point> lastWrite_;
 };
 
 }  // namespace
