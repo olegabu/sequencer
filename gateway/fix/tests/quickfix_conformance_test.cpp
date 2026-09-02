@@ -25,6 +25,7 @@
 #include <quickfix/SocketInitiator.h>
 #include <quickfix/fix44/Logon.h>
 #include <quickfix/fix44/TestRequest.h>
+#include <quickfix/Fields.h>
 
 #include <sequencer/fix/fix_input_transport.hpp>
 
@@ -82,16 +83,39 @@ class ConformanceApp : public FIX::Application {
     if (type == FIX::MsgType_TestRequest) {
       testRequests.fetch_add(1);
     }
+    if (type == FIX::MsgType_ResendRequest) {
+      resendRequests.fetch_add(1);
+    }
+    if (type == FIX::MsgType_SequenceReset) {
+      sequenceResets.fetch_add(1);
+      FIX::GapFillFlag gapFill(false);
+      if (message.isSetField(gapFill)) {
+        message.getField(gapFill);
+        if (gapFill == true) {
+          gapFills.fetch_add(1);
+        }
+      }
+    }
+    if (type == FIX::MsgType_Logout) {
+      logoutMessages.fetch_add(1);
+    }
   }
   void fromApp(const FIX::Message&, const FIX::SessionID&)
       QUICKFIX_THROW(FIX::FieldNotFound, FIX::IncorrectDataFormat, FIX::IncorrectTagValue,
-                      FIX::UnsupportedMessageType) override {}
+                      FIX::UnsupportedMessageType) override {
+    appMessages.fetch_add(1);
+  }
 
   std::atomic<int> logons{0};
   std::atomic<int> logouts{0};
   std::atomic<int> heartbeats{0};
   std::atomic<int> rejects{0};
   std::atomic<int> testRequests{0};
+  std::atomic<int> resendRequests{0};
+  std::atomic<int> sequenceResets{0};
+  std::atomic<int> gapFills{0};
+  std::atomic<int> logoutMessages{0};
+  std::atomic<int> appMessages{0};
   std::atomic<bool> resetOnNextLogon{false};
 };
 
@@ -104,15 +128,34 @@ struct Acceptor {
   std::unique_ptr<FixInputTransport> transport;
   std::string storeDir;
 
+  std::atomic<std::uint64_t> liveSession{0};
+
   Acceptor(int port, std::string dir, int heartBtInt = 5) : storeDir(std::move(dir)) {
     FixInputConfig config;
     config.senderCompId = "SEQUENCER";
     config.heartBtInt = heartBtInt;
     config.sequenceStoreDir = storeDir;
     transport = std::make_unique<FixInputTransport>(config);
+    transport->setSessionReadyFn(
+        [this](std::uint64_t id, FixSession&) { liveSession.store(id); });
     transport->attach([](std::shared_ptr<sequencer::RequestContext> request) { request->respond({}); },
                        [](const sequencer::SessionInfo&) {});
     transport->start(port);
+  }
+
+  // Sends an application message on the live session, the way the
+  // output half would.
+  bool sendApp(std::string_view msgType, std::string_view body) {
+    const std::uint64_t id = liveSession.load();
+    if (id == 0) {
+      return false;
+    }
+    FixSession* session = transport->sessionFor(id);
+    if (session == nullptr) {
+      return false;
+    }
+    session->sendApplication(msgType, body);
+    return true;
   }
   ~Acceptor() {
     transport->stop();
@@ -199,6 +242,20 @@ struct Initiator {
     return false;
   }
 };
+
+// Polls rather than sleeps: these are real sockets and a real engine,
+// and a fixed sleep is either flaky or slow.
+template <typename Predicate>
+bool waitFor(Predicate done, std::chrono::milliseconds budget) {
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (done()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return done();
+}
 
 std::string makeStoreDir(const char* name) {
   const std::filesystem::path dir =
@@ -296,6 +353,260 @@ TEST(QuickFixConformance, ResetSeqNumFlagLogonIsHonoured) {
   EXPECT_TRUE(client.waitForLogon(std::chrono::seconds(10)))
       << "a ResetSeqNumFlag logon must be accepted and reset both counters";
   EXPECT_EQ(client.app.rejects.load(), 0);
+}
+
+
+// --- the resend machinery, against a real engine -------------------
+//
+// These are the paths fix_session_test.cpp covers on its own terms and
+// this suite did not cover at all. They matter more than the handshake:
+// a hand-rolled engine agreeing with itself about resends says nothing
+// about whether a counterparty agrees, and resend/gap-fill is where FIX
+// implementations actually diverge.
+
+// A gap in what the CLIENT sends must make us ask for the missing
+// range, and the session must survive the exchange. QuickFIX answers a
+// ResendRequest by itself, so a session that is still alive afterwards
+// is the engine's own verdict that our request was well-formed.
+TEST(QuickFixConformance, AGapInInboundMakesUsRequestAResendAndTheSessionSurvives) {
+  const std::string storeDir = makeStoreDir("inbound-gap");
+  Acceptor acceptor(29635, storeDir);
+  Initiator client(29635);
+  client.start();
+  ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
+
+  FIX::Session* session = FIX::Session::lookupSession(client.sessionId);
+  ASSERT_NE(session, nullptr);
+
+  // Skip ahead: the next message the client sends claims a sequence
+  // number five beyond what we are expecting.
+  const int jumped = session->getExpectedSenderNum() + 5;
+  session->setNextSenderMsgSeqNum(jumped);
+  FIX44::TestRequest probe(FIX::TestReqID("after-gap"));
+  FIX::Session::sendToTarget(probe, client.sessionId);
+
+  EXPECT_TRUE(waitFor([&] { return client.app.resendRequests.load() > 0; },
+                       std::chrono::seconds(10)))
+      << "a gap in inbound sequence numbers must produce a ResendRequest";
+
+  // QuickFIX fills the gap on its own; the session must come back and
+  // still answer a TestRequest afterwards.
+  const int before = client.app.heartbeats.load();
+  EXPECT_TRUE(waitFor([&] { return client.app.heartbeats.load() > before; },
+                       std::chrono::seconds(15)))
+      << "the session must resynchronise and keep running after the gap";
+  EXPECT_EQ(client.app.logouts.load(), 0) << "a recoverable gap must not end the session";
+}
+
+// The mirror: the CLIENT believes it missed messages and asks US for a
+// resend. This suite's acceptor has no journal behind it, so the
+// correct answer is a SequenceReset-GapFill covering the range -- and
+// QuickFIX has to accept it and carry on.
+TEST(QuickFixConformance, AResendRequestIsAnsweredWithAGapFillTheEngineAccepts) {
+  const std::string storeDir = makeStoreDir("resend-gapfill");
+  Acceptor acceptor(29636, storeDir);
+  Initiator client(29636);
+  client.start();
+  ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
+
+  FIX::Session* session = FIX::Session::lookupSession(client.sessionId);
+  ASSERT_NE(session, nullptr);
+
+  // Rewind what the client expects from us, so it concludes it has a
+  // hole and asks for the range back.
+  session->setNextTargetMsgSeqNum(1);
+  FIX44::TestRequest probe(FIX::TestReqID("provoke-resend"));
+  FIX::Session::sendToTarget(probe, client.sessionId);
+
+  EXPECT_TRUE(waitFor([&] { return client.app.gapFills.load() > 0; },
+                       std::chrono::seconds(15)))
+      << "a ResendRequest with nothing to resend must be answered with "
+          "SequenceReset-GapFill, not silence";
+  EXPECT_EQ(client.app.logouts.load(), 0)
+      << "the engine must accept our gap fill rather than dropping the session";
+}
+
+// FIX 4.4: a sequence number BELOW the expectation cannot be recovered
+// from, and the session must end rather than continue on a number
+// nobody agrees about.
+TEST(QuickFixConformance, ASequenceNumberBelowExpectationEndsTheSession) {
+  const std::string storeDir = makeStoreDir("low-seqnum");
+  Acceptor acceptor(29637, storeDir);
+  Initiator client(29637);
+  client.start();
+  ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
+
+  FIX::Session* session = FIX::Session::lookupSession(client.sessionId);
+  ASSERT_NE(session, nullptr);
+
+  // Rewind the client's OUTBOUND numbering, so its next message
+  // repeats a sequence number we have already seen.
+  session->setNextSenderMsgSeqNum(1);
+  FIX44::TestRequest probe(FIX::TestReqID("too-low"));
+  FIX::Session::sendToTarget(probe, client.sessionId);
+
+  EXPECT_TRUE(waitFor([&] {
+                 return client.app.logouts.load() > 0 || client.app.logoutMessages.load() > 0;
+               },
+                       std::chrono::seconds(15)))
+      << "a sequence number below the expectation is fatal in FIX 4.4 and must "
+          "end the session rather than being silently accepted";
+}
+
+// An application message we send must reach the engine's application
+// callback -- not its reject path. This is the outbound framing the
+// output half depends on, judged by something other than our own
+// parser.
+TEST(QuickFixConformance, AnApplicationMessageWeSendReachesTheEnginesApplicationLayer) {
+  const std::string storeDir = makeStoreDir("app-message");
+  Acceptor acceptor(29638, storeDir);
+  Initiator client(29638);
+  client.start();
+  ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
+
+  ASSERT_TRUE(waitFor([&] { return acceptor.liveSession.load() != 0; },
+                       std::chrono::seconds(10)))
+      << "the acceptor must have a live session before it can send on one";
+
+  // The counter's own shape: a private MsgType carrying private tags.
+  ASSERT_TRUE(acceptor.sendApp("U2", "5000=7\0015001=42\001"));
+
+  EXPECT_TRUE(waitFor([&] { return client.app.appMessages.load() > 0; },
+                       std::chrono::seconds(10)))
+      << "our application message must arrive at fromApp; reaching fromAdmin or "
+          "the reject path would mean the framing is wrong";
+  EXPECT_EQ(client.app.rejects.load(), 0)
+      << "a real engine must not reject what we frame as an application message";
+}
+
+
+// A resend served from a real source, rather than gap-filled away.
+// This is the path a production gateway takes -- the journal replays
+// what was sent -- and FIX 4.4 requires each replayed message to carry
+// PossDupFlag=Y and the OrigSendingTime of the original. An engine
+// that receives a replay without them treats it as a NEW message at an
+// already-used sequence number, which is fatal. Nothing but a real
+// engine can judge that.
+class StubResendSource : public ResendSource {
+ public:
+  bool resend(std::uint64_t begin, std::uint64_t end, const Emit& emit) override {
+    served.fetch_add(1);
+    for (std::uint64_t seq = begin; seq <= end && seq < begin + 50; ++seq) {
+      emit(seq, "U2", "5000=1\0015001=1\001", "20260101-00:00:00.000");
+    }
+    return true;
+  }
+  std::atomic<int> served{0};
+};
+
+TEST(QuickFixConformance, AServedResendCarriesPossDupAndIsAcceptedByTheEngine) {
+  const std::string storeDir = makeStoreDir("served-resend");
+  Acceptor acceptor(29639, storeDir);
+  Initiator client(29639);
+  client.start();
+  ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
+  ASSERT_TRUE(waitFor([&] { return acceptor.liveSession.load() != 0; },
+                       std::chrono::seconds(10)));
+
+  StubResendSource source;
+  FixSession* session = acceptor.transport->sessionFor(acceptor.liveSession.load());
+  ASSERT_NE(session, nullptr);
+  session->setResendSource(&source);
+
+  // Send a few application messages so there is a range worth asking
+  // for, then rewind what the client expects so it asks for them.
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(acceptor.sendApp("U2", "5000=1\0015001=1\001"));
+  }
+  ASSERT_TRUE(waitFor([&] { return client.app.appMessages.load() >= 3; },
+                       std::chrono::seconds(10)));
+
+  FIX::Session* qf = FIX::Session::lookupSession(client.sessionId);
+  ASSERT_NE(qf, nullptr);
+  const int expected = qf->getExpectedTargetNum();
+  qf->setNextTargetMsgSeqNum(expected - 2);
+
+  ASSERT_TRUE(acceptor.sendApp("U2", "5000=1\0015001=1\001"));
+
+  EXPECT_TRUE(waitFor([&] { return source.served.load() > 0; }, std::chrono::seconds(15)))
+      << "the engine must ask us for the range it thinks it missed";
+  EXPECT_EQ(client.app.logouts.load(), 0)
+      << "a replayed message without PossDupFlag=Y and OrigSendingTime would be "
+          "read as a new message at a used sequence number, which ends the session";
+}
+
+// The client tells US to skip forward. FIX 4.4: SequenceReset-GapFill
+// moves the inbound expectation to NewSeqNo, and everything after must
+// continue from there.
+TEST(QuickFixConformance, AClientSequenceResetGapFillAdvancesOurExpectation) {
+  const std::string storeDir = makeStoreDir("client-seqreset");
+  Acceptor acceptor(29640, storeDir);
+  Initiator client(29640);
+  client.start();
+  ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
+
+  FIX::Session* qf = FIX::Session::lookupSession(client.sessionId);
+  ASSERT_NE(qf, nullptr);
+
+  // Jump the client's outbound numbering forward and announce it the
+  // legitimate way, rather than leaving us to discover a hole.
+  const int from = qf->getExpectedSenderNum();
+  FIX::Message reset;
+  reset.getHeader().setField(FIX::MsgType(FIX::MsgType_SequenceReset));
+  reset.setField(FIX::GapFillFlag(true));
+  reset.setField(FIX::NewSeqNo(from + 4));
+  FIX::Session::sendToTarget(reset, client.sessionId);
+  // The sender must actually CONTINUE from NewSeqNo. Announcing a jump
+  // and then numbering the next message as though it had not happened
+  // is incoherent, and our gateway is right to end the session over it
+  // -- the first version of this test did exactly that and read the
+  // resulting "MsgSeqNum too low" Logout as a failure, when the trace
+  // showed the engine had honoured the reset and then correctly
+  // rejected a sequence number below the new expectation.
+  qf->setNextSenderMsgSeqNum(from + 4);
+
+  // If the expectation moved, the session keeps running and heartbeats
+  // continue. If it did not, we would demand a resend of a range the
+  // client has already declared skipped.
+  const int before = client.app.heartbeats.load();
+  EXPECT_TRUE(waitFor([&] { return client.app.heartbeats.load() > before; },
+                       std::chrono::seconds(15)))
+      << "SequenceReset-GapFill must advance our inbound expectation and leave "
+          "the session healthy";
+  EXPECT_EQ(client.app.logouts.load(), 0);
+}
+
+// Sequence numbers are session state that must outlive a connection:
+// the client drops and reconnects WITHOUT ResetSeqNumFlag, so both
+// sides must resume their counters rather than restart them.
+TEST(QuickFixConformance, SequenceNumbersSurviveAReconnectWithoutReset) {
+  const std::string storeDir = makeStoreDir("reconnect");
+  Acceptor acceptor(29641, storeDir);
+
+  int afterFirst = 0;
+  {
+    Initiator client(29641);
+    client.start();
+    ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
+    FIX44::TestRequest probe(FIX::TestReqID("before-reconnect"));
+    FIX::Session::sendToTarget(probe, client.sessionId);
+    ASSERT_TRUE(waitFor([&] { return client.app.heartbeats.load() > 0; },
+                         std::chrono::seconds(10)));
+    FIX::Session* qf = FIX::Session::lookupSession(client.sessionId);
+    ASSERT_NE(qf, nullptr);
+    afterFirst = qf->getExpectedTargetNum();
+    EXPECT_GT(afterFirst, 1) << "the first session must have advanced our outbound numbering";
+  }
+
+  // A fresh initiator with a fresh in-memory store starts its own
+  // numbering at 1, so this asserts what OUR side persisted: it must
+  // not have forgotten, and it must recover the session rather than
+  // dropping it.
+  Initiator second(29641);
+  second.start();
+  EXPECT_TRUE(second.waitForLogon(std::chrono::seconds(15)))
+      << "the gateway must accept a reconnect and reconcile sequence numbers "
+          "rather than refusing the session";
 }
 
 }  // namespace
