@@ -12,6 +12,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <string>
 #include <thread>
@@ -54,13 +56,72 @@ class ApplyLoop {
       return false;
     }
 
+    // Off unless SEQ_APPLY_STALL_US is set, and off means no clock read
+    // at all -- this runs per record, and instrumentation that measures
+    // itself is a mistake this repo has already made once (see the FIX
+    // ring reader's stage timers, which were 47.8% of a gateway's CPU).
+    static const char* const kStallEnv = std::getenv("SEQ_APPLY_STALL_US");
+    static const std::int64_t kStallUs = kStallEnv != nullptr ? std::atoll(kStallEnv) : 0;
+    if (kStallUs <= 0) {
+      collector_.reset();
+      const std::uint64_t sequenceNumber = journal_.nextSequenceNumber();
+      stateMachine_.apply(sequenceNumber, entry.input, collector_);
+      journal_.append(sequenceNumber, entry.input, collector_.outputs());
+      if (onApplied_ != nullptr) {
+        onApplied_(entry.context, sequenceNumber, collector_.designatedOutputs());
+      }
+      return true;
+    }
+
+    // Four phases, reported separately, because knowing WHICH one
+    // stalled is the whole point:
+    //
+    //   gap     -- since the previous record was applied. Large gap with
+    //              small phases means nothing was waiting for us: the
+    //              stall is upstream, in consensus or replication, not
+    //              here.
+    //   sm      -- the application's own apply().
+    //   journal -- the append, including a segment roll.
+    //   notify  -- the completion callback, which runs braft's closure
+    //              and so releases the client's response.
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    const std::int64_t gapUs =
+        lastStepEnd_.time_since_epoch().count() == 0
+            ? 0
+            : std::chrono::duration_cast<std::chrono::microseconds>(t0 - lastStepEnd_).count();
+
     collector_.reset();
     const std::uint64_t sequenceNumber = journal_.nextSequenceNumber();
     stateMachine_.apply(sequenceNumber, entry.input, collector_);
+    const auto t1 = Clock::now();
     journal_.append(sequenceNumber, entry.input, collector_.outputs());
-
+    const auto t2 = Clock::now();
     if (onApplied_ != nullptr) {
       onApplied_(entry.context, sequenceNumber, collector_.designatedOutputs());
+    }
+    const auto t3 = Clock::now();
+    lastStepEnd_ = t3;
+
+    const auto us = [](auto a, auto b) {
+      return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    const std::int64_t smUs = us(t0, t1), journalUs = us(t1, t2), notifyUs = us(t2, t3);
+    const std::int64_t totalUs = smUs + journalUs + notifyUs;
+    if (totalUs >= kStallUs || gapUs >= kStallUs) {
+      // Wall clock, so a stall can be lined up against anything else
+      // sampled on this host.
+      const auto wall = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+      std::fprintf(stderr,
+                   "[apply-stall] t=%lld.%06lld seq=%llu gap=%lldus sm=%lldus journal=%lldus "
+                   "notify=%lldus total=%lldus\n",
+                   static_cast<long long>(wall / 1000000), static_cast<long long>(wall % 1000000),
+                   static_cast<unsigned long long>(sequenceNumber),
+                   static_cast<long long>(gapUs), static_cast<long long>(smUs),
+                   static_cast<long long>(journalUs), static_cast<long long>(notifyUs),
+                   static_cast<long long>(totalUs));
     }
     return true;
   }
@@ -120,6 +181,7 @@ class ApplyLoop {
   CommittedEntryRing& ring_;
   CompletionCallback onApplied_;
   OutputCollector collector_;
+  std::chrono::steady_clock::time_point lastStepEnd_{};
   bool halted_ = false;
   std::string haltReason_;
 };
