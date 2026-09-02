@@ -1444,6 +1444,97 @@ FIX gateway's own `README.md` must restate the deviation rationale
 above, in its own words, so that anyone opening that directory
 understands why an engine was not used before they propose adding one.
 
+### 8.13 A QuickFIX-based gateway — the alternative, and what it would cost
+
+§8.12 owns its session layer. This section states the alternative
+seriously, because the argument for it is real and the argument against
+it is not "we already wrote one".
+
+**The case for it.** A FIX session layer is mostly edge cases, and the
+edge cases are where a hand-rolled engine diverges from the rest of the
+world: resend requests that span a gap, gap fills that overlap an
+administrative message, `SequenceReset` below the expectation,
+`PossDupFlag` and `OrigSendingTime` on a replayed message, a `Logon`
+that arrives already gapped. QuickFIX has had those paths exercised by
+many counterparties for two decades. This repository's own engine has
+them exercised by this repository's own tests, which is a weaker claim
+however many tests there are: a test written by the same understanding
+that wrote the code cannot find a misunderstanding shared by both.
+
+The conformance suite is the honest measure of that gap. It puts a real
+QuickFIX initiator against the gateway, and it covers Logon/Logout,
+heartbeat cadence, `TestRequest`/`TestReqID`, and `ResetSeqNumFlag` --
+four behaviours. `fix_session_test.cpp` covers eighteen, and the
+fourteen with no QuickFIX counterpart include every resend, gap-fill and
+sequence-reset path. Those are precisely the subtle ones. Anyone
+extending the conformance suite should start there rather than adding
+more coverage of the handshake.
+
+**How the message store would work.** QuickFIX requires a
+`FIX::MessageStore` per session -- `set()` to save an outbound message
+by sequence number, `get(begin, end, out)` to retrieve a range for a
+resend, plus the next sender/target sequence numbers. The obvious
+implementation writes every outbound message to a file, which is what
+§8.12 reason 1 exists to avoid: the journal already holds every
+message the gateway ever sent.
+
+So the store is implemented over the journal rather than beside it:
+
+- `set(seqNum, message)` stores no message body. It records the
+  `(journal sequence number, output index)` the message was produced
+  from -- the mapping this repository already maintains as `SentRecord`
+  to serve its own resends.
+- `get(begin, end, out)` walks that mapping, re-reads each journal
+  record from the relay, and re-runs the OUTPUT codec over it to
+  reproduce the bytes. Deterministic, because the codec is a pure
+  function of the record; this is exactly what `JournalResendSource`
+  does today, behind QuickFIX's interface instead of this repository's.
+- `getNextSenderMsgSeqNum` / `getNextTargetMsgSeqNum` and their setters
+  read and write the same persisted counter pair §8.12 already keeps.
+  That pair, plus the journal, remains the only durable session state.
+- `refresh()` and `reset()` follow from those: refresh re-reads the
+  counters, reset clears them and the mapping.
+
+The mapping must be reproducible after a restart, exactly as it must be
+today: the persisted `lastJournalSequence` plus a walk forward from it
+rebuilds `seqNum -> journal position` without a message store on disk.
+
+**What would not change.** §8.11 still decides delivery: outputs reach a
+FIX session from the journal, in sequence-number order, and the
+synchronous propose receipt stays bookkeeping. The output gateway
+chassis still tails the journal and publishes to the ring; only the
+final hop changes, from this repository's session core to
+`FIX::Session::send`. Per-client topics, `MarketDataRequest`
+subscription and the input codec are untouched.
+
+**What it would cost, and what is not yet known.** QuickFIX is
+string-and-allocation based where hffix parses and writes in place on
+the I/O buffer, and it manages its own threads per session rather than
+sharing the gateway's. The measured FIX arm carries 400k requests/sec
+with zero drops at a 3.4ms p50; there is no basis in this repository for
+predicting where a QuickFIX-based gateway would land, and the number
+should be measured rather than argued about. Treat the throughput
+question as open.
+
+Two further costs are known rather than speculative. QuickFIX brings its
+own session scheduling, data dictionaries and configuration surface,
+which is capability but also configuration that must be got right --
+and its `QUICKFIX_THROW` macro silently becomes `noexcept` under C++17,
+turning a documented `ConfigError` into `std::terminate` (this repo hit
+exactly that, as a CI-only failure, because vcpkg built the dependency
+with a different default standard than the one the project compiles
+with). A library being battle-tested is an argument about its protocol
+logic, not about its build hygiene.
+
+**When to prefer it.** If this gateway is to face counterparties whose
+engines this repository has never seen, QuickFIX's protocol logic is
+worth more than the throughput it costs, and the message store above
+means adopting it does not give up the journal-as-resend-store property
+that motivated §8.12 in the first place. If the deployment is internal,
+the counterparties are known, and the rate is high, §8.12's engine keeps
+its advantage -- provided the conformance suite is extended to cover the
+fourteen behaviours it currently does not.
+
 ## 9. Repository layout and build tooling
 
 ```
