@@ -28,11 +28,15 @@
 #include <quickfix/Fields.h>
 
 #include <sequencer/fix/fix_input_transport.hpp>
+#include <sequencer/quickfix/journal_message_store.hpp>
+#include <sequencer/quickfix/quickfix_input_transport.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -124,13 +128,18 @@ class ConformanceApp : public FIX::Application {
 // Owns the store directory as well as the transport, so cleanup cannot
 // race a live session still persisting into it -- removing it under a
 // running gateway is what first exposed the unguarded store write.
-struct Acceptor {
+struct HffixAcceptor {
+  // Distinct port ranges per gateway: the typed suite runs the same
+  // test against both, and they must not collide.
+  static constexpr int kBasePort = 29631;
+  static constexpr const char* kName = "hffix";
+
   std::unique_ptr<FixInputTransport> transport;
   std::string storeDir;
 
   std::atomic<std::uint64_t> liveSession{0};
 
-  Acceptor(int port, std::string dir, int heartBtInt = 5) : storeDir(std::move(dir)) {
+  HffixAcceptor(int port, std::string dir, int heartBtInt = 5) : storeDir(std::move(dir)) {
     FixInputConfig config;
     config.senderCompId = "SEQUENCER";
     config.heartBtInt = heartBtInt;
@@ -157,7 +166,33 @@ struct Acceptor {
     session->sendApplication(msgType, body);
     return true;
   }
-  ~Acceptor() {
+  // Serves a resend the way gateway/fix/ does in production: through a
+  // ResendSource the session core asks. The QuickFIX acceptor needs no
+  // equivalent -- its store does this -- so the typed tests call this on
+  // both and one of them does nothing.
+  class Stub : public ResendSource {
+   public:
+    bool resend(std::uint64_t begin, std::uint64_t end, const Emit& emit) override {
+      served.fetch_add(1);
+      for (std::uint64_t seq = begin; seq <= end && seq < begin + 50; ++seq) {
+        emit(seq, "U2", "5000=1\0015001=1\001", "20260101-00:00:00.000");
+      }
+      return true;
+    }
+    std::atomic<int> served{0};
+  } stub;
+
+  void enableResends() {
+    const std::uint64_t id = liveSession.load();
+    if (id == 0) {
+      return;
+    }
+    if (FixSession* session = transport->sessionFor(id); session != nullptr) {
+      session->setResendSource(&stub);
+    }
+  }
+
+  ~HffixAcceptor() {
     transport->stop();
     std::filesystem::remove_all(storeDir);
   }
@@ -243,6 +278,99 @@ struct Initiator {
   }
 };
 
+// The same gateway, on QuickFIX's session layer (specification.md
+// §8.13). Same surface as HffixAcceptor so one suite drives both -- the
+// point of the exercise is that a real engine cannot tell them apart.
+//
+// Its message store is journal-backed like the real one, with a stub
+// standing in for the journal: sendApp() registers the body under a
+// synthetic journal position, and the store rebuilds from it. So a
+// resend here exercises the real reconstruction path, not a shortcut.
+struct QuickFixAcceptor {
+  static constexpr int kBasePort = 29731;
+  static constexpr const char* kName = "quickfix";
+
+  class Bodies : public sequencer::quickfix::BodySource {
+   public:
+    bool bodyFor(std::uint64_t seq, std::uint32_t, std::string& msgTypeOut,
+                  std::string& bodyOut) override {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto it = bodies.find(seq);
+      if (it == bodies.end()) {
+        return false;
+      }
+      msgTypeOut = "U2";
+      bodyOut = it->second;
+      return true;
+    }
+    std::mutex mutex;
+    std::map<std::uint64_t, std::string> bodies;
+  };
+
+  class Sequences : public sequencer::quickfix::SequenceNumberStore {
+   public:
+    void load(const std::string& key, int& nextSender, int& nextTarget) override {
+      std::lock_guard<std::mutex> lock(mutex);
+      nextSender = sender.count(key) ? sender[key] : 1;
+      nextTarget = target.count(key) ? target[key] : 1;
+    }
+    void save(const std::string& key, int nextSender, int nextTarget) override {
+      std::lock_guard<std::mutex> lock(mutex);
+      sender[key] = nextSender;
+      target[key] = nextTarget;
+    }
+    std::mutex mutex;
+    std::map<std::string, int> sender, target;
+  };
+
+  Bodies bodies;
+  Sequences sequences;
+  std::unique_ptr<sequencer::quickfix::JournalMessageStoreFactory> storeFactory;
+  std::unique_ptr<sequencer::quickfix::QuickFixInputTransport> transport;
+  std::string storeDir;
+  std::atomic<std::uint64_t> liveSession{0};
+  std::atomic<std::uint64_t> nextJournalSeq{1};
+
+  QuickFixAcceptor(int port, std::string dir, int heartBtInt = 5) : storeDir(std::move(dir)) {
+    sequencer::quickfix::QuickFixInputConfig config;
+    config.senderCompId = "SEQUENCER";
+    config.heartBtInt = heartBtInt;
+    // QuickFIX declares its acceptor sessions up front, so the client
+    // this suite uses has to be named. See the transport's header.
+    config.clientCompIds = {"QFCLIENT"};
+    storeFactory = std::make_unique<sequencer::quickfix::JournalMessageStoreFactory>(bodies,
+                                                                                      sequences);
+    transport = std::make_unique<sequencer::quickfix::QuickFixInputTransport>(config);
+    transport->setStoreFactory(storeFactory.get());
+    transport->setSessionReadyFn([this](std::uint64_t id) { liveSession.store(id); });
+    transport->attach([](std::shared_ptr<sequencer::RequestContext> request) { request->respond({}); },
+                       [](const sequencer::SessionInfo&) {});
+    transport->start(port);
+  }
+
+  bool sendApp(std::string_view msgType, std::string_view body) {
+    const std::uint64_t id = liveSession.load();
+    if (id == 0) {
+      return false;
+    }
+    const std::uint64_t journalSeq = nextJournalSeq.fetch_add(1);
+    {
+      std::lock_guard<std::mutex> lock(bodies.mutex);
+      bodies.bodies[journalSeq] = std::string(body);
+    }
+    return transport->sendApplication(id, msgType, body, journalSeq, 0);
+  }
+
+  // Nothing to do: QuickFIX serves resends from the message store,
+  // which is wired at construction.
+  void enableResends() {}
+
+  ~QuickFixAcceptor() {
+    transport->stop();
+    std::filesystem::remove_all(storeDir);
+  }
+};
+
 // Polls rather than sleeps: these are real sockets and a real engine,
 // and a fixed sleep is either flaky or slow.
 template <typename Predicate>
@@ -266,10 +394,31 @@ std::string makeStoreDir(const char* name) {
   return dir.string();
 }
 
-TEST(QuickFixConformance, LogonAndLogoutWithARealEngine) {
+// One suite, both gateways (specification.md §8.12 and §8.13).
+//
+// Every test below runs twice: once against the hffix gateway with its
+// own session core, once against the QuickFIX gateway. That is the
+// whole point -- a real engine should not be able to tell them apart,
+// and any behaviour only one of them gets right shows up here as a
+// single red cell rather than as a difference nobody looked for.
+template <typename AcceptorT>
+class Conformance : public ::testing::Test {};
+
+using AcceptorTypes = ::testing::Types<HffixAcceptor, QuickFixAcceptor>;
+
+class AcceptorNames {
+ public:
+  template <typename T>
+  static std::string GetName(int) {
+    return T::kName;
+  }
+};
+TYPED_TEST_SUITE(Conformance, AcceptorTypes, AcceptorNames);
+
+TYPED_TEST(Conformance, LogonAndLogoutWithARealEngine) {
   const std::string storeDir = makeStoreDir("logon");
-  Acceptor acceptor(29631, storeDir);
-  Initiator client(29631);
+  TypeParam acceptor(TypeParam::kBasePort + 0, storeDir);
+  Initiator client(TypeParam::kBasePort + 0);
   client.start();
 
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)))
@@ -289,10 +438,10 @@ TEST(QuickFixConformance, LogonAndLogoutWithARealEngine) {
 
 // Heartbeats on the negotiated interval, which is what keeps an engine
 // from declaring us dead.
-TEST(QuickFixConformance, HeartbeatsArriveOnTheNegotiatedInterval) {
+TYPED_TEST(Conformance, HeartbeatsArriveOnTheNegotiatedInterval) {
   const std::string storeDir = makeStoreDir("heartbeat");
-  Acceptor acceptor(29632, storeDir, /*heartBtInt=*/1);
-  Initiator client(29632, /*heartBtInt=*/1);
+  TypeParam acceptor(TypeParam::kBasePort + 1, storeDir, /*heartBtInt=*/1);
+  Initiator client(TypeParam::kBasePort + 1, /*heartBtInt=*/1);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
 
@@ -308,10 +457,10 @@ TEST(QuickFixConformance, HeartbeatsArriveOnTheNegotiatedInterval) {
 
 // A TestRequest must be answered with a Heartbeat echoing its TestReqID
 // -- QuickFIX drops a session that gets this wrong.
-TEST(QuickFixConformance, ATestRequestIsAnsweredWithItsId) {
+TYPED_TEST(Conformance, ATestRequestIsAnsweredWithItsId) {
   const std::string storeDir = makeStoreDir("testrequest");
-  Acceptor acceptor(29633, storeDir);
-  Initiator client(29633);
+  TypeParam acceptor(TypeParam::kBasePort + 2, storeDir);
+  Initiator client(TypeParam::kBasePort + 2);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
 
@@ -332,12 +481,12 @@ TEST(QuickFixConformance, ATestRequestIsAnsweredWithItsId) {
 
 // ResetSeqNumFlag on Logon: both sides restart at 1. An engine checks
 // this strictly, and getting it wrong strands a session at end of day.
-TEST(QuickFixConformance, ResetSeqNumFlagLogonIsHonoured) {
+TYPED_TEST(Conformance, ResetSeqNumFlagLogonIsHonoured) {
   const std::string storeDir = makeStoreDir("reset");
 
   {
-    Acceptor acceptor(29634, storeDir);
-    Initiator client(29634);
+    TypeParam acceptor(TypeParam::kBasePort + 3, storeDir);
+    Initiator client(TypeParam::kBasePort + 3);
     client.start();
     ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
   }
@@ -345,8 +494,8 @@ TEST(QuickFixConformance, ResetSeqNumFlagLogonIsHonoured) {
   // Reconnect with 141=Y against an acceptor whose counters carried
   // over from the session above.
   std::this_thread::sleep_for(std::chrono::seconds(2));
-  Acceptor acceptor(29634, storeDir);
-  Initiator client(29634);
+  TypeParam acceptor(TypeParam::kBasePort + 3, storeDir);
+  Initiator client(TypeParam::kBasePort + 3);
   client.app.resetOnNextLogon.store(true);
   client.start();
 
@@ -368,10 +517,10 @@ TEST(QuickFixConformance, ResetSeqNumFlagLogonIsHonoured) {
 // range, and the session must survive the exchange. QuickFIX answers a
 // ResendRequest by itself, so a session that is still alive afterwards
 // is the engine's own verdict that our request was well-formed.
-TEST(QuickFixConformance, AGapInInboundMakesUsRequestAResendAndTheSessionSurvives) {
+TYPED_TEST(Conformance, AGapInInboundMakesUsRequestAResendAndTheSessionSurvives) {
   const std::string storeDir = makeStoreDir("inbound-gap");
-  Acceptor acceptor(29635, storeDir);
-  Initiator client(29635);
+  TypeParam acceptor(TypeParam::kBasePort + 4, storeDir);
+  Initiator client(TypeParam::kBasePort + 4);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
 
@@ -402,10 +551,10 @@ TEST(QuickFixConformance, AGapInInboundMakesUsRequestAResendAndTheSessionSurvive
 // resend. This suite's acceptor has no journal behind it, so the
 // correct answer is a SequenceReset-GapFill covering the range -- and
 // QuickFIX has to accept it and carry on.
-TEST(QuickFixConformance, AResendRequestIsAnsweredWithAGapFillTheEngineAccepts) {
+TYPED_TEST(Conformance, AResendRequestIsAnsweredWithAGapFillTheEngineAccepts) {
   const std::string storeDir = makeStoreDir("resend-gapfill");
-  Acceptor acceptor(29636, storeDir);
-  Initiator client(29636);
+  TypeParam acceptor(TypeParam::kBasePort + 5, storeDir);
+  Initiator client(TypeParam::kBasePort + 5);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
 
@@ -429,10 +578,10 @@ TEST(QuickFixConformance, AResendRequestIsAnsweredWithAGapFillTheEngineAccepts) 
 // FIX 4.4: a sequence number BELOW the expectation cannot be recovered
 // from, and the session must end rather than continue on a number
 // nobody agrees about.
-TEST(QuickFixConformance, ASequenceNumberBelowExpectationEndsTheSession) {
+TYPED_TEST(Conformance, ASequenceNumberBelowExpectationEndsTheSession) {
   const std::string storeDir = makeStoreDir("low-seqnum");
-  Acceptor acceptor(29637, storeDir);
-  Initiator client(29637);
+  TypeParam acceptor(TypeParam::kBasePort + 6, storeDir);
+  Initiator client(TypeParam::kBasePort + 6);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
 
@@ -457,10 +606,10 @@ TEST(QuickFixConformance, ASequenceNumberBelowExpectationEndsTheSession) {
 // callback -- not its reject path. This is the outbound framing the
 // output half depends on, judged by something other than our own
 // parser.
-TEST(QuickFixConformance, AnApplicationMessageWeSendReachesTheEnginesApplicationLayer) {
+TYPED_TEST(Conformance, AnApplicationMessageWeSendReachesTheEnginesApplicationLayer) {
   const std::string storeDir = makeStoreDir("app-message");
-  Acceptor acceptor(29638, storeDir);
-  Initiator client(29638);
+  TypeParam acceptor(TypeParam::kBasePort + 7, storeDir);
+  Initiator client(TypeParam::kBasePort + 7);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
 
@@ -487,31 +636,20 @@ TEST(QuickFixConformance, AnApplicationMessageWeSendReachesTheEnginesApplication
 // that receives a replay without them treats it as a NEW message at an
 // already-used sequence number, which is fatal. Nothing but a real
 // engine can judge that.
-class StubResendSource : public ResendSource {
- public:
-  bool resend(std::uint64_t begin, std::uint64_t end, const Emit& emit) override {
-    served.fetch_add(1);
-    for (std::uint64_t seq = begin; seq <= end && seq < begin + 50; ++seq) {
-      emit(seq, "U2", "5000=1\0015001=1\001", "20260101-00:00:00.000");
-    }
-    return true;
-  }
-  std::atomic<int> served{0};
-};
-
-TEST(QuickFixConformance, AServedResendCarriesPossDupAndIsAcceptedByTheEngine) {
+TYPED_TEST(Conformance, AServedResendCarriesPossDupAndIsAcceptedByTheEngine) {
   const std::string storeDir = makeStoreDir("served-resend");
-  Acceptor acceptor(29639, storeDir);
-  Initiator client(29639);
+  TypeParam acceptor(TypeParam::kBasePort + 8, storeDir);
+  Initiator client(TypeParam::kBasePort + 8);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
   ASSERT_TRUE(waitFor([&] { return acceptor.liveSession.load() != 0; },
                        std::chrono::seconds(10)));
 
-  StubResendSource source;
-  FixSession* session = acceptor.transport->sessionFor(acceptor.liveSession.load());
-  ASSERT_NE(session, nullptr);
-  session->setResendSource(&source);
+  // Each gateway serves this its own way: hffix through a ResendSource
+  // on the session core, QuickFIX through the journal-backed message
+  // store. The assertion below is the same for both -- the engine asked,
+  // we answered, and it kept the session.
+  acceptor.enableResends();
 
   // Send a few application messages so there is a range worth asking
   // for, then rewind what the client expects so it asks for them.
@@ -526,10 +664,16 @@ TEST(QuickFixConformance, AServedResendCarriesPossDupAndIsAcceptedByTheEngine) {
   const int expected = qf->getExpectedTargetNum();
   qf->setNextTargetMsgSeqNum(expected - 2);
 
+  const int beforeReplay = client.app.appMessages.load();
   ASSERT_TRUE(acceptor.sendApp("U2", "5000=1\0015001=1\001"));
 
-  EXPECT_TRUE(waitFor([&] { return source.served.load() > 0; }, std::chrono::seconds(15)))
-      << "the engine must ask us for the range it thinks it missed";
+  // The replays must actually ARRIVE, not merely fail to break the
+  // session. Asserting only "no logout" would pass against a gateway
+  // that answered a ResendRequest with silence, which is the bug this
+  // test exists to catch.
+  EXPECT_TRUE(waitFor([&] { return client.app.appMessages.load() > beforeReplay; },
+                       std::chrono::seconds(15)))
+      << "the engine asked for a range and must receive it";
   EXPECT_EQ(client.app.logouts.load(), 0)
       << "a replayed message without PossDupFlag=Y and OrigSendingTime would be "
           "read as a new message at a used sequence number, which ends the session";
@@ -538,10 +682,10 @@ TEST(QuickFixConformance, AServedResendCarriesPossDupAndIsAcceptedByTheEngine) {
 // The client tells US to skip forward. FIX 4.4: SequenceReset-GapFill
 // moves the inbound expectation to NewSeqNo, and everything after must
 // continue from there.
-TEST(QuickFixConformance, AClientSequenceResetGapFillAdvancesOurExpectation) {
+TYPED_TEST(Conformance, AClientSequenceResetGapFillAdvancesOurExpectation) {
   const std::string storeDir = makeStoreDir("client-seqreset");
-  Acceptor acceptor(29640, storeDir);
-  Initiator client(29640);
+  TypeParam acceptor(TypeParam::kBasePort + 9, storeDir);
+  Initiator client(TypeParam::kBasePort + 9);
   client.start();
   ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
 
@@ -579,13 +723,13 @@ TEST(QuickFixConformance, AClientSequenceResetGapFillAdvancesOurExpectation) {
 // Sequence numbers are session state that must outlive a connection:
 // the client drops and reconnects WITHOUT ResetSeqNumFlag, so both
 // sides must resume their counters rather than restart them.
-TEST(QuickFixConformance, SequenceNumbersSurviveAReconnectWithoutReset) {
+TYPED_TEST(Conformance, SequenceNumbersSurviveAReconnectWithoutReset) {
   const std::string storeDir = makeStoreDir("reconnect");
-  Acceptor acceptor(29641, storeDir);
+  TypeParam acceptor(TypeParam::kBasePort + 10, storeDir);
 
   int afterFirst = 0;
   {
-    Initiator client(29641);
+    Initiator client(TypeParam::kBasePort + 10);
     client.start();
     ASSERT_TRUE(client.waitForLogon(std::chrono::seconds(10)));
     FIX44::TestRequest probe(FIX::TestReqID("before-reconnect"));
@@ -602,7 +746,7 @@ TEST(QuickFixConformance, SequenceNumbersSurviveAReconnectWithoutReset) {
   // numbering at 1, so this asserts what OUR side persisted: it must
   // not have forgotten, and it must recover the session rather than
   // dropping it.
-  Initiator second(29641);
+  Initiator second(TypeParam::kBasePort + 10);
   second.start();
   EXPECT_TRUE(second.waitForLogon(std::chrono::seconds(15)))
       << "the gateway must accept a reconnect and reconcile sequence numbers "

@@ -33,6 +33,45 @@ endif()
 target_link_libraries(sequencer_quickfix_store PUBLIC sequencer::output_codec_api)
 target_compile_features(sequencer_quickfix_store PUBLIC cxx_std_20)
 
+add_library(sequencer_quickfix_input STATIC
+  input/src/quickfix_input_transport.cpp
+)
+add_library(sequencer::quickfix_input ALIAS sequencer_quickfix_input)
+target_include_directories(sequencer_quickfix_input PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/input/include>"
+)
+target_link_libraries(sequencer_quickfix_input PUBLIC
+  sequencer::quickfix_store
+  sequencer::gateway_input
+)
+target_compile_features(sequencer_quickfix_input PUBLIC cxx_std_20)
+
+add_library(sequencer_quickfix_output STATIC
+  output/src/quickfix_output_transport.cpp
+)
+add_library(sequencer::quickfix_output ALIAS sequencer_quickfix_output)
+target_include_directories(sequencer_quickfix_output PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/output/include>"
+)
+target_link_libraries(sequencer_quickfix_output PUBLIC
+  sequencer::quickfix_input
+  sequencer::gateway_output
+)
+target_compile_features(sequencer_quickfix_output PUBLIC cxx_std_20)
+
+add_library(sequencer_quickfix_gateway STATIC
+  src/quickfix_session_gateway.cpp
+)
+add_library(sequencer::quickfix_gateway ALIAS sequencer_quickfix_gateway)
+target_include_directories(sequencer_quickfix_gateway PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(sequencer_quickfix_gateway PUBLIC
+  sequencer::quickfix_input
+  sequencer::quickfix_output
+)
+target_compile_features(sequencer_quickfix_gateway PUBLIC cxx_std_20)
+
 if(SEQUENCER_BUILD_TESTS)
   add_subdirectory(tests)
 endif()

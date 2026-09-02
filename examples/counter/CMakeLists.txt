@@ -200,6 +200,15 @@ target_link_libraries(counter_fix_codecs PUBLIC
 )
 target_compile_features(counter_fix_codecs PUBLIC cxx_std_20)
 
+add_executable(counter_quickfix_gateway_main quickfix_gateway_main.cpp)
+set_target_properties(counter_quickfix_gateway_main PROPERTIES OUTPUT_NAME counter_quickfix_gateway)
+target_link_libraries(counter_quickfix_gateway_main PRIVATE
+  counter::fix_codecs
+  sequencer::quickfix_gateway
+  gflags::gflags
+  glog::glog
+)
+
 add_executable(counter_fix_gateway_main fix_gateway_main.cpp)
 target_link_libraries(counter_fix_gateway_main PRIVATE counter::fix_codecs
                                                         sequencer::fix_gateway

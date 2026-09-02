@@ -38,7 +38,10 @@ gtest_discover_tests(fix_loadgen_loopback_test PROPERTIES TIMEOUT 180)
 find_package(quickfix CONFIG QUIET)
 if(quickfix_FOUND)
   add_executable(quickfix_conformance_test quickfix_conformance_test.cpp)
-  target_link_libraries(quickfix_conformance_test PRIVATE sequencer::fix_input quickfix
+  # Both gateways: the suite runs every test against each, so a real
+  # engine judges them on the same terms (specification.md §8.13).
+  target_link_libraries(quickfix_conformance_test PRIVATE sequencer::fix_input
+                                                           sequencer::quickfix_input quickfix
                                                            GTest::gtest GTest::gtest_main Threads::Threads)
   gtest_discover_tests(quickfix_conformance_test PROPERTIES TIMEOUT 180)
 else()
