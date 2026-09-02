@@ -100,7 +100,7 @@ void QuickFixInputTransport::start(int listenPort) {
   log_ = std::getenv("QUICKFIX_SCREEN_LOG") != nullptr
              ? std::unique_ptr<FIX::LogFactory>(new FIX::ScreenLogFactory(true, true, true))
              : std::unique_ptr<FIX::LogFactory>(new NullLogFactory());
-  acceptor_ = std::make_unique<FIX::SocketAcceptor>(*this, *storeFactory_, *settings_, *log_);
+  acceptor_ = std::make_unique<FIX::ThreadedSocketAcceptor>(*this, *storeFactory_, *settings_, *log_);
   acceptor_->start();
 }
 

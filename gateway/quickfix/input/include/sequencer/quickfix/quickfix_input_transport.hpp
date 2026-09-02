@@ -27,7 +27,7 @@
 #include <quickfix/Session.h>
 #include <quickfix/SessionID.h>
 #include <quickfix/SessionSettings.h>
-#include <quickfix/SocketAcceptor.h>
+#include <quickfix/ThreadedSocketAcceptor.h>
 
 #include <sequencer/input_transport.hpp>
 #include <sequencer/quickfix/journal_message_store.hpp>
@@ -125,7 +125,20 @@ class QuickFixInputTransport : public sequencer::InputTransport, public FIX::App
 
   std::unique_ptr<FIX::SessionSettings> settings_;
   std::unique_ptr<FIX::LogFactory> log_;
-  std::unique_ptr<FIX::SocketAcceptor> acceptor_;
+  // THREADED, not FIX::SocketAcceptor.
+  //
+  // SocketAcceptor is single-threaded: one thread services every
+  // session's parsing, session logic and sends. Measured on five
+  // clients that capped the gateway near 140k with the node 53% idle
+  // and no CPU hotspot anywhere -- a flat profile, which is what a
+  // serialised design looks like rather than an expensive one.
+  // ThreadedSocketAcceptor gives each connection its own thread.
+  //
+  // The Application callbacks below are therefore called from several
+  // threads at once. Everything they touch is guarded: the session-id
+  // maps by mutex_, and each session's message store is its own object,
+  // so noteOrigin()/set() on different sessions cannot interleave.
+  std::unique_ptr<FIX::ThreadedSocketAcceptor> acceptor_;
 
   std::mutex mutex_;
   std::map<std::string, std::uint64_t> idsByKey_;
