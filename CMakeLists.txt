@@ -69,6 +69,7 @@ add_subdirectory(gateway/input)
 add_subdirectory(gateway/output)
 add_subdirectory(gateway/relay)
 add_subdirectory(gateway/fix)
+add_subdirectory(gateway/quickfix)
 add_subdirectory(evidence)
 add_subdirectory(sdk/cpp)
 # After gateway/relay: sequencer_bench_relay_observer links its

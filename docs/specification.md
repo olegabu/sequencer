@@ -1480,15 +1480,24 @@ message the gateway ever sent.
 
 So the store is implemented over the journal rather than beside it:
 
-- `set(seqNum, message)` stores no message body. It records the
-  `(journal sequence number, output index)` the message was produced
-  from -- the mapping this repository already maintains as `SentRecord`
-  to serve its own resends.
-- `get(begin, end, out)` walks that mapping, re-reads each journal
-  record from the relay, and re-runs the OUTPUT codec over it to
-  reproduce the bytes. Deterministic, because the codec is a pure
-  function of the record; this is exactly what `JournalResendSource`
-  does today, behind QuickFIX's interface instead of this repository's.
+- `set(seqNum, message)` stores no message BYTES. It records a small
+  fixed-size row: the `(journal sequence number, output index)` the
+  message was produced from, its MsgType, and the `SendingTime`
+  QuickFIX stamped on it. That is the same row this repository already
+  keeps as `SentRecord` to serve its own resends.
+- `get(begin, end, out)` reconstructs each message from that row: the
+  body by re-reading the journal record and re-running the OUTPUT codec
+  over it, deterministic because the codec is a pure function of the
+  record; the header from the recorded sequence number and sending
+  time.
+
+  Reconstruction rather than retrieval is forced by QuickFIX's own
+  resend loop, which does not hand the store's output to the wire. It
+  PARSES each returned string, reads its MsgType to decide between a
+  gap fill and a replay, and rewrites `PossDupFlag` and
+  `OrigSendingTime` into it before sending (`Session::nextResendRequest`
+  in QuickFIX 1.15.1). So `get()` must return a complete, parseable
+  message with its original sequence number -- not the body alone.
 - `getNextSenderMsgSeqNum` / `getNextTargetMsgSeqNum` and their setters
   read and write the same persisted counter pair §8.12 already keeps.
   That pair, plus the journal, remains the only durable session state.
@@ -1498,6 +1507,17 @@ So the store is implemented over the journal rather than beside it:
 The mapping must be reproducible after a restart, exactly as it must be
 today: the persisted `lastJournalSequence` plus a walk forward from it
 rebuilds `seqNum -> journal position` without a message store on disk.
+
+**What QuickFIX handles, and we therefore do not.** This is the whole
+argument, so it is worth naming: Logon and Logout handshakes, heartbeat
+cadence, `TestRequest`/`TestReqID`, inbound sequence validation, gap
+detection, generating a `ResendRequest`, processing an inbound resend,
+generating `SequenceReset-GapFill`, applying `PossDupFlag` and
+`OrigSendingTime` to a replay, and session scheduling. Every one of the
+eighteen behaviours `fix_session_test.cpp` covers becomes QuickFIX's
+responsibility. What remains ours is the message store above: six
+sequence-number accessors and two methods that put a row in a map and
+take it out again.
 
 **What would not change.** §8.11 still decides delivery: outputs reach a
 FIX session from the journal, in sequence-number order, and the
