@@ -1,5 +1,7 @@
 #include <sequencer/quickfix/journal_message_store.hpp>
 
+#include <cstdio>
+
 #include <quickfix/Message.h>
 #include <quickfix/Values.h>
 
@@ -30,22 +32,22 @@ bool JournalMessageStore::set(int seqNum, const std::string& message)
     row.outputIndex = pendingOutputIndex_;
   }
 
+  // isSetField before every getField, never a try/catch around one:
+  // getField is declared QUICKFIX_THROW(FieldNotFound), which is
+  // `noexcept` under C++17, so a missing field calls std::terminate
+  // inside the accessor rather than throwing something catchable. See
+  // quickfix_input_transport.cpp for what that cost to find.
   FIX::Message parsed;
-  try {
-    parsed.setString(message, false);
-    FIX::MsgType msgType;
+  parsed.setString(message, false);
+  FIX::MsgType msgType;
+  if (parsed.getHeader().isSetField(msgType)) {
     parsed.getHeader().getField(msgType);
     row.msgType = msgType.getValue();
-    FIX::SendingTime sendingTime;
-    if (parsed.getHeader().isSetField(sendingTime)) {
-      parsed.getHeader().getField(sendingTime);
-      row.sendingTime = sendingTime.getString();
-    }
-  } catch (const FIX::Exception&) {
-    // A message we cannot parse is one we cannot rebuild. Record what
-    // is known; get() will gap-fill over it rather than replay
-    // something wrong.
-    row.msgType.clear();
+  }
+  FIX::SendingTime sendingTime;
+  if (parsed.getHeader().isSetField(sendingTime)) {
+    parsed.getHeader().getField(sendingTime);
+    row.sendingTime = sendingTime.getString();
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -55,6 +57,20 @@ bool JournalMessageStore::set(int seqNum, const std::string& message)
 
 void JournalMessageStore::get(int begin, int end, std::vector<std::string>& out) const
     QUICKFIX_THROW(FIX::IOException) {
+  // Another noexcept boundary in disguise: QUICKFIX_THROW is `noexcept`
+  // under C++17, so a rebuild that throws would terminate the gateway
+  // rather than fail the resend. Returning fewer messages is safe --
+  // QuickFIX gap-fills the difference.
+  try {
+    getGuarded(begin, end, out);
+  } catch (const FIX::Exception& e) {
+    std::fprintf(stderr, "[quickfix-store] rebuild failed, leaving it to gap fill: %s\n", e.what());
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[quickfix-store] rebuild failed: %s\n", e.what());
+  }
+}
+
+void JournalMessageStore::getGuarded(int begin, int end, std::vector<std::string>& out) const {
   std::vector<std::pair<int, SentRow>> rows;
   {
     std::lock_guard<std::mutex> lock(mutex_);

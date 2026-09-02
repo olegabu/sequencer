@@ -66,6 +66,7 @@ target_link_libraries(counter_fix_gateway_test PRIVATE counter::fix_codecs
 target_compile_definitions(counter_fix_gateway_test PRIVATE
   COUNTER_NODE_MAIN_PATH="$<TARGET_FILE:counter_node_main>"
   COUNTER_FIX_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_fix_gateway_main>"
+  COUNTER_QUICKFIX_GATEWAY_MAIN_PATH="$<TARGET_FILE:counter_quickfix_gateway_main>"
 )
 add_dependencies(counter_fix_gateway_test counter_node_main counter_fix_gateway_main)
 gtest_discover_tests(counter_fix_gateway_test PROPERTIES TIMEOUT 120)

@@ -87,6 +87,50 @@ identity from the Logon's `SenderCompID` and needs no such list.
 For a venue with known counterparties that is configuration. For one
 that accepts whoever arrives, it is a reason to prefer `gateway/fix/`.
 
+## The QUICKFIX_THROW landmine
+
+Read this before touching anything in this directory.
+
+QuickFIX declares its throwing accessors like this:
+
+```cpp
+#ifdef __cpp_noexcept_function_type
+#define QUICKFIX_THROW(...) noexcept
+#else
+#define QUICKFIX_THROW(...) throw(__VA_ARGS__)
+#endif
+```
+
+`__cpp_noexcept_function_type` is defined from C++17 onward. So when
+QuickFIX is compiled as C++17 or later — which is the default for any
+current GCC, and therefore what vcpkg produces — **every function
+documented as throwing becomes `noexcept`**, and the exception it
+documents calls `std::terminate` inside the accessor instead of
+propagating.
+
+Two consequences, both of which cost real debugging here:
+
+1. **`try`/`catch` around a QuickFIX accessor does nothing.** The
+   terminate happens inside the callee, before any handler of ours is
+   reachable. `FIX::Message::getField` on an absent field does not throw
+   a catchable `FieldNotFound`; it kills the process. Guarding it with a
+   try block *looks* correct and is structurally incapable of working.
+   Always ask `isSetField` first.
+2. **Our own overrides are noexcept boundaries too.** Anything escaping
+   `fromApp`, `set`, `get` or any other override with a `QUICKFIX_THROW`
+   in its signature terminates the gateway. Those bodies are wrapped so
+   nothing escapes.
+
+The same macro is why the conformance suite aborted in CI while passing
+locally: `Dictionary::getDay()` threw `ConfigError` to say "StartDay
+absent", which `SessionFactory` reads inside a `catch(ConfigError&)` so
+the key can be optional — and on a C++17 build that catch is
+unreachable. The session configuration here supplies `StartDay`/`EndDay`
+for that reason, not because a 24-hour session needs them.
+
+A library being battle-tested is a claim about its protocol logic. It is
+not a claim about its build hygiene.
+
 ## Tests
 
 `gateway/fix/tests/quickfix_conformance_test.cpp` is a **typed** suite:

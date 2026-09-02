@@ -110,6 +110,9 @@ class QuickFixInputTransport : public sequencer::InputTransport, public FIX::App
                       FIX::UnsupportedMessageType) override;
 
  private:
+  // The real body of fromApp(), called inside its exception guard.
+  void fromAppGuarded(const FIX::Message& message, const FIX::SessionID& sessionId);
+
   std::uint64_t idFor(const FIX::SessionID& sessionId);
   const FIX::SessionID* sessionForId(std::uint64_t id);
 

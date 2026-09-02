@@ -103,6 +103,8 @@ class JournalMessageStore : public FIX::MessageStore {
   void refresh() QUICKFIX_THROW(FIX::IOException) override;
 
  private:
+  void getGuarded(int begin, int end, std::vector<std::string>& out) const;
+
   std::string sessionKey_;
   BodySource& bodies_;
   SequenceNumberStore& sequences_;

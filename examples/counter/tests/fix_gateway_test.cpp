@@ -131,25 +131,60 @@ std::filesystem::path makeTempDir() {
   return std::filesystem::path(tmpl);
 }
 
-TEST(CounterFixGateway, TotalsArriveAsU2FromTheJournalNotAsTheSynchronousReply) {
+// Which gateway binary is under test. Both implement the same example
+// -- same codecs, same journal, same §8.11 delivery -- and differ only
+// in whose session layer runs underneath, so the observable behaviour a
+// client sees must be identical. Running one test over both is what
+// says so (gateway/quickfix/README.md).
+struct GatewayUnderTest {
+  const char* name;
+  const char* binary;
+  // QuickFIX declares its acceptor sessions up front and has no dynamic
+  // ones, so the client's CompID has to be named here. The hffix
+  // gateway adopts it from the Logon and needs no such argument.
+  bool needsClientCompIds;
+};
+
+class CounterFixGatewayEndToEnd : public ::testing::TestWithParam<GatewayUnderTest> {};
+
+INSTANTIATE_TEST_SUITE_P(
+    Gateways, CounterFixGatewayEndToEnd,
+    ::testing::Values(GatewayUnderTest{"hffix", COUNTER_FIX_GATEWAY_MAIN_PATH, false},
+                      GatewayUnderTest{"quickfix", COUNTER_QUICKFIX_GATEWAY_MAIN_PATH, true}),
+    [](const ::testing::TestParamInfo<GatewayUnderTest>& info) {
+      return std::string(info.param.name);
+    });
+
+TEST_P(CounterFixGatewayEndToEnd, TotalsArriveAsU2FromTheJournalNotAsTheSynchronousReply) {
+  const GatewayUnderTest& gatewayUnderTest = GetParam();
+  // Distinct ports per parameter: the two runs must not collide.
+  const int nodePort = gatewayUnderTest.needsClientCompIds ? 29751 : 29701;
+  const int fixPort = gatewayUnderTest.needsClientCompIds ? 29752 : 29702;
+
   const std::filesystem::path dir = makeTempDir();
-  const std::string nodePeer = "127.0.0.1:29701:0";
+  const std::string nodePeer = "127.0.0.1:" + std::to_string(nodePort) + ":0";
 
   ChildProcess node(COUNTER_NODE_MAIN_PATH,
                      {"--peer=" + nodePeer, "--peers=" + nodePeer,
                       "--data_dir=" + dir.string(), "--election_timeout_ms=300"});
   std::this_thread::sleep_for(std::chrono::milliseconds(900));
 
-  ChildProcess gateway(COUNTER_FIX_GATEWAY_MAIN_PATH,
-                        {"--node_peers=127.0.0.1:29701", "--listen_port=29702",
-                         "--data_dir=" + dir.string(),
-                         "--resume_file=" + (dir / "fix-resume").string(),
-                         "--sequence_store_dir=" + (dir / "fix-seq").string()});
+  std::vector<std::string> args{
+      "--node_peers=127.0.0.1:" + std::to_string(nodePort),
+      "--listen_port=" + std::to_string(fixPort),
+      "--data_dir=" + dir.string(),
+      "--resume_file=" + (dir / "fix-resume").string(),
+      "--sequence_store_dir=" + (dir / "fix-seq").string()};
+  if (gatewayUnderTest.needsClientCompIds) {
+    args.push_back("--client_comp_ids=ACME");
+  }
+  ChildProcess gateway(gatewayUnderTest.binary, args);
   std::this_thread::sleep_for(std::chrono::milliseconds(900));
 
-  FixClient client(29702, "ACME");
+  FixClient client(fixPort, "ACME");
   client.logon();
-  ASSERT_TRUE(client.isLoggedOn()) << "the counter FIX gateway did not accept a session";
+  ASSERT_TRUE(client.isLoggedOn())
+      << gatewayUnderTest.name << " gateway did not accept a session";
 
   // Subscribe first: the counter broadcasts its totals, and FIX's own
   // MarketDataRequest is the subscription (see counter_fix_codecs.hpp
@@ -168,17 +203,17 @@ TEST(CounterFixGateway, TotalsArriveAsU2FromTheJournalNotAsTheSynchronousReply) 
   EXPECT_EQ(client.totals()[0].value, "5");
   EXPECT_EQ(client.totals()[1].value, "3") << "the counter must accumulate: 5 + (-2)";
 
-  // The §8.11 assertion. CounterStateMachine designates its total, and
-  // over REST or gRPC that designated value IS the reply. Here it is
-  // withheld, and every U2 above arrived from the journal instead --
-  // which is why there are exactly two of them and not four.
+  // The §8.11 assertion, and it holds for both gateways:
+  // CounterStateMachine designates its total, and over REST or gRPC that
+  // designated value IS the reply. Here it is withheld, and every U2
+  // above arrived from the journal instead -- which is why there are
+  // exactly two of them and not four.
   EXPECT_EQ(client.totals().size(), 2u)
       << "each total must arrive exactly once: designated outputs are withheld on a "
           "session transport, so nothing is delivered twice";
 
   std::filesystem::remove_all(dir);
 }
-
 
 // The mirror of the test above, with --inline_designated_outputs on.
 //

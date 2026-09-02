@@ -4,6 +4,8 @@
 #include <quickfix/Values.h>
 #include <quickfix/fix44/MarketDataRequest.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 
 namespace sequencer::quickfix {
@@ -90,7 +92,13 @@ void QuickFixInputTransport::start(int listenPort) {
   }
 
   settings_ = std::make_unique<FIX::SessionSettings>(config);
-  log_ = std::make_unique<NullLogFactory>();
+  // QUICKFIX_SCREEN_LOG=1 puts every message on stderr. Off by
+  // default -- at rate this would flood a gateway -- but it is the only
+  // way to see what QuickFIX was processing when something inside it
+  // threw.
+  log_ = std::getenv("QUICKFIX_SCREEN_LOG") != nullptr
+             ? std::unique_ptr<FIX::LogFactory>(new FIX::ScreenLogFactory(true, true, true))
+             : std::unique_ptr<FIX::LogFactory>(new NullLogFactory());
   acceptor_ = std::make_unique<FIX::SocketAcceptor>(*this, *storeFactory_, *settings_, *log_);
   acceptor_->start();
 }
@@ -170,27 +178,66 @@ void QuickFixInputTransport::fromAdmin(const FIX::Message&, const FIX::SessionID
 void QuickFixInputTransport::fromApp(const FIX::Message& message, const FIX::SessionID& sessionId)
     QUICKFIX_THROW(FIX::FieldNotFound, FIX::IncorrectDataFormat, FIX::IncorrectTagValue,
                     FIX::UnsupportedMessageType) {
+  // NOTHING may escape this function.
+  //
+  // QUICKFIX_THROW expands to `noexcept` whenever QuickFIX is compiled
+  // as C++17 or later, so the exception specification in the signature
+  // above is a lie: an escaping FIX::FieldNotFound does not reach
+  // QuickFIX's handler, it calls std::terminate and takes the gateway
+  // down. A missing field in a client's message must never do that.
+  try {
+    fromAppGuarded(message, sessionId);
+  } catch (const FIX::Exception& e) {
+    std::fprintf(stderr, "[quickfix-gateway] dropped a malformed application message: %s\n",
+                 e.what());
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[quickfix-gateway] dropped an application message: %s\n", e.what());
+  }
+}
+
+void QuickFixInputTransport::fromAppGuarded(const FIX::Message& message,
+                                             const FIX::SessionID& sessionId) {
   const std::uint64_t id = idFor(sessionId);
+
+  // EVERY field lookup below is guarded with isSetField, and none of
+  // them is wrapped in a try. That is not defensive style, it is the
+  // only thing that works.
+  //
+  // FIX::Message::getField is declared QUICKFIX_THROW(FieldNotFound),
+  // and that macro expands to `noexcept` whenever QuickFIX is compiled
+  // as C++17 or later. So on a missing field getField does not throw a
+  // catchable exception -- it calls std::terminate INSIDE ITSELF,
+  // before any catch of ours can see it. A try/catch around it is
+  // structurally incapable of helping; this cost a crash and a
+  // debugging session to establish.
+  //
+  // The rule for this whole directory: never call a QuickFIX accessor
+  // that is documented to throw. Ask isSetField first.
+  FIX::MsgType msgType;
+  if (!message.getHeader().isSetField(msgType)) {
+    return;  // no MsgType: nothing sensible to do, and asking would kill us
+  }
+  message.getHeader().getField(msgType);
 
   // The same one exception the hffix gateway makes: MarketDataRequest
   // is a subscription, which is how §8.10's topic question is answered
   // FIX's own way. It is still passed to the codec afterwards.
-  FIX::MsgType msgType;
-  message.getHeader().getField(msgType);
   if (msgType.getValue() == FIX::MsgType_MarketDataRequest && onSubscribe_) {
-    try {
-      FIX::NoRelatedSym count;
-      message.getField(count);
-      for (int i = 1; i <= count.getValue(); ++i) {
-        FIX44::MarketDataRequest::NoRelatedSym group;
-        message.getGroup(static_cast<unsigned>(i), group);
-        FIX::Symbol symbol;
-        group.getField(symbol);
-        onSubscribe_(id, symbol.getValue());
+    // Symbols are read by scanning for tag 55 rather than through
+    // repeating-group accessors: the group API needs a data dictionary,
+    // this session runs without one (UseDataDictionary=N), and the
+    // gateway must not care how a client laid the request out. The
+    // hffix gateway scans for the same tag for the same reason.
+    const std::string raw = message.toString();
+    std::size_t pos = 0;
+    while ((pos = raw.find("\00155=", pos)) != std::string::npos) {
+      const std::size_t start = pos + 4;
+      const std::size_t soh = raw.find('\001', start);
+      if (soh == std::string::npos) {
+        break;
       }
-    } catch (const FIX::Exception&) {
-      // A malformed subscription is not worth dropping the session for;
-      // the codec still sees the message.
+      onSubscribe_(id, raw.substr(start, soh - start));
+      pos = soh;
     }
   }
 
@@ -234,7 +281,15 @@ bool QuickFixInputTransport::sendApplication(std::uint64_t sessionId, std::strin
     }
     pos = soh + 1;
   }
-  return FIX::Session::sendToTarget(message, *target);
+  // sendToTarget throws SessionNotFound if the session went away
+  // between the lookup above and here, which is a race the output
+  // thread must survive rather than die of.
+  try {
+    return FIX::Session::sendToTarget(message, *target);
+  } catch (const FIX::Exception& e) {
+    std::fprintf(stderr, "[quickfix-gateway] send failed: %s\n", e.what());
+    return false;
+  }
 }
 
 }  // namespace sequencer::quickfix
