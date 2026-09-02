@@ -135,6 +135,33 @@ struct Initiator {
            << "ConnectionType=initiator\n"
            << "ReconnectInterval=1\n"
            << "FileStorePath=\n"
+           // StartDay/EndDay are given even though this is a 24/7
+           // session and QuickFIX documents them as optional.
+           //
+           // SessionFactory::create() reads them inside a
+           // `catch(ConfigError&){}` precisely so they can be omitted --
+           // but Dictionary::getDay() is declared QUICKFIX_THROW(...),
+           // and that macro expands to `noexcept` whenever QuickFIX is
+           // itself compiled as C++17 or later:
+           //
+           //   #ifdef __cpp_noexcept_function_type
+           //   #define QUICKFIX_THROW(...) noexcept
+           //
+           // So on a toolchain whose default standard is C++17+, the
+           // ConfigError that signals "key absent" hits a noexcept
+           // boundary and calls std::terminate instead of being caught.
+           // That is why these four tests passed on a local vcpkg built
+           // by g++-10 (gnu++14) and aborted in CI, where vcpkg builds
+           // quickfix with the runner's default gcc-11 (gnu++17) --
+           // same library version, same port hash, different macro
+           // branch.
+           //
+           // Supplying both keys means getDay() never throws, so it does
+           // not matter which branch the macro took. Sunday-to-Sunday
+           // with equal times is QuickFIX's idiom for a week-long
+           // session, which is what StartTime==EndTime already meant.
+           << "StartDay=Sunday\n"
+           << "EndDay=Sunday\n"
            << "StartTime=00:00:00\n"
            << "EndTime=00:00:00\n"
            << "UseDataDictionary=N\n"
