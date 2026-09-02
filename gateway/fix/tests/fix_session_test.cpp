@@ -294,6 +294,79 @@ TEST(FixSession, SequenceNumbersSurviveAReconstruction) {
   EXPECT_EQ(revived.sequences().nextOutbound, 4u);
 }
 
+// The INITIATOR side of ResetSeqNumFlag, which the test below does not
+// cover and which no test covered until a real engine rejected us.
+//
+// FIX 4.4: with 141=Y both sides restart at 1 and the Logon exchange
+// ITSELF is sequence 1, so the initiator's next message is 2. Resetting
+// when the reply arrives instead -- which is what this session used to
+// do -- put the Logon on the wire at 1 and then set the outbound
+// counter back to 1, so the next message repeated sequence 1.
+//
+// Every test here passed anyway, because our acceptor made the same
+// mistake symmetrically: our client and our gateway agreed with each
+// other and disagreed with the rest of the world. Pointing the load
+// generator at a QuickFIX acceptor is what surfaced it -- QuickFIX
+// answered the repeated sequence number with "MsgSeqNum too low" and a
+// Logout, which is exactly right.
+TEST(FixSession, AnInitiatorsResetLogonLeavesTheNextMessageAtTwo) {
+  MemorySequenceStore store;
+  Clock clock;
+  Wire wire;
+
+  SessionConfig config;
+  config.role = Role::Initiator;
+  config.senderCompId = "CLIENT";
+  config.targetCompId = "VENUE";
+  config.resetSeqNumOnLogon = true;
+  // Stale counters from a previous session, which is the situation
+  // ResetSeqNumFlag exists for.
+  store.numbers_["CLIENT->VENUE"] = SequenceNumbers{.nextOutbound = 41, .nextInbound = 37};
+
+  FixSession session(config, store, [&clock] { return clock.now; });
+  session.setSendFn([&wire](std::string_view f) { wire(f); });
+  session.start();
+
+  ASSERT_FALSE(wire.frames.empty()) << "the initiator must send a Logon";
+  EXPECT_NE(wire.frames[0].find("\00134=1\001"), std::string::npos)
+      << "a reset Logon is sequence 1, not the stale counter's value";
+  EXPECT_NE(wire.frames[0].find("\001141=Y\001"), std::string::npos);
+
+  // A real acceptor produces the echo, rather than a hand-built frame:
+  // the reply's own sequence number is part of what is under test.
+  MemorySequenceStore acceptorStore;
+  Wire acceptorWire;
+  SessionConfig acceptorConfig;
+  acceptorConfig.role = Role::Acceptor;
+  acceptorConfig.senderCompId = "VENUE";
+  acceptorConfig.targetCompId = "CLIENT";
+  // The echo has to carry 141=Y, because that is what a real
+  // counterparty sends -- QuickFIX does -- and it is the field that
+  // triggers the initiator's reset path. Without it this test passes
+  // against the bug it exists to catch, which the first version did.
+  acceptorConfig.resetSeqNumOnLogon = true;
+  FixSession acceptor(acceptorConfig, acceptorStore, [&clock] { return clock.now; });
+  acceptor.setSendFn([&acceptorWire](std::string_view f) { acceptorWire(f); });
+  acceptor.start();
+  acceptor.onBytes(wire.frames[0]);
+  ASSERT_FALSE(acceptorWire.frames.empty()) << "the acceptor must echo the Logon";
+
+  session.onBytes(acceptorWire.frames[0]);
+
+  EXPECT_EQ(session.sequences().nextOutbound, 2u)
+      << "the Logon consumed sequence 1, so the next message is 2; going back to 1 "
+          "repeats a sequence number the counterparty has already seen and is fatal";
+  EXPECT_EQ(session.sequences().nextInbound, 2u)
+      << "their Logon was sequence 1, so the next inbound expected is 2";
+
+  // And the next message on the wire must actually carry 2.
+  wire.frames.clear();
+  session.sendApplication("U1", "5001=7\001");
+  ASSERT_FALSE(wire.frames.empty());
+  EXPECT_NE(wire.frames[0].find("\00134=2\001"), std::string::npos)
+      << "the first application message after a reset Logon is sequence 2";
+}
+
 TEST(FixSession, ResetSeqNumFlagOnLogonResetsBothCounters) {
   // End-of-day reset, as it actually happens: the session drops, and
   // the initiator reconnects with 141=Y against an acceptor whose

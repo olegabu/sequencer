@@ -4,6 +4,7 @@
 #include <quickfix/Values.h>
 #include <quickfix/fix44/MarketDataRequest.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>

@@ -196,6 +196,27 @@ void FixSession::start() {
   lastReceivedUs_ = clock_();
   lastSentUs_ = clock_();
   if (config_.role == Role::Initiator) {
+    // The reset happens BEFORE the Logon goes out, not when the reply
+    // comes back.
+    //
+    // FIX 4.4: with ResetSeqNumFlag=Y both sides restart at 1 and the
+    // Logon exchange ITSELF is sequence 1, so the next message is 2.
+    // Resetting on the reply instead -- which is what this did -- put
+    // the Logon on the wire at 1 and then set the outbound counter back
+    // to 1, so the very next message repeated sequence 1 and any
+    // counterparty logged us out for a sequence number below its
+    // expectation.
+    //
+    // It went unnoticed because both ends of this repository make the
+    // same mistake symmetrically: our acceptor also reset to 1 after
+    // the exchange, so our client and our gateway agreed with each
+    // other and disagreed with everyone else. Pointing the load
+    // generator at a real QuickFIX acceptor is what exposed it.
+    if (config_.resetSeqNumOnLogon) {
+      sequences_.nextInbound = 1;
+      sequences_.nextOutbound = 1;
+      persist();
+    }
     sendLogon();
     state_ = State::LogonSent;
   } else {
@@ -408,7 +429,12 @@ void FixSession::handleLogon(const hffix::message_reader& message) {
     return;
   }
 
-  if (isTrue(field(message, hffix::tag::ResetSeqNumFlag))) {
+  // Only an ACCEPTOR resets here. An initiator that asked for the reset
+  // already did it before sending its Logon (see start()); resetting
+  // again on the echoed reply would undo the sequence number its own
+  // Logon consumed, and put the next message back at 1.
+  if (config_.role == Role::Acceptor &&
+      isTrue(field(message, hffix::tag::ResetSeqNumFlag))) {
     sequences_.nextInbound = 1;
     sequences_.nextOutbound = 1;
     persist();
