@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # examples/counter/demo_grpc.sh — the real-gRPC counterpart to
-# demo_rest_websocket.sh: the same single-node raft group, but
+# demo_http_websocket.sh: the same single-node raft group, but
 # submission and dissemination both go over real gRPC
 # (grpc-go/grpc-java/grpcurl-compatible, unlike brpc's own Streaming
 # RPC), driven entirely by grpcurl — no brpc, no custom client code, no
@@ -10,7 +10,7 @@
 # READ THIS BEFORE COMPARING THE TWO DEMOS. They differ on TWO axes at
 # once, and only one of them is in this script's name:
 #
-#                    demo_rest_websocket.sh      demo_grpc.sh
+#                    demo_http_websocket.sh      demo_grpc.sh
 #   input gateway    generic chassis, opaque     typed, own schema
 #   submit wire      HTTP + JSON (curl)          gRPC (grpcurl)
 #   output transport WebSocket                   real gRPC
@@ -25,7 +25,7 @@
 # Two parallel patterns, on purpose (see README.md for the tradeoff):
 #   - Output: sequencer::GrpcOutputTransport (gateway/output/) — the
 #     *generic*, reusable gRPC OutputTransport, "just like" the
-#     WebSocket one demo_rest_websocket.sh uses. It wraps whatever
+#     WebSocket one demo_http_websocket.sh uses. It wraps whatever
 #     bytes CounterOutputCodec already produces (the same JSON that
 #     demo shows you over WebSocket) in a generic bytes envelope — so
 #     grpcurl prints it base64-encoded, which this script decodes for
@@ -152,7 +152,7 @@ echo "   JSON mapping for a \"bytes\" field, not something specific to this tran
 cat "$DATA_DIR/grpc_output.log"
 
 echo
-echo "== decoded payloads (the same JSON demo_rest_websocket.sh's WebSocket path shows you) =="
+echo "== decoded payloads (the same JSON demo_http_websocket.sh's WebSocket path shows you) =="
 python3 - "$DATA_DIR/grpc_output.log" <<'PYEOF'
 import base64
 import json

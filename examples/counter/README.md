@@ -79,7 +79,7 @@ dependency now instead of a private one.
 
 ## The gRPC alternative: two patterns, one for each side
 
-`demo_grpc.sh` is the real-gRPC counterpart to `demo_rest_websocket.sh` — same
+`demo_grpc.sh` is the real-gRPC counterpart to `demo_http_websocket.sh` — same
 single-node raft group, but submission and dissemination both go over
 the real, standard C++ gRPC library instead of brpc/WebSocket, driven
 entirely by `grpcurl`. It shows two deliberately different patterns,
@@ -463,10 +463,10 @@ path is quoted as sub-millisecond.
 
 ## Seeing it in action
 
-### The fastest way: `demo_rest_websocket.sh`
+### The fastest way: `demo_http_websocket.sh`
 
 ```sh
-./examples/counter/demo_rest_websocket.sh
+./examples/counter/demo_http_websocket.sh
 ```
 
 Starts a real single-node raft group, a real input gateway, and a real
@@ -554,7 +554,7 @@ reporting the submission-to-synchronous-receipt round trip
   --input_gateway_addr=127.0.0.1:8200 --mode=open --rate=50 --warmup=2 --measure=5
 ```
 
-with `curl` and `websocat` exactly as `demo_rest_websocket.sh` does (see its
+with `curl` and `websocat` exactly as `demo_http_websocket.sh` does (see its
 `SubmitService/Submit` URL, its `-n`/`--no-close` flag, and its
 `/totals` path on the WebSocket URL — `WebSocketOutputTransport` routes
 a connecting client's topic from the URL path, so `ws://host:port/`

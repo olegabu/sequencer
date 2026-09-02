@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# examples/counter/demo_rest_websocket.sh — a live, external-tools walkthrough of the
+# examples/counter/demo_http_websocket.sh — a live, external-tools walkthrough of the
 # whole pipeline (specification.md §10): a real single-node raft group,
 # a real input gateway, a real output gateway, driven entirely by tools
 # outside this repository — curl for submission, websocat for
@@ -17,10 +17,14 @@
 # Named for the two protocols it drives, not left unmarked as the one
 # that happened to exist first: it submits over plain HTTP with a JSON
 # body and receives over WebSocket. Its counterpart is demo_grpc.sh.
-# ("REST" here is the colloquial HTTP+JSON sense -- the submit endpoint
-# is a single POST, not a resource hierarchy.)
 #
-# Usage: examples/counter/demo_rest_websocket.sh [build_dir]   (default: build/debug)
+# HTTP, not REST. This was demo_rest_websocket.sh, which overclaimed:
+# the submit endpoint is a single POST of {"delta": N}, with no resource
+# hierarchy, no verbs beyond POST and nothing hypertext-driven. What
+# brpc gives us here is HTTP with a JSON body, and calling it REST
+# invited a reader to expect an interface this does not implement.
+#
+# Usage: examples/counter/demo_http_websocket.sh [build_dir]   (default: build/debug)
 
 set -euo pipefail
 
