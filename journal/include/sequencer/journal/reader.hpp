@@ -14,6 +14,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -184,12 +186,49 @@ class JournalReader {
   // segment did not go anywhere, and a record whose existence the
   // committed count already promised cannot become unreadable.
   Segment openSegment(std::uint64_t segment) const {
+    // Timed because this is the reader's counterpart to the writer's
+    // roll, and the writer's roll turned out to own the tail. A tailing
+    // gateway must open and map each new segment as the writer reaches
+    // it -- exists() probes, two mmaps, and on a lost race a retry loop
+    // -- and it does so on the very thread that delivers records. Off
+    // unless SEQ_SEGMENT_OPEN_US is set; off reads no clock.
+    static const char* const kEnv = std::getenv("SEQ_SEGMENT_OPEN_US");
+    static const std::int64_t kThresholdUs = kEnv != nullptr ? std::atoll(kEnv) : 0;
+    const auto openStart = kThresholdUs > 0 ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+    struct Report {
+      const std::int64_t threshold;
+      const std::chrono::steady_clock::time_point start;
+      std::uint64_t segment;
+      int attempts = 0;
+      ~Report() {
+        if (threshold <= 0) {
+          return;
+        }
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+        if (us >= threshold) {
+          const auto wall = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+          std::fprintf(stderr,
+                       "[segment-open] t=%lld.%06lld segment=%llu attempts=%d took=%lldus\n",
+                       static_cast<long long>(wall / 1000000),
+                       static_cast<long long>(wall % 1000000),
+                       static_cast<unsigned long long>(segment), attempts,
+                       static_cast<long long>(us));
+        }
+      }
+    } report{kThresholdUs, openStart, segment, 0};
+
     const std::uint64_t first = segment * recordsPerSegment_ + 1;
     const std::string sealed = sealedSegmentStem(first, first + recordsPerSegment_ - 1);
     const std::string open = openSegmentStem(first);
 
     constexpr int kAttempts = 100;
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
+      report.attempts = attempt + 1;
       bool isSealed = true;
       for (const std::string& stem : {sealed, open}) {
         const bool sealedName = isSealed;

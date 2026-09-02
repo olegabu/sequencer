@@ -101,6 +101,18 @@ struct ProposerMetrics {
   // -- the same run's own numbers imply batches of 3-4 there.
   bvar::IntRecorder batchSizeRaw;
   bvar::Window<bvar::IntRecorder> batchSize{"input_gateway_batch_size", &batchSizeRaw, -1};
+  // The other half of the split queueDelayUs exists to make: once a
+  // batch is on the wire, how long the raft group takes to commit it
+  // and answer. queueDelayUs says "waiting for a slot"; this says
+  // "waiting for the group", and the two together account for a
+  // proposal's whole life inside the gateway.
+  //
+  // Added while chasing a tail that survives the journal fix: the apply
+  // thread, braft's append-entry RPCs, braft's own log roll, device
+  // writeback and this queue were each measured and each excluded, all
+  // of them well under the 8-60ms the client sees. This was the one
+  // span left unmeasured.
+  bvar::LatencyRecorder rpcLatencyUs{"input_gateway_propose_rpc_us"};
   bvar::Maxer<int> queueDepthMax{"input_gateway_queue_depth_max"};
   bvar::PassiveStatus<int> queueDepthNow{"input_gateway_queue_depth", readQueueDepth, nullptr};
   bvar::PassiveStatus<int> batchesInFlightNow{"input_gateway_batches_in_flight",
@@ -361,6 +373,12 @@ class NodeProposer {
   }
 
   static void onBatchDone(NodeProposer* self, std::shared_ptr<BatchContext> ctx) {
+    // brpc's own measurement of the call, so it covers the wire, the
+    // node's server queue, consensus and the reply. Recorded before the
+    // retry paths below, which reissue on a fresh Controller.
+    if (!ctx->cntl.Failed()) {
+      ProposerMetrics::instance().rpcLatencyUs << ctx->cntl.latency_us();
+    }
     if (ctx->cntl.Failed()) {
       ctx->target = self->nextEndpoint(ctx->endpointIndex);
       self->issueBatch(ctx);

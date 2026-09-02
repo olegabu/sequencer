@@ -107,6 +107,20 @@ class OutputGatewayImpl {
       b.transport->start(b.listenPort);
     }
     tailThread_ = std::thread([this] { tailLoop(); });
+    // Writes the resume position on its own thread, on the same cadence
+    // the tail loop used to write it on: at most every 200ms, and only
+    // when it has moved. Nothing here is on a request's path.
+    persistThread_ = std::thread([this] {
+      std::uint64_t written = 0;
+      while (!stopRequested_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const std::uint64_t seq = pendingResume_.load(std::memory_order_relaxed);
+        if (seq != written) {
+          resumePosition_.store(seq);
+          written = seq;
+        }
+      }
+    });
     started_ = true;
   }
 
@@ -114,6 +128,9 @@ class OutputGatewayImpl {
     stopRequested_.store(true, std::memory_order_relaxed);
     if (tailThread_.joinable()) {
       tailThread_.join();
+    }
+    if (persistThread_.joinable()) {
+      persistThread_.join();
     }
     // The tailing thread only persists periodically now (see
     // tailLoop()'s own comment) — one final, unconditional persist
@@ -190,14 +207,24 @@ class OutputGatewayImpl {
     std::uint64_t seq = resumePosition_.load();
     nextSeq_.store(seq, std::memory_order_relaxed);
     std::unique_ptr<journal::JournalReader> reader;
-    std::uint64_t persistedThrough = seq;
-    auto lastPersist = std::chrono::steady_clock::now();
+    pendingResume_.store(seq, std::memory_order_relaxed);
     sequencer::IdleStrategy idle(config_.idleSpinIterations);
     // Same lesson as the FIX ring reader: this loop spins, and timing
     // every iteration unconditionally made clock_gettime the single
     // largest CPU consumer in the process (47.8% on a profile) while
     // inflating the wait% it reported. No clock is read unless asked.
     const bool timed = std::getenv("FIX_STAGE_TIMERS") != nullptr;
+    // Report a record that took too long to get from "committed in the
+    // journal" to "published on the ring", or too long a gap since the
+    // previous one. This is the last span between a client's request and
+    // its reply that nothing measured: the proposer queue, the propose
+    // RPC, the apply thread, braft's replication and log roll, the
+    // reader's segment open and the client's own correlator were each
+    // instrumented and each came back well inside the 8-123ms the client
+    // sees. Off unless SEQ_TAIL_STALL_US is set; off reads no clock.
+    const char* const stallEnv = std::getenv("SEQ_TAIL_STALL_US");
+    const std::int64_t stallUs = stallEnv != nullptr ? std::atoll(stallEnv) : 0;
+    std::chrono::steady_clock::time_point lastPublish{};
     while (!stopRequested_.load(std::memory_order_relaxed)) {
       if (!reader) {
         try {
@@ -238,10 +265,33 @@ class OutputGatewayImpl {
       int processed = 0;
       while (processed < kMaxBurst && reader->contains(seq) &&
              !stopRequested_.load(std::memory_order_relaxed)) {
-        const auto codecStart = timed ? std::chrono::steady_clock::now()
-                                      : std::chrono::steady_clock::time_point{};
+        const bool measure = timed || stallUs > 0;
+        const auto codecStart = measure ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
         ringFanout_.beginRecord(seq);
         codec_->toOutput(reader->record(seq), ringFanout_);
+        if (stallUs > 0) {
+          const auto done = std::chrono::steady_clock::now();
+          const std::int64_t workUs =
+              std::chrono::duration_cast<std::chrono::microseconds>(done - codecStart).count();
+          const std::int64_t gapUs =
+              lastPublish.time_since_epoch().count() == 0
+                  ? 0
+                  : std::chrono::duration_cast<std::chrono::microseconds>(done - lastPublish)
+                        .count();
+          lastPublish = done;
+          if (workUs >= stallUs || gapUs >= stallUs) {
+            const auto wall = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+            std::fprintf(stderr,
+                         "[tail-stall] t=%lld.%06lld seq=%llu gap=%lldus codec_publish=%lldus\n",
+                         static_cast<long long>(wall / 1000000),
+                         static_cast<long long>(wall % 1000000),
+                         static_cast<unsigned long long>(seq),
+                         static_cast<long long>(gapUs), static_cast<long long>(workUs));
+          }
+        }
         if (timed) {
           tailCodecNs_ += static_cast<std::uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -288,12 +338,24 @@ class OutputGatewayImpl {
       // AfterRestartWithoutRedelivering's own guarantee stays exactly
       // true for a normal restart; only an ungraceful crash can now
       // redeliver, bounded to at most one batch's worth of records.
-      const auto now = std::chrono::steady_clock::now();
-      if (seq - persistedThrough >= 1000 || now - lastPersist >= std::chrono::milliseconds(200)) {
-        resumePosition_.store(seq);
-        persistedThrough = seq;
-        lastPersist = now;
-      }
+      // Handed to a background thread, never written here.
+      //
+      // ResumePosition::store() creates a temp file, writes it, closes
+      // it and renames -- and "every 1000 records" is every 5ms at
+      // 200k, so this thread was doing ~200 file create/write/rename
+      // cycles a second between bursts of delivery. Measured with
+      // SEQ_TAIL_STALL_US: the codec and ring publish take 1-6us while
+      // the GAP between successive publishes reached 5-77ms, and the
+      // stalls landed exactly kMaxBurst records apart. That is the same
+      // mistake as doing a segment roll on the apply thread, one layer
+      // out: durable file I/O on the thread with the latency budget.
+      //
+      // A relaxed store is all this needs. The persister reads whatever
+      // is current on its own cadence; a value it misses is superseded
+      // by the next one, and stop() still does the final synchronous
+      // persist that ResumesFromDurablePositionAfterRestartWithout-
+      // Redelivering depends on.
+      pendingResume_.store(seq, std::memory_order_relaxed);
     }
   }
 
@@ -317,6 +379,11 @@ class OutputGatewayImpl {
   std::chrono::steady_clock::time_point lastTailReport_ = std::chrono::steady_clock::now();
   std::atomic<std::uint64_t> nextSeq_{1};  // mirrors tailLoop()'s own seq, readable from stop()
   std::thread tailThread_;
+  std::thread persistThread_;
+  // Latest position the tail loop has published; the persister writes
+  // it. Relaxed on both sides: it is a recovery hint, and a missed
+  // update is superseded by the next one.
+  std::atomic<std::uint64_t> pendingResume_{0};
   std::atomic<bool> stopRequested_{false};
   bool started_ = false;
 };
