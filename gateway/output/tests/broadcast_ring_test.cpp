@@ -215,8 +215,21 @@ TEST(BroadcastRing, LappedReaderSeesOverrunsButNeverTornPayloads) {
   std::atomic<bool> producerDone{false};
   std::atomic<bool> failed{false};
   std::atomic<std::uint64_t> overruns{0};
-  std::thread readerThread([&] {
-    std::uint64_t cursor = ring.head();
+  // The cursor starts HERE, on this thread, before a single entry is
+  // published -- not inside the reader.
+  //
+  // Reading ring.head() in the reader body makes the starting position
+  // depend on how fast the thread gets scheduled, and it reliably loses
+  // that race: over 24 concurrent runs on a loaded 4-core box the
+  // reader started at 0 exactly zero times, at a median of ~50k, and
+  // TWICE at 100000 -- past the producer's entire run. A reader that
+  // starts past the end sees Empty, finds producerDone already set,
+  // and returns having been lapped never, so the overruns assertion
+  // below fails. That is the flake this test showed under full-suite
+  // load, and it was in the test, not the ring.
+  const std::uint64_t startCursor = ring.head();
+  std::thread readerThread([&, startCursor] {
+    std::uint64_t cursor = startCursor;
     std::vector<std::byte> buf(ring.maxPayload());
     IdleStrategy idle(1000);
     while (!failed.load(std::memory_order_relaxed)) {

@@ -34,7 +34,7 @@ CTEST_FLAGS += -R "$(TEST_FILTER)"
 endif
 
 .PHONY: help all check-vcpkg-root configure build test clean prune distclean \
-        debug test-debug \
+        preflight debug test-debug \
         release test-release \
         tsan test-tsan \
         benchmark demo
@@ -46,6 +46,8 @@ endif
 
 help:
 	@echo "Targets (default preset: $(PRESET); override with PRESET=release|tsan):"
+	@echo "  make preflight         build+test the DEBUG preset, exactly as CI does"
+	@echo "                         (run this before pushing; release+LTO hides link errors)"
 	@echo "  make configure         cmake --preset \$$(PRESET)"
 	@echo "  make build             configure, then cmake --build --preset \$$(PRESET)"
 	@echo "  make test              build, then ctest --preset \$$(PRESET) --output-on-failure"
@@ -96,6 +98,28 @@ build: configure
 
 test: build
 	ctest --preset $(PRESET) $(CTEST_FLAGS)
+
+# What CI runs, run locally, before you push.
+#
+# CI builds the DEBUG preset. Fleet work builds the RELEASE preset,
+# because that is what gets measured — and release links with LTO,
+# which silently FOLDS duplicate symbols that debug rejects. A gflag
+# defined in both a static library and a binary therefore linked
+# cleanly here and failed there, twice, an hour after each push. Local
+# green was never evidence about CI unless it was green in CI's own
+# configuration.
+#
+# Deliberately not a pre-push git hook: this takes tens of minutes, and
+# a hook that slow gets bypassed with --no-verify until it means
+# nothing. It is a target you run when you are about to push, and the
+# one command whose output settles the question.
+.PHONY: preflight
+preflight:
+	@echo "== preflight: exactly what .github/workflows/ci.yml runs =="
+	cmake --preset debug
+	cmake --build --preset debug
+	ctest --preset debug --output-on-failure
+	@echo "== preflight passed: build and tests are green in CI's configuration =="
 
 # Named shortcuts — the three presets this project defines.
 debug:

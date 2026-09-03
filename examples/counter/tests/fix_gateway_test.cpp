@@ -150,6 +150,17 @@ struct GatewayUnderTest {
   bool needsClientCompIds;
 };
 
+// Without this, gtest falls back to dumping the struct's raw bytes, and
+// --gtest_list_tests annotates each case with
+//   # GetParam() = 24-byte object <B5-D9 7D-A3 ...>
+// CMake's gtest_discover_tests parses that listing to name its ctest
+// entries and picks up the byte dump, so both cases appear in `ctest
+// -N` under names that contain live POINTER VALUES -- different on
+// every run under ASLR. The tests themselves are filtered by the
+// correct name and do run; it is the ctest-side names that are
+// unusable, which makes `ctest -R` unable to target them and CI's test
+// list gratuitously nondeterministic.
+inline void PrintTo(const GatewayUnderTest& gateway, std::ostream* os) { *os << gateway.name; }
 
 class CounterFixGatewayEndToEnd : public ::testing::TestWithParam<GatewayUnderTest> {};
 
