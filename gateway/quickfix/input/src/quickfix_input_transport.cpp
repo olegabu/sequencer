@@ -81,6 +81,30 @@ void QuickFixInputTransport::start(int listenPort) {
          << "EndDay=Sunday\n"
          << "StartTime=00:00:00\n"
          << "EndTime=00:00:00\n"
+         // All FOUR probe blocks, not just the first.
+         //
+         // The previous fix here supplied StartDay/EndDay, which is
+         // the first of four separate `catch(ConfigError&){}` probes
+         // in SessionFactory::create(); CI simply advanced to the
+         // next one and aborted on "LogonDay not defined" instead.
+         // Fixing one key at a time turns a single toolchain
+         // difference into one red CI run per key, an hour apart, so
+         // here is the whole set that file probes:
+         //
+         //   START_DAY, END_DAY
+         //   START_TIME, END_TIME, HEARTBTINT, LOGON_DAY, LOGOUT_DAY
+         //   LOGON_TIME
+         //   LOGOUT_TIME
+         //
+         // The logon/logout values below are exactly the fallbacks
+         // QuickFIX itself would have used (logonDay = startDay,
+         // logonTime = startTime, and likewise for logout), so
+         // stating them changes no behaviour -- it only removes the
+         // chance to throw.
+         << "LogonDay=Sunday\n"
+         << "LogoutDay=Sunday\n"
+         << "LogonTime=00:00:00\n"
+         << "LogoutTime=00:00:00\n"
          << "UseDataDictionary=N\n"
          << "ValidateUserDefinedFields=N\n"
          << "ResetOnLogon=N\n"
@@ -103,7 +127,44 @@ void QuickFixInputTransport::start(int listenPort) {
          // the correct fix is application-level write coalescing inside
          // the gateway, not turning Nagle off underneath a library that
          // does not coalesce.
+         //
+         // That coalescing is NOT AVAILABLE through QuickFIX 1.15.1's
+         // public API, which was checked in the headers rather than
+         // assumed:
+         //
+         //   - Session::m_pResponder is private and has no getter, so a
+         //     buffering Responder cannot be installed around the
+         //     connection's own -- setResponder() is public, but there
+         //     is no way to read the pointer you would have to forward
+         //     to.
+         //   - Session::send(const std::string&) is private, so a
+         //     pre-framed batch cannot be handed in.
+         //   - ThreadedSocketAcceptor declares everything but its
+         //     destructor private: there is no hook on connection
+         //     creation.
+         //   - Acceptor's only virtuals are onStart/onPoll/onStop, so
+         //     subclassing it means writing the socket layer ourselves
+         //     -- which is precisely the layer this gateway exists to
+         //     delegate to QuickFIX.
+         //   - The only transport settings are SocketNodelay and the
+         //     two socket buffer sizes. None of them coalesce.
+         //
+         // So the choice here is binary, not a temporary state pending
+         // a coalescing patch, and Nagle-on is the measured better half
+         // of it. gateway/fix/ is the gateway that CAN coalesce, and
+         // does (SessionSource::beginBatch/endBatch); that difference
+         // is one of the more interesting things the two
+         // implementations say about each other.
+         //
+         // Set QUICKFIX_SOCKET_NODELAY=1 to take the other half of the
+         // trade, so the A/B above can be re-measured on current code
+         // rather than trusted from this comment.
          ;
+  // Appended before the [SESSION] blocks below, so it lands in the
+  // DEFAULT section where QuickFIX reads it.
+  if (std::getenv("QUICKFIX_SOCKET_NODELAY") != nullptr) {
+    config << "SocketNodelay=Y\n";
+  }
   for (const std::string& client : config_.clientCompIds) {
     config << "[SESSION]\n"
            << "BeginString=FIX.4.4\n"
@@ -113,6 +174,9 @@ void QuickFixInputTransport::start(int listenPort) {
   }
 
   settings_ = std::make_unique<FIX::SessionSettings>(config);
+  // Fails here, loudly and locally, rather than as a std::terminate in
+  // CI an hour after the push.
+  requireSchedulingKeys(settings_->get());
   // QUICKFIX_SCREEN_LOG=1 puts every message on stderr. Off by
   // default -- at rate this would flood a gateway -- but it is the only
   // way to see what QuickFIX was processing when something inside it

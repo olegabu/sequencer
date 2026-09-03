@@ -128,6 +128,36 @@ the key can be optional — and on a C++17 build that catch is
 unreachable. The session configuration here supplies `StartDay`/`EndDay`
 for that reason, not because a 24-hour session needs them.
 
+**And then it did it again.** That fix supplied the keys of the *first*
+such probe; `SessionFactory::create()` has four, and CI advanced to the
+next one and aborted on "LogonDay not defined" instead — a second red
+run, an hour later, for the same root cause. So the rule is not "add
+the key the error names", it is **supply every setting QuickFIX probes
+optionally**:
+
+| probe block | keys |
+|---|---|
+| 1 | `StartDay`, `EndDay` |
+| 2 | `StartTime`, `EndTime`, `HeartBtInt`, `LogonDay`, `LogoutDay` |
+| 3 | `LogonTime` |
+| 4 | `LogoutTime` |
+
+The logon/logout values are exactly QuickFIX's own fallbacks
+(`logonDay = startDay`, `logonTime = startTime`, likewise for logout),
+so stating them changes no behaviour — it only removes the opportunity
+to throw.
+
+`requireSchedulingKeys()` in `quickfix_input_transport.hpp` enforces
+this on every `SessionSettings` the repository builds, and both config
+sites call it. That matters because **this bug cannot reproduce on a
+developer machine**: whether the macro takes the `noexcept` branch
+depends on the compiler *vcpkg* used to build quickfix, not the one
+building this repo. Locally that was g++-9/10 defaulting to `gnu++14`,
+so the catch worked and every test passed; CI's runner defaults to
+`gnu++17`, so it terminated. Same library version, same port hash,
+different macro branch. The guard turns a remote `std::terminate` into
+a local exception naming the missing key.
+
 A library being battle-tested is a claim about its protocol logic. It is
 not a claim about its build hygiene.
 

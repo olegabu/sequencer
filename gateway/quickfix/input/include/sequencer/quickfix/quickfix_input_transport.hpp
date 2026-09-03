@@ -27,6 +27,8 @@
 #include <quickfix/Session.h>
 #include <quickfix/SessionID.h>
 #include <quickfix/SessionSettings.h>
+
+#include <stdexcept>
 #include <quickfix/ThreadedSocketAcceptor.h>
 
 #include <sequencer/fix/session_source.hpp>
@@ -43,6 +45,46 @@
 #include <vector>
 
 namespace sequencer::quickfix {
+
+// The settings QuickFIX documents as OPTIONAL but cannot safely omit.
+//
+// SessionFactory::create() reads each of these inside a
+// `catch(ConfigError&){}`, so that an absent key is ignored. But the
+// accessors are declared QUICKFIX_THROW(...), which expands to
+// `noexcept` when QuickFIX is itself built as C++17 or later -- and
+// then the ConfigError meaning "key absent" hits a noexcept boundary
+// and calls std::terminate INSIDE the accessor, where no catch can
+// reach it. See gateway/quickfix/README.md, "The QUICKFIX_THROW
+// landmine".
+//
+// Whether that happens depends on the compiler vcpkg happened to build
+// quickfix with, which differs between a developer's machine and CI --
+// so a config missing one of these runs fine locally and aborts there,
+// an hour later. This check turns that into a clear local failure.
+inline constexpr const char* kRequiredSchedulingKeys[] = {
+    "StartDay", "EndDay", "StartTime", "EndTime",
+    "LogonDay", "LogoutDay", "LogonTime", "LogoutTime",
+};
+
+// Throws std::runtime_error naming every missing key. Call it on the
+// DEFAULT dictionary of any SessionSettings this repository builds.
+inline void requireSchedulingKeys(const FIX::Dictionary& defaults) {
+  std::string missing;
+  for (const char* key : kRequiredSchedulingKeys) {
+    if (!defaults.has(key)) {
+      missing += (missing.empty() ? "" : ", ");
+      missing += key;
+    }
+  }
+  if (!missing.empty()) {
+    throw std::runtime_error(
+        "QuickFIX session settings omit key(s) that SessionFactory probes inside a "
+        "catch(ConfigError&): " + missing +
+        ". On a toolchain where QUICKFIX_THROW expands to noexcept this aborts the "
+        "process instead of being caught. Supply them; QuickFIX's own fallback values "
+        "(logon=start, logout=end) change no behaviour.");
+  }
+}
 
 struct QuickFixInputConfig {
   std::string senderCompId = "SEQUENCER";

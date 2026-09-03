@@ -254,6 +254,30 @@ struct Initiator {
            << "EndDay=Sunday\n"
            << "StartTime=00:00:00\n"
            << "EndTime=00:00:00\n"
+           // All FOUR probe blocks, not just the first.
+           //
+           // The previous fix here supplied StartDay/EndDay, which is
+           // the first of four separate `catch(ConfigError&){}` probes
+           // in SessionFactory::create(); CI simply advanced to the
+           // next one and aborted on "LogonDay not defined" instead.
+           // Fixing one key at a time turns a single toolchain
+           // difference into one red CI run per key, an hour apart, so
+           // here is the whole set that file probes:
+           //
+           //   START_DAY, END_DAY
+           //   START_TIME, END_TIME, HEARTBTINT, LOGON_DAY, LOGOUT_DAY
+           //   LOGON_TIME
+           //   LOGOUT_TIME
+           //
+           // The logon/logout values below are exactly the fallbacks
+           // QuickFIX itself would have used (logonDay = startDay,
+           // logonTime = startTime, and likewise for logout), so
+           // stating them changes no behaviour -- it only removes the
+           // chance to throw.
+           << "LogonDay=Sunday\n"
+           << "LogoutDay=Sunday\n"
+           << "LogonTime=00:00:00\n"
+           << "LogoutTime=00:00:00\n"
            << "UseDataDictionary=N\n"
            << "ValidateUserDefinedFields=N\n"
            << "[SESSION]\n"
@@ -264,6 +288,10 @@ struct Initiator {
            << "SocketConnectPort=" << port << "\n"
            << "HeartBtInt=" << heartBtInt << "\n";
     settings = std::make_unique<FIX::SessionSettings>(config);
+    // Same guard the gateway applies to its own settings: this config
+    // is the one that aborted CI, and the check makes a missing key a
+    // local failure instead of a remote std::terminate.
+    sequencer::quickfix::requireSchedulingKeys(settings->get());
     store = std::make_unique<FIX::MemoryStoreFactory>();
     log = std::getenv("FIX_SCREEN_LOG") ? std::unique_ptr<FIX::LogFactory>(new FIX::ScreenLogFactory(true, true, true))
                                        : std::unique_ptr<FIX::LogFactory>(new NullLogFactory());
