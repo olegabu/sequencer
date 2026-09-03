@@ -53,9 +53,20 @@ add_library(sequencer::quickfix_output ALIAS sequencer_quickfix_output)
 target_include_directories(sequencer_quickfix_output PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/output/include>"
 )
+# output_codec_api, NOT gateway_output: the latter also contains
+# run_output_gateway.cpp, whose DEFINE_string(data_dir, ...) and
+# DEFINE_string(resume_file, ...) are program-level gflags at namespace
+# scope. counter_quickfix_gateway defines both flags for itself, so
+# pulling that object in gave two definitions of one symbol and CI's
+# linker refused it -- the same failure this directory's neighbour
+# documents at gateway/output/CMakeLists.txt, hit again by new code.
+#
+# It went unnoticed locally because the release preset builds with LTO,
+# which folded the duplicate; only the debug preset CI uses reproduces
+# it. `cmake --build --preset debug` is the check that matters here.
 target_link_libraries(sequencer_quickfix_output PUBLIC
   sequencer::quickfix_input
-  sequencer::gateway_output
+  sequencer::output_codec_api
 )
 target_compile_features(sequencer_quickfix_output PUBLIC cxx_std_20)
 
