@@ -217,7 +217,7 @@ void FixSession::start() {
       sequences_.nextOutbound = 1;
       persist();
     }
-    sendLogon();
+    sendLogon(config_.resetSeqNumOnLogon);
     state_ = State::LogonSent;
   } else {
     state_ = State::AwaitingLogon;
@@ -433,8 +433,8 @@ void FixSession::handleLogon(const hffix::message_reader& message) {
   // already did it before sending its Logon (see start()); resetting
   // again on the echoed reply would undo the sequence number its own
   // Logon consumed, and put the next message back at 1.
-  if (config_.role == Role::Acceptor &&
-      isTrue(field(message, hffix::tag::ResetSeqNumFlag))) {
+  const bool peerAskedForReset = isTrue(field(message, hffix::tag::ResetSeqNumFlag));
+  if (config_.role == Role::Acceptor && peerAskedForReset) {
     sequences_.nextInbound = 1;
     sequences_.nextOutbound = 1;
     persist();
@@ -462,7 +462,21 @@ void FixSession::handleLogon(const hffix::message_reader& message) {
   // closed the gap can never be requested. checkSequence() still
   // rejects a number that is too LOW, which remains fatal.
   if (config_.role == Role::Acceptor) {
-    sendLogon();  // the echo
+    // FIX 4.4 requires the confirming Logon to ECHO ResetSeqNumFlag=Y
+    // when the initiator asked for the reset. We used to emit the flag
+    // only when our OWN config requested resets, which is a different
+    // question: an acceptor configured without resets performed the
+    // reset the initiator asked for and then confirmed it with a Logon
+    // that said nothing about it. A conforming initiator reads that
+    // silence as "reset refused", keeps its pre-reset outbound
+    // counter, and the next message it sends is far above the 1 we
+    // just reset to.
+    //
+    // Our own client never noticed because it does not check the echo.
+    // Interoperating with QuickFIX, which does, is what makes it
+    // matter -- and is why the conformance suite now asserts on the
+    // flag rather than on the sequence numbers alone.
+    sendLogon(peerAskedForReset);  // the echo
   }
   state_ = State::LoggedOn;
   if (onEvent_) {
@@ -659,11 +673,11 @@ std::uint64_t FixSession::emit(std::string_view msgType,
   return seqNum;
 }
 
-void FixSession::sendLogon() {
+void FixSession::sendLogon(bool resetSeqNumFlag) {
   emit("A", [&](hffix::message_writer& writer) {
     writer.push_back_int(hffix::tag::EncryptMethod, 0);
     writer.push_back_int(hffix::tag::HeartBtInt, config_.heartBtInt);
-    if (config_.resetSeqNumOnLogon) {
+    if (resetSeqNumFlag) {
       writer.push_back_string(hffix::tag::ResetSeqNumFlag, "Y");
     }
   });

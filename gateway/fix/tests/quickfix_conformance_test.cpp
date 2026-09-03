@@ -103,6 +103,16 @@ class ConformanceApp : public FIX::Application {
     if (type == FIX::MsgType_Logout) {
       logoutMessages.fetch_add(1);
     }
+    if (type == FIX::MsgType_Logon) {
+      logonsReceived.fetch_add(1);
+      FIX::ResetSeqNumFlag reset(false);
+      if (message.isSetField(reset)) {
+        message.getField(reset);
+        if (reset == true) {
+          logonResetEchoes.fetch_add(1);
+        }
+      }
+    }
   }
   void fromApp(const FIX::Message&, const FIX::SessionID&)
       QUICKFIX_THROW(FIX::FieldNotFound, FIX::IncorrectDataFormat, FIX::IncorrectTagValue,
@@ -120,6 +130,8 @@ class ConformanceApp : public FIX::Application {
   std::atomic<int> gapFills{0};
   std::atomic<int> logoutMessages{0};
   std::atomic<int> appMessages{0};
+  std::atomic<int> logonsReceived{0};
+  std::atomic<int> logonResetEchoes{0};
   std::atomic<bool> resetOnNextLogon{false};
 };
 
@@ -502,6 +514,18 @@ TYPED_TEST(Conformance, ResetSeqNumFlagLogonIsHonoured) {
   EXPECT_TRUE(client.waitForLogon(std::chrono::seconds(10)))
       << "a ResetSeqNumFlag logon must be accepted and reset both counters";
   EXPECT_EQ(client.app.rejects.load(), 0);
+
+  // The CONFIRMING logon must carry 141=Y back.
+  //
+  // Asserting only on "the session came up" is what let the missing
+  // echo live here undetected: our acceptor did perform the reset, so
+  // the handshake completed and both of our own ends agreed. The echo
+  // is how a counterparty learns the reset was granted rather than
+  // ignored, and QuickFIX-as-acceptor sends it -- so this assertion is
+  // also a statement that the two acceptors now agree.
+  EXPECT_GE(client.app.logonsReceived.load(), 1);
+  EXPECT_EQ(client.app.logonResetEchoes.load(), client.app.logonsReceived.load())
+      << "the acceptor confirmed a ResetSeqNumFlag logon without echoing 141=Y";
 }
 
 

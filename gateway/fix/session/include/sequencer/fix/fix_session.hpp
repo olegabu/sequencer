@@ -348,7 +348,11 @@ class FixSession {
   void handleSequenceReset(const hffix::message_reader& message);
 
   // --- emission ---
-  void sendLogon();
+  // resetSeqNumFlag is a parameter rather than a read of
+  // config_.resetSeqNumOnLogon because the two differ on an acceptor:
+  // the flag on the echo must report the reset the COUNTERPARTY asked
+  // for, not the one we would have requested as an initiator.
+  void sendLogon(bool resetSeqNumFlag);
   void sendLogout(std::string_view text);
   void sendHeartbeat(std::string_view testReqId = {});
   void sendTestRequest();
