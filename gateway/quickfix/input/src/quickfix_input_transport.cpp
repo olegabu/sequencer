@@ -83,7 +83,20 @@ void QuickFixInputTransport::start(int listenPort) {
          << "EndTime=00:00:00\n"
          << "UseDataDictionary=N\n"
          << "ValidateUserDefinedFields=N\n"
-         << "ResetOnLogon=N\n";
+         << "ResetOnLogon=N\n"
+         // Nagle off. NOT the default, and not set for us by QuickFIX:
+         // ThreadedSocketAcceptor sets TCP_NODELAY only `if (noDelay)`,
+         // which it reads from this key. Without it, FIX's small
+         // request/response messages deadlock against the peer's
+         // delayed ACK for up to 40ms.
+         //
+         // Assuming QuickFIX handled this cost a wrong conclusion once:
+         // the hffix gateway and the client were fixed and their ~41ms
+         // outlier vanished, while this arm kept 10-14 samples above
+         // 10ms per 400,000, all landing at ~41ms. SocketServer.cpp
+         // does set it unconditionally, but that is the SINGLE-threaded
+         // acceptor's path, and this gateway uses the threaded one.
+         << "SocketNodelay=Y\n";
   for (const std::string& client : config_.clientCompIds) {
     config << "[SESSION]\n"
            << "BeginString=FIX.4.4\n"
