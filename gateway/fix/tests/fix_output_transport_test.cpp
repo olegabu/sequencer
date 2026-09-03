@@ -209,8 +209,13 @@ TEST(FixOutputTransport, BroadcastsReachOnlySessionsThatSubscribed) {
   ASSERT_TRUE(subscriber.isLoggedOn());
   ASSERT_TRUE(bystander.isLoggedOn());
 
-  // A MarketDataRequest naming one symbol.
-  subscriber.send("V", "262=req1\001146=1\00155=TOTALS\001");
+  // A MarketDataRequest naming one symbol. 263=1 is snapshot-plus-
+  // updates: the standing subscription. The tag was absent when this
+  // test was written, because the gateway subscribed on any 35=V
+  // whatever it said; now that the three values mean three different
+  // things, the request has to say which one it is -- as FIX 4.4
+  // requires and as the load generator has always sent.
+  subscriber.send("V", "262=req1\001263=1\001146=1\00155=TOTALS\001");
   subscriber.pumpFor(std::chrono::milliseconds(400),
                       [&] { return gateway.requests.load() >= 1; });
 
@@ -223,6 +228,76 @@ TEST(FixOutputTransport, BroadcastsReachOnlySessionsThatSubscribed) {
   EXPECT_EQ(subscriber.received()[0].payload, "tick");
   EXPECT_TRUE(bystander.received().empty())
       << "a session that sent no MarketDataRequest must receive nothing";
+}
+
+// 263=2 asks to STOP a feed. The gateway used to read every 35=V as a
+// subscription whatever tag 263 said, so this message -- the one way a
+// client has of unsubscribing -- subscribed it instead, and a feed once
+// started could never be stopped short of dropping the session.
+TEST(FixOutputTransport, ASubscriptionRequestTypeOfTwoUnsubscribes) {
+  SessionGateway gateway(29513);
+  TestClient client(29513, "ALPHA");
+  client.logon();
+  ASSERT_TRUE(client.isLoggedOn());
+
+  client.send("V", "262=req1\001263=1\001146=1\00155=TOTALS\001");
+  client.pumpFor(std::chrono::milliseconds(400), [&] { return gateway.requests.load() >= 1; });
+  gateway.publishBroadcast("TOTALS", "35=W\0015001=first\001");
+  client.pumpFor(std::chrono::milliseconds(500), [&] { return !client.received().empty(); });
+  ASSERT_EQ(client.received().size(), 1u) << "the subscription itself must work first";
+
+  client.send("V", "262=req1\001263=2\001146=1\00155=TOTALS\001");
+  client.pumpFor(std::chrono::milliseconds(400), [&] { return gateway.requests.load() >= 2; });
+
+  gateway.publishBroadcast("TOTALS", "35=W\0015001=second\001");
+  client.pumpFor(std::chrono::milliseconds(300));
+
+  EXPECT_EQ(client.received().size(), 1u)
+      << "263=2 must end the feed; a second broadcast arrived after it";
+}
+
+// 263=0 is a one-off query, not a subscription. The application answers
+// it -- the request reaches the codec like any other -- but the
+// transport must not sign the session up for the stream, which is
+// precisely what it used to do.
+TEST(FixOutputTransport, ASubscriptionRequestTypeOfZeroDoesNotSubscribe) {
+  SessionGateway gateway(29514);
+  TestClient client(29514, "ALPHA");
+  client.logon();
+  ASSERT_TRUE(client.isLoggedOn());
+
+  client.send("V", "262=req1\001263=0\001146=1\00155=TOTALS\001");
+  client.pumpFor(std::chrono::milliseconds(400), [&] { return gateway.requests.load() >= 1; });
+
+  // The codec still sees it: a snapshot is an application-level query,
+  // and refusing to subscribe must not mean swallowing the request.
+  EXPECT_GE(gateway.requests.load(), 1)
+      << "a snapshot request must still reach the codec";
+
+  gateway.publishBroadcast("TOTALS", "35=W\0015001=tick\001");
+  client.pumpFor(std::chrono::milliseconds(300));
+
+  EXPECT_TRUE(client.received().empty())
+      << "263=0 is a snapshot, not a subscription to the ongoing stream";
+}
+
+// FIX 4.4 makes tag 263 required. A request without it is malformed,
+// and the safe reading of a malformed request is the one that grants
+// nothing -- not the one that hands out a permanent feed.
+TEST(FixOutputTransport, AMarketDataRequestWithoutTag263DoesNotSubscribe) {
+  SessionGateway gateway(29515);
+  TestClient client(29515, "ALPHA");
+  client.logon();
+  ASSERT_TRUE(client.isLoggedOn());
+
+  client.send("V", "262=req1\001146=1\00155=TOTALS\001");
+  client.pumpFor(std::chrono::milliseconds(400), [&] { return gateway.requests.load() >= 1; });
+
+  gateway.publishBroadcast("TOTALS", "35=W\0015001=tick\001");
+  client.pumpFor(std::chrono::milliseconds(300));
+
+  EXPECT_TRUE(client.received().empty())
+      << "a MarketDataRequest missing its required 263 must not subscribe";
 }
 
 TEST(FixOutputTransport, SentMessagesAreRecordedForResend) {

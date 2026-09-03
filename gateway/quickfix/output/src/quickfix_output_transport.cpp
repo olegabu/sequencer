@@ -6,8 +6,26 @@ namespace sequencer::quickfix {
 
 QuickFixOutputTransport::QuickFixOutputTransport(QuickFixInputTransport& sessions)
     : sessions_(sessions) {
-  sessions_.setSubscribeFn([this](std::uint64_t sessionId, const std::string& topic) {
+  sessions_.setSubscribeFn([this](std::uint64_t sessionId, const std::string& topic,
+                                   sequencer::fix::SessionSource::SubscriptionAction action) {
+    // Snapshot (263=0) deliberately does nothing here. It is not a
+    // subscription, and the request has already gone to the codec,
+    // which is the layer that can answer it: the application holds the
+    // state, the transport holds only the routing.
+    if (action == sequencer::fix::SessionSource::SubscriptionAction::Snapshot) {
+      return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (action == sequencer::fix::SessionSource::SubscriptionAction::Unsubscribe) {
+      const auto it = topicSubscribers_.find(topic);
+      if (it != topicSubscribers_.end()) {
+        it->second.erase(sessionId);
+        if (it->second.empty()) {
+          topicSubscribers_.erase(it);
+        }
+      }
+      return;
+    }
     topicSubscribers_[topic].insert(sessionId);
     if (topics_ != nullptr) {
       topicNames_[topics_->idFor(topic)] = topic;

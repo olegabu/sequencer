@@ -244,6 +244,23 @@ void QuickFixInputTransport::fromAppGuarded(const FIX::Message& message,
   // is a subscription, which is how §8.10's topic question is answered
   // FIX's own way. It is still passed to the codec afterwards.
   if (msgType.getValue() == FIX::MsgType_MarketDataRequest && onSubscribe_) {
+    // SubscriptionRequestType (263) says which of the three requests
+    // this is; see SessionSource::SubscriptionAction. Read with
+    // isSetField first, like every other accessor in this directory --
+    // and defaulting to Snapshot when it is absent or unrecognised, so
+    // the fallback is the one that registers nothing.
+    using Action = sequencer::fix::SessionSource::SubscriptionAction;
+    Action action = Action::Snapshot;
+    FIX::SubscriptionRequestType requestType;
+    if (message.isSetField(requestType)) {
+      message.getField(requestType);
+      if (requestType.getValue() == FIX::SubscriptionRequestType_SNAPSHOT_PLUS_UPDATES) {
+        action = Action::Subscribe;
+      } else if (requestType.getValue() ==
+                 FIX::SubscriptionRequestType_DISABLE_PREVIOUS_SNAPSHOT_PLUS_UPDATE_REQUEST) {
+        action = Action::Unsubscribe;
+      }
+    }
     // Symbols are read by scanning for tag 55 rather than through
     // repeating-group accessors: the group API needs a data dictionary,
     // this session runs without one (UseDataDictionary=N), and the
@@ -257,7 +274,7 @@ void QuickFixInputTransport::fromAppGuarded(const FIX::Message& message,
       if (soh == std::string::npos) {
         break;
       }
-      onSubscribe_(id, raw.substr(start, soh - start));
+      onSubscribe_(id, raw.substr(start, soh - start), action);
       pos = soh;
     }
   }

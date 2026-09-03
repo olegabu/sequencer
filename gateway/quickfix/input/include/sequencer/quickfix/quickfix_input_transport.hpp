@@ -29,6 +29,7 @@
 #include <quickfix/SessionSettings.h>
 #include <quickfix/ThreadedSocketAcceptor.h>
 
+#include <sequencer/fix/session_source.hpp>
 #include <sequencer/input_transport.hpp>
 #include <sequencer/quickfix/journal_message_store.hpp>
 
@@ -76,7 +77,10 @@ class QuickFixInputTransport : public sequencer::InputTransport, public FIX::App
   // FixSession*, which is this repository's own session object and does
   // not exist here. QuickFIX owns the session; the output half asks
   // this class to send, rather than borrowing a session to send on.
-  using SubscribeFn = std::function<void(std::uint64_t sessionId, const std::string& topic)>;
+  // Same signature as the hffix gateway's, deliberately: the two
+  // gateways answer a MarketDataRequest the same way, and a difference
+  // here would be a difference in FIX conformance between them.
+  using SubscribeFn = sequencer::fix::SessionSource::SubscribeFn;
   void setSubscribeFn(SubscribeFn fn);
   using SessionReadyFn = std::function<void(std::uint64_t sessionId)>;
   void setSessionReadyFn(SessionReadyFn fn);

@@ -21,6 +21,24 @@ target_include_directories(sequencer_fix_session
 )
 target_compile_features(sequencer_fix_session PUBLIC cxx_std_20)
 
+# The session directory's HEADERS, with none of its compiled code.
+#
+# session_source.hpp defines the vocabulary both FIX gateways share --
+# SessionSource, and the SubscriptionAction a MarketDataRequest carries
+# -- and gateway/quickfix/ needs exactly that and nothing else: it runs
+# QuickFIX's own session layer, so linking sequencer_fix_session would
+# pull in a FixSession implementation it never calls.
+#
+# Same reasoning as sequencer::output_codec_api next door, and the same
+# discipline: depend on the narrowest target that carries the
+# declarations you need, so a library's object files travel only to the
+# binaries that actually want them.
+add_library(sequencer_fix_session_api INTERFACE)
+add_library(sequencer::fix_session_api ALIAS sequencer_fix_session_api)
+target_include_directories(sequencer_fix_session_api
+  INTERFACE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/session/include>")
+target_compile_features(sequencer_fix_session_api INTERFACE cxx_std_20)
+
 find_package(Boost REQUIRED COMPONENTS system)
 
 # The FIX input transport: the session core plus Asio sockets, as an

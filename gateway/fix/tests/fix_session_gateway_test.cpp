@@ -497,7 +497,8 @@ TEST(FixMarketDataGateway, BroadcastsReachOnlySubscribersAndNothingCanBeProposed
     ASSERT_TRUE(bystander.isLoggedOn());
 
     // Only one of them asks.
-    subscriber.session().sendApplication("V", "262=req1\001146=1\00155=TOTALS\001");
+    subscriber.session().sendApplication("V",
+                                          "262=req1\001263=1\001146=1\00155=TOTALS\001");
     subscriber.pumpFor(std::chrono::milliseconds(400));
     bystander.pumpFor(std::chrono::milliseconds(200));
 

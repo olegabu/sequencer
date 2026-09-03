@@ -187,11 +187,26 @@ Both shapes need the journal for recovery. A market-data session is a
 FIX session: it drops, reconnects, and recovers by exactly the two
 mechanisms above. It is not "tail the journal only".
 
-**Not yet implemented:** `MarketDataRequest`'s `SubscriptionRequestType`
-(263) is read as a subscription regardless of its value, so a client
-sending `263=0` (snapshot only) is registered for updates and gets no
-snapshot. A snapshot is an application-level query the codec or state
-machine must answer; the subscription half is what is built.
+`MarketDataRequest`'s `SubscriptionRequestType` (263) selects between
+the three requests FIX 4.4 defines, in both gateways:
+
+| 263 | meaning | what the transport does |
+|---|---|---|
+| `0` | snapshot | no subscription; the request still reaches the codec |
+| `1` | snapshot + updates | subscribes the session to the topic |
+| `2` | disable previous request | unsubscribes it |
+| absent | malformed (263 is required) | treated as `0`: subscribes nothing |
+
+This tag used to be ignored, and every `35=V` subscribed whatever it
+said -- so `263=2`, a client's only way to stop a feed, subscribed it
+instead, and the feed could not be stopped short of dropping the
+session.
+
+A `263=0` snapshot is answered by the application, not here: the
+transport's half of the contract is to route, and only the state
+machine knows the current value. The request reaches the codec exactly
+as every other application message does, so a codec that wants to
+answer one can, as a designated output on the requesting session.
 
 ## Throughput, and the bug that hid it
 

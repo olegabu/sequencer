@@ -307,8 +307,26 @@ struct FixOutputTransport::Impl {
 
 FixOutputTransport::FixOutputTransport(SessionSource& sessions)
     : impl_(std::make_unique<Impl>(sessions)) {
-  impl_->sessions.setSubscribeFn([this](std::uint64_t sessionId, const std::string& topic) {
+  impl_->sessions.setSubscribeFn([this](std::uint64_t sessionId, const std::string& topic,
+                                        SessionSource::SubscriptionAction action) {
+    // Snapshot (263=0) deliberately does nothing here. It is not a
+    // subscription, and the request has already gone to the codec,
+    // which is the layer that can answer it: the application holds the
+    // state, the transport holds only the routing.
+    if (action == SessionSource::SubscriptionAction::Snapshot) {
+      return;
+    }
     std::lock_guard<std::mutex> lock(impl_->subscriptionsMutex);
+    if (action == SessionSource::SubscriptionAction::Unsubscribe) {
+      const auto it = impl_->topicSubscribers.find(topic);
+      if (it != impl_->topicSubscribers.end()) {
+        it->second.erase(sessionId);
+        if (it->second.empty()) {
+          impl_->topicSubscribers.erase(it);
+        }
+      }
+      return;
+    }
     impl_->topicSubscribers[topic].insert(sessionId);
     if (impl_->topics != nullptr) {
       impl_->topicNames[impl_->topics->idFor(topic)] = topic;

@@ -90,7 +90,12 @@ class FixClient {
     // This test submits with delta 5 and -2, so the client id in the
     // high bits is 0 and its topic is TOTALS-0.
     session_->sendApplication(
-        "V", "262=req1\00110155=1\00155=" + counterTopicFor(0) + "\001");
+        // 263=1: snapshot plus updates, the standing subscription.
+        // 146=1: NoRelatedSym, the count for the one symbol below --
+        // it read 10155 here, a tag that means nothing in FIX 4.4 and
+        // survived only because the gateway scans for tag 55 and
+        // ignores everything else in the request.
+        "V", "262=req1\001263=1\001146=1\00155=" + counterTopicFor(0) + "\001");
   }
   void submit(std::int64_t delta) {
     session_->sendApplication("U1", std::to_string(kCounterValueTag) + "=" +
@@ -144,6 +149,7 @@ struct GatewayUnderTest {
   // gateway adopts it from the Logon and needs no such argument.
   bool needsClientCompIds;
 };
+
 
 class CounterFixGatewayEndToEnd : public ::testing::TestWithParam<GatewayUnderTest> {};
 

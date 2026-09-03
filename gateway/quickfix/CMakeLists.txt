@@ -43,6 +43,7 @@ target_include_directories(sequencer_quickfix_input PUBLIC
 target_link_libraries(sequencer_quickfix_input PUBLIC
   sequencer::quickfix_store
   sequencer::gateway_input
+  sequencer::fix_session_api
 )
 target_compile_features(sequencer_quickfix_input PUBLIC cxx_std_20)
 

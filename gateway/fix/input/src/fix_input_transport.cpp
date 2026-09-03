@@ -49,6 +49,29 @@ std::vector<std::string> symbolsOf(const hffix::message_reader& message) {
   return symbols;
 }
 
+// SubscriptionRequestType (263) decides which of the three requests a
+// MarketDataRequest is. FIX 4.4 makes the tag required; a message
+// without it is malformed, and we treat that as a snapshot -- the
+// reading that registers NO standing subscription, so a malformed
+// request cannot silently sign a session up for a permanent feed.
+sequencer::fix::SessionSource::SubscriptionAction subscriptionActionOf(
+    const hffix::message_reader& message) {
+  using Action = sequencer::fix::SessionSource::SubscriptionAction;
+  for (auto it = message.begin(); it != message.end(); ++it) {
+    if (it->tag() == 263) {
+      const std::string_view value(it->value().begin(), it->value().size());
+      if (value == "1") {
+        return Action::Subscribe;
+      }
+      if (value == "2") {
+        return Action::Unsubscribe;
+      }
+      return Action::Snapshot;
+    }
+  }
+  return Action::Snapshot;
+}
+
 std::uint64_t steadyMicros() {
   return static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
@@ -284,7 +307,7 @@ struct FixInputTransport::Impl {
   // Set by the output side: a MarketDataRequest is a subscription, and
   // the output half is what acts on it (§8.10's topic question,
   // resolved FIX's own way).
-  std::function<void(std::uint64_t, const std::string&)> onSubscribe;
+  SessionSource::SubscribeFn onSubscribe;
   SessionSource::SessionReadyFn onSessionReady;
 
   net::io_context ioContext;
@@ -360,8 +383,9 @@ struct FixInputTransport::Impl {
       // nothing. It is still passed to the codec afterwards, since an
       // application may want to see the request too.
       if (msgTypeIs(message, "V") && this->onSubscribe) {
+        const auto action = subscriptionActionOf(message);
         for (const std::string& symbol : symbolsOf(message)) {
-          this->onSubscribe(connection->sessionId, symbol);
+          this->onSubscribe(connection->sessionId, symbol, action);
         }
       }
 

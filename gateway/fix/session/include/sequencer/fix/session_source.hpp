@@ -31,9 +31,31 @@ class SessionSource {
   // Every live session's routing id, for broadcast fan-out.
   virtual std::vector<std::uint64_t> liveSessions() = 0;
 
-  // Invoked when a session subscribes to a topic via MarketDataRequest.
-  // The input side sees the request; the output side acts on it.
-  using SubscribeFn = std::function<void(std::uint64_t sessionId, const std::string& topic)>;
+  // What a MarketDataRequest asked for, from its SubscriptionRequestType
+  // (tag 263). FIX 4.4 makes the tag REQUIRED, and its three values are
+  // three different requests -- which this gateway used to collapse into
+  // one, registering a subscription whatever the tag said. A client
+  // sending 263=2 to stop its feed was therefore subscribed by the very
+  // message that asked to unsubscribe, and one sending 263=0 for a
+  // one-off snapshot was signed up for the stream instead.
+  enum class SubscriptionAction {
+    // 263=0. A one-off query, and explicitly NOT a subscription: the
+    // request still reaches the codec, because only the application
+    // knows the current state and can answer it as a designated
+    // output. The transport's whole job here is to NOT register a
+    // standing subscription.
+    Snapshot,
+    // 263=1, snapshot plus updates: the standing subscription.
+    Subscribe,
+    // 263=2, disable a previous request.
+    Unsubscribe,
+  };
+
+  // Invoked when a session sends a MarketDataRequest. The input side
+  // sees the request; the output side acts on it.
+  using SubscribeFn =
+      std::function<void(std::uint64_t sessionId, const std::string& topic,
+                          SubscriptionAction action)>;
   virtual void setSubscribeFn(SubscribeFn fn) = 0;
 
   // Called once a session has completed Logon and before it can be
