@@ -118,12 +118,29 @@ void QuickFixInputTransport::start(int listenPort) {
          // per message -- so SocketNodelay=Y multiplies its packet rate
          // instead, and measurement is unambiguous about the result:
          //
-         //   100k, SocketNodelay unset:  p50   958us,      0 dropped
-         //   100k, SocketNodelay=Y:      p50 1,082us, 29,559 dropped
-         //   ceiling, unset:  ~158k     ceiling, =Y:  ~123k
+         // Re-measured on current code, five clients, same cluster
+         // lifetime per arm, with the env var verified in
+         // /proc/<pid>/environ for both arms:
          //
-         // So the trade is a rare ~41ms tail sample against a 22%
-         // ceiling. Nagle is doing useful work for this transport, and
+         //         |        Nagle (default)      |     SocketNodelay=Y
+         //   rate  |  p50    p999    max    drop |  p50     p999    max    drop
+         //   100k  | 1086    3158  41760      0  | 1114     8896  10496      0
+         //   125k  | 1182   11072  42240   31696  | 44768  112448 113792  99142
+         //   150k  | 1824   22464  41952  116947  | 112640 136704 145536 926066
+         //   ceiling ~158k                        | ~123k
+         //
+         // Note what the max column says: ~41.8ms at EVERY rate with
+         // Nagle on, and 10.5ms without it. That is the delayed-ACK
+         // timer, and un-Nagling genuinely removes it.
+         //
+         // But it is not a clean trade of tail against throughput.
+         // SocketNodelay=Y is also 2.8x WORSE at p999 (3,158 ->
+         // 8,896us at 100k), and it collapses at 125k instead of 175k
+         // -- a 22% lower ceiling, reproducing the earlier measurement
+         // exactly. It improves one number, the extreme max, and makes
+         // everything else worse.
+         //
+         // Nagle is doing useful work for this transport, and
          // the correct fix is application-level write coalescing inside
          // the gateway, not turning Nagle off underneath a library that
          // does not coalesce.

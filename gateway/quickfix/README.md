@@ -173,10 +173,66 @@ difference nobody looked for.
 stub body source standing in for the journal, so a failure there is the
 store's and not a gateway's.
 
-## What is not yet measured
+## Throughput, measured
 
-Throughput. The hffix arm carries 400k requests/sec with zero drops at a
-3.4ms p50 on a five-client fleet; there is no basis in this repository
-for predicting where this gateway lands, and QuickFIX is
-string-and-allocation based where hffix parses in place. Measure it
-before quoting it.
+Five clients, 3-node multi-AZ c7a fleet:
+
+| | QuickFIX | hffix (`gateway/fix/`) |
+|---|---|---|
+| p50 @ 100k | ~1,086 us | ~905 us |
+| ceiling | **~158k/sec** | ~400k/sec |
+
+The gap is the design difference, not a bug: QuickFIX is
+string-and-allocation based where hffix parses in place, and it writes
+one message per socket write where `gateway/fix/` coalesces.
+
+Getting to 158k took two fixes worth knowing about. `FileSequences`
+did a file write and rename **per message**, which held the gateway at
+about 1,000/sec; throttling it to 100 ms lifted that. And
+`FIX::SocketAcceptor` is single-threaded, which capped it at ~140k;
+`FIX::ThreadedSocketAcceptor` is what gets to 158k.
+
+## Nagle, and why there is no write coalescing here
+
+`SocketNodelay` is left at its default (off), which is the opposite of
+what every other transport in this repository does. Measured both ways
+on the same fleet, with the setting verified in `/proc/<pid>/environ`
+for each arm:
+
+| rate | Nagle p50 / p999 / max | NODELAY p50 / p999 / max |
+|---|---|---|
+| 100k | 1,086 / 3,158 / **41,760** us | 1,114 / 8,896 / **10,496** us |
+| 125k | 1,182 / 11,072 / 42,240 us | **44,768** / 112,448 / 113,792 us |
+| ceiling | **~158k** | **~123k** |
+
+The ~41.8 ms max at every Nagle-on rate is the delayed-ACK timer, and
+turning Nagle off genuinely removes it. But this is not a clean trade
+of tail against throughput: `SocketNodelay=Y` is also **2.8x worse at
+p999** (3,158 -> 8,896 us at 100k) and collapses at 125k instead of
+175k. It improves exactly one number — the extreme max — and degrades
+everything else. So Nagle stays on. Set `QUICKFIX_SOCKET_NODELAY=1` to
+re-measure rather than trust this table.
+
+TCP_NODELAY is safe when the transport batches its own writes, which is
+why `gateway/fix/` sets it: that gateway accumulates into one buffer and
+drains it in a single syscall
+(`SessionSource::beginBatch`/`endBatch`). The right fix for QuickFIX
+would be the same coalescing — and **QuickFIX 1.15.1's public API does
+not allow it.** Checked in the headers, not inferred:
+
+- `Session::m_pResponder` is private with no getter. `setResponder()`
+  is public, so a buffering `Responder` can be installed — but there is
+  no way to read the pointer it would have to forward to.
+- `Session::send(const std::string&)` is private, so a pre-framed batch
+  cannot be handed in.
+- `ThreadedSocketAcceptor` declares everything but its destructor
+  private: no hook on connection creation.
+- `Acceptor`'s only virtuals are `onStart`/`onPoll`/`onStop`, so
+  subclassing it means writing the socket layer — the layer this
+  gateway exists to delegate.
+- The only transport settings are `SocketNodelay`,
+  `SocketSendBufferSize` and `SocketReceiveBufferSize`. None coalesce.
+
+So the choice here is binary and permanent, not a placeholder pending a
+patch. That `gateway/fix/` can coalesce and this one cannot is one of
+the more useful things the two implementations say about each other.
