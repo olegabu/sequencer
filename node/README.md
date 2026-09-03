@@ -85,6 +85,37 @@ brand-new group), `--election_timeout_ms`, and `--apply_thread_cpu`
 (§5.3's recommended core-pinning, off by default for portability) all
 have defaults.
 
+## A deployment note worth knowing: open-file limits
+
+braft keeps **one open file descriptor per raft log segment**, and it
+truncates the log only when it takes a snapshot. A node running with
+the default snapshot interval therefore accumulates descriptors for as
+long as it has been up, and when it runs out:
+
+```
+E log.cpp:1203] Fail to close old open_segment or create new
+  open_segment path: .../log: Too many open files [24]
+E raft error: {type=LogError, error_code=5, error_text=`Fail to append
+  entries'}
+W node ... is not in active state current_term 2 state ERROR
+```
+
+**braft latches the node into `ERROR` — it does not recover.** From
+that point the process is still running, still listening, and still
+accepting connections, but every proposal fails. Nothing crashes and
+no log line says "I am finished", which is what makes it worth knowing
+in advance.
+
+A 1024 descriptor limit (the common default) is reached at roughly a
+thousand log segments. Raise the soft limit before starting a node:
+`ulimit -n 65536`, `LimitNOFILE=65536` under systemd, or a container
+equivalent. The hard limit is usually already ~1M, so this needs no
+privilege.
+
+This was found in the benchmarking repo, where a long sweep drove a
+node to 1008 segments and every measurement taken afterwards silently
+recorded zero completions.
+
 ## A build note worth knowing
 
 The pinned vcpkg baseline's `glog` (0.7.1) and `braft`/`brpc` don't
