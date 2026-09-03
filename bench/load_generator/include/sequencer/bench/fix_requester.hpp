@@ -23,6 +23,9 @@
 #include <sequencer/bench/load_generator.hpp>
 #include <sequencer/fix/fix_session.hpp>
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
 #include <boost/asio/connect.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -77,6 +80,15 @@ class FixRequester : public LoadGeneratorRequester {
       : socket_(ioContext_), clientId_(clientId), clientIdShift_(clientIdShift) {
     boost::asio::ip::tcp::resolver resolver(ioContext_);
     boost::asio::connect(socket_, resolver.resolve(host, std::to_string(port)));
+    // Nagle off. The client is the side that both FIX arms share, so a
+    // delayed-ACK stall here shows up in every FIX measurement this
+    // repository makes -- and it did: one sample per session per run at
+    // ~40ms, in the hffix and QuickFIX sweeps alike. See
+    // fix_input_transport.cpp for the numbers.
+    {
+      const int noDelay = 1;
+      ::setsockopt(socket_.native_handle(), IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+    }
 
     sequencer::fix::SessionConfig config;
     config.role = sequencer::fix::Role::Initiator;

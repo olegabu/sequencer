@@ -5,6 +5,8 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/write.hpp>
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 
 #include <atomic>
@@ -410,6 +412,22 @@ struct FixInputTransport::Impl {
       // session's inbound path.
       struct timeval timeout {};
       timeout.tv_sec = 1;
+      // Nagle off, on every accepted connection.
+      //
+      // FIX is small messages with a request/response rhythm, which is
+      // exactly the shape Nagle plus the peer's delayed ACK deadlocks:
+      // a small write waits for an ACK the peer holds back for up to
+      // 40ms. Measured on the fleet, every session showed EXACTLY ONE
+      // sample above 10ms per 40,000 -- at 40,384 / 40,608 / 41,344 /
+      // 40,768 / 41,792us across five clients, which is the delayed-ACK
+      // timer and nothing else. That single stall is what pushed the
+      // rig's in-flight count toward its cap and produced its drop
+      // count. QuickFIX sets this on its own accepted sockets
+      // (SocketServer.cpp); this side never did.
+      const int noDelay = 1;
+      ::setsockopt(connection->socket.native_handle(), IPPROTO_TCP, TCP_NODELAY, &noDelay,
+                   sizeof(noDelay));
+
       ::setsockopt(connection->socket.native_handle(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
                    sizeof(timeout));
 
