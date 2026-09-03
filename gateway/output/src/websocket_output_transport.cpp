@@ -130,6 +130,16 @@ struct WebSocketOutputTransport::Impl {
   void doAccept() {
     acceptor->async_accept([this](beast::error_code ec, tcp::socket socket) {
       if (!ec) {
+        // Nagle off, for the same reason the FIX transports set it: a
+        // small write that waits on the peer's delayed ACK stalls up to
+        // 40ms. brpc and gRPC set this in their own socket layers;
+        // Beast does not, so this transport is the one output flavour
+        // that was still Nagled -- and it is the one whose p90 leaves
+        // the other two above 150k (2,182-2,506us against ~1,630us),
+        // which was previously attributed to its per-connection writer
+        // thread without checking this.
+        boost::system::error_code nodelayEc;
+        socket.set_option(tcp::no_delay(true), nodelayEc);
         std::make_shared<PendingConnection>(std::move(socket), *this)->start();
       }
       if (!stopping) {

@@ -70,6 +70,11 @@ class WebSocketOutputObserver final : public OutputGatewayObserver {
     tcp::resolver resolver(ioContext_);
     const auto results = resolver.resolve(host_, port_);
     net::connect(ws_.next_layer(), results);
+    // The observer's own half of the same fix; see the transport.
+    {
+      boost::system::error_code nodelayEc;
+      ws_.next_layer().set_option(boost::asio::ip::tcp::no_delay(true), nodelayEc);
+    }
     ws_.handshake(host_, "/" + topic_);
     readerThread_ = std::thread([this] { readLoop(); });
   }

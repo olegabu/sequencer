@@ -84,19 +84,26 @@ void QuickFixInputTransport::start(int listenPort) {
          << "UseDataDictionary=N\n"
          << "ValidateUserDefinedFields=N\n"
          << "ResetOnLogon=N\n"
-         // Nagle off. NOT the default, and not set for us by QuickFIX:
-         // ThreadedSocketAcceptor sets TCP_NODELAY only `if (noDelay)`,
-         // which it reads from this key. Without it, FIX's small
-         // request/response messages deadlock against the peer's
-         // delayed ACK for up to 40ms.
+         // Nagle is left ON here, deliberately, and this is the one
+         // transport in the repository where that is the right answer.
          //
-         // Assuming QuickFIX handled this cost a wrong conclusion once:
-         // the hffix gateway and the client were fixed and their ~41ms
-         // outlier vanished, while this arm kept 10-14 samples above
-         // 10ms per 400,000, all landing at ~41ms. SocketServer.cpp
-         // does set it unconditionally, but that is the SINGLE-threaded
-         // acceptor's path, and this gateway uses the threaded one.
-         << "SocketNodelay=Y\n";
+         // TCP_NODELAY is safe when the transport batches its own
+         // writes: gateway/fix/ accumulates into outBuffer and drains
+         // it in one syscall, so un-Nagling costs nothing and removed a
+         // 40ms delayed-ACK stall. QuickFIX does NOT batch -- it writes
+         // per message -- so SocketNodelay=Y multiplies its packet rate
+         // instead, and measurement is unambiguous about the result:
+         //
+         //   100k, SocketNodelay unset:  p50   958us,      0 dropped
+         //   100k, SocketNodelay=Y:      p50 1,082us, 29,559 dropped
+         //   ceiling, unset:  ~158k     ceiling, =Y:  ~123k
+         //
+         // So the trade is a rare ~41ms tail sample against a 22%
+         // ceiling. Nagle is doing useful work for this transport, and
+         // the correct fix is application-level write coalescing inside
+         // the gateway, not turning Nagle off underneath a library that
+         // does not coalesce.
+         ;
   for (const std::string& client : config_.clientCompIds) {
     config << "[SESSION]\n"
            << "BeginString=FIX.4.4\n"
