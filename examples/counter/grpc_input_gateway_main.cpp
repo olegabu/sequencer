@@ -34,6 +34,8 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <sequencer/comma_separated.hpp>
+
 #include "counter_input_grpc.grpc.pb.h"
 #include "node_proposer.hpp"
 
@@ -58,22 +60,6 @@ DEFINE_int32(max_inflight_batches, 0,
 namespace sequencer::examples::counter {
 namespace {
 
-std::vector<std::string> splitCommaList(const std::string& s) {
-  std::vector<std::string> out;
-  std::size_t start = 0;
-  while (start <= s.size()) {
-    const std::size_t comma = s.find(',', start);
-    const std::size_t end = comma == std::string::npos ? s.size() : comma;
-    if (end > start) {
-      out.push_back(s.substr(start, end - start));
-    }
-    if (comma == std::string::npos) {
-      break;
-    }
-    start = comma + 1;
-  }
-  return out;
-}
 
 // CallbackService, not Service: the callback API lets a handler return
 // before its answer exists, which is precisely what proposeAsync()
@@ -139,7 +125,7 @@ int main(int argc, char** argv) {
   }
 
   sequencer::examples::counter::CounterSubmitServiceImpl service(
-      sequencer::examples::counter::splitCommaList(FLAGS_node_peers),
+      sequencer::splitCommaSeparated(FLAGS_node_peers),
       static_cast<std::size_t>(FLAGS_max_batch_size), FLAGS_max_inflight_batches);
 
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();

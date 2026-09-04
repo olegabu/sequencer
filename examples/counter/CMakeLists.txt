@@ -103,7 +103,9 @@ target_link_libraries(counter_load_generator_main PRIVATE sequencer::gateway_inp
                                                             sequencer::bench_load_generator
                                                             sequencer::bench_relay_observer
                                                             sequencer::bench_output_observer
-                                                            unofficial::brpc::brpc-static gflags::gflags_static glog::glog)
+                                                            unofficial::brpc::brpc-static gflags::gflags_static glog::glog
+  sequencer::common
+)
 set_target_properties(counter_load_generator_main PROPERTIES OUTPUT_NAME counter_load_generator)
 
 # specification.md §8.7: real gRPC entry points, alongside the existing
@@ -171,6 +173,7 @@ target_link_libraries(counter_grpc_input_gateway_main PRIVATE
   protobuf::libprotobuf
   gflags::gflags_static
   glog::glog
+  sequencer::common
 )
 set_target_properties(counter_grpc_input_gateway_main PROPERTIES OUTPUT_NAME counter_grpc_input_gateway)
 
@@ -213,5 +216,7 @@ target_link_libraries(counter_quickfix_gateway_main PRIVATE
 add_executable(counter_fix_gateway_main fix_gateway_main.cpp)
 target_link_libraries(counter_fix_gateway_main PRIVATE counter::fix_codecs
                                                         sequencer::fix_gateway
-                                                        gflags::gflags_static glog::glog)
+                                                        gflags::gflags_static glog::glog
+  sequencer::common
+)
 set_target_properties(counter_fix_gateway_main PROPERTIES OUTPUT_NAME counter_fix_gateway)

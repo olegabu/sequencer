@@ -4,6 +4,7 @@
 #include <filesystem>
 
 #include <sequencer/journal/format.hpp>
+#include <sequencer/temp_dir.hpp>
 #include <stdexcept>
 #include <string>
 
@@ -12,13 +13,11 @@ namespace sequencer::journal::testing {
 // A uniquely-named scratch directory, removed on destruction.
 class TempDir {
  public:
-  TempDir() {
-    std::string tmpl = (std::filesystem::temp_directory_path() / "sequencer_journal_XXXXXX").string();
-    if (::mkdtemp(tmpl.data()) == nullptr) {
-      throw std::runtime_error("mkdtemp failed");
-    }
-    path_ = tmpl;
-  }
+  // The class stays -- it is not merely a mkdtemp wrapper: it REMOVES
+  // the directory on destruction and knows where a journal's segment
+  // files live. Only its creation was duplicated, and that now comes
+  // from sequencer::makeTempDir.
+  TempDir() : path_(sequencer::makeTempDir("sequencer_journal")) {}
 
   ~TempDir() {
     std::error_code ec;

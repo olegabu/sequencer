@@ -5,6 +5,7 @@
 
 #include "apply_loop.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 
 #include <atomic>
@@ -64,9 +65,7 @@ Payload payloadOf(const std::int64_t& v) {
 class ApplyLoopTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::string tmpl = (std::filesystem::temp_directory_path() / "apply_loop_test_XXXXXX").string();
-    ASSERT_NE(::mkdtemp(tmpl.data()), nullptr);
-    dir_ = tmpl;
+    dir_ = sequencer::makeTempDir("apply_loop_test");
     writer_ = std::make_unique<journal::JournalWriter>(dir_ / "j");
     ring_ = std::make_unique<CommittedEntryRing>(16, 64);
     loop_ = std::make_unique<ApplyLoop>(sm_, *writer_, *ring_, &recordCompletion);

@@ -3,6 +3,7 @@
 // apply() accumulates an 8-byte signed delta into a running total and
 // emits (and designates) the new total.
 
+#include <sequencer/temp_dir.hpp>
 #include "../counter_state_machine.hpp"
 
 #include <cstring>
@@ -67,11 +68,8 @@ TEST(CounterStateMachine, RejectsWrongSizedInput) {
 }
 
 TEST(CounterStateMachine, SnapshotSaveAndLoadRoundTripsTotal) {
-  const std::string tmpl =
-      (std::filesystem::temp_directory_path() / "counter_snapshot_test_XXXXXX").string();
-  std::string path = tmpl;
-  ASSERT_NE(::mkdtemp(path.data()), nullptr);
-  const std::filesystem::path file = std::filesystem::path(path) / "state.bin";
+  const std::filesystem::path dir = sequencer::makeTempDir("counter_snapshot_test");
+  const std::filesystem::path file = dir / "state.bin";
 
   CounterStateMachine original;
   {
@@ -99,7 +97,7 @@ TEST(CounterStateMachine, SnapshotSaveAndLoadRoundTripsTotal) {
   EXPECT_EQ(restored.total(), 40);
   EXPECT_EQ(designatedTotal(outputs), 40);
 
-  std::filesystem::remove_all(path);
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

@@ -58,6 +58,7 @@ target_link_libraries(sequencer_signing_gateway PRIVATE
   unofficial::brpc::brpc-static
   gflags::gflags_static
   glog::glog
+  sequencer::common
 )
 
 if(SEQUENCER_BUILD_TESTS)

@@ -12,6 +12,7 @@
 
 #include "node_impl.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 
 #include <brpc/channel.h>
@@ -54,10 +55,7 @@ class SumStateMachine : public sequencer::StateMachine {
 class NodeIntegrationTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::string tmpl =
-        (std::filesystem::temp_directory_path() / "node_integration_test_XXXXXX").string();
-    ASSERT_NE(::mkdtemp(tmpl.data()), nullptr);
-    dir_ = tmpl;
+    dir_ = sequencer::makeTempDir("node_integration_test");
 
     NodeConfig config;
     config.groupId = "test-group";

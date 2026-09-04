@@ -3,7 +3,7 @@ include(GoogleTest)
 
 function(sequencer_journal_test name)
   add_executable(${name} ${name}.cpp)
-  target_link_libraries(${name} PRIVATE sequencer::journal GTest::gtest GTest::gtest_main Threads::Threads)
+  target_link_libraries(${name} PRIVATE sequencer::journal sequencer::common GTest::gtest GTest::gtest_main Threads::Threads)
   gtest_discover_tests(${name})
 endfunction()
 

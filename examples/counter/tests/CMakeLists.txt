@@ -2,7 +2,7 @@ find_package(Threads REQUIRED)
 include(GoogleTest)
 
 add_executable(counter_state_machine_test counter_state_machine_test.cpp)
-target_link_libraries(counter_state_machine_test PRIVATE counter::state_machine GTest::gtest GTest::gtest_main)
+target_link_libraries(counter_state_machine_test PRIVATE counter::state_machine GTest::gtest GTest::gtest_main sequencer::common)
 gtest_discover_tests(counter_state_machine_test)
 
 add_executable(three_node_smoke_test three_node_smoke_test.cpp)
