@@ -8,6 +8,7 @@
 
 #include "counter_fix_codecs.hpp"
 
+#include <sequencer/comma_separated.hpp>
 #include <sequencer/quickfix/quickfix_session_gateway.hpp>
 
 #include <gflags/gflags.h>
@@ -34,17 +35,6 @@ DEFINE_string(client_comp_ids, "",
 
 namespace {
 
-std::vector<std::string> splitCommaSeparated(const std::string& value) {
-  std::vector<std::string> parts;
-  std::stringstream stream(value);
-  std::string part;
-  while (std::getline(stream, part, ',')) {
-    if (!part.empty()) {
-      parts.push_back(part);
-    }
-  }
-  return parts;
-}
 
 }  // namespace
 
@@ -65,14 +55,14 @@ int main(int argc, char** argv) {
   }
 
   sequencer::quickfix::QuickFixGatewayConfig config;
-  config.nodeEndpoints = splitCommaSeparated(FLAGS_node_peers);
+  config.nodeEndpoints = sequencer::splitCommaSeparated(FLAGS_node_peers);
   config.listenPort = FLAGS_listen_port;
   config.dataDir = FLAGS_data_dir;
   config.resumeFile = FLAGS_resume_file;
   config.senderCompId = FLAGS_sender_comp_id;
   config.heartBtInt = FLAGS_heartbeat_interval;
   config.sequenceStoreDir = FLAGS_sequence_store_dir;
-  config.clientCompIds = splitCommaSeparated(FLAGS_client_comp_ids);
+  config.clientCompIds = sequencer::splitCommaSeparated(FLAGS_client_comp_ids);
 
   LOG(INFO) << "counter QuickFIX session gateway starting: listen_port=" << FLAGS_listen_port
             << " clients=" << FLAGS_client_comp_ids;

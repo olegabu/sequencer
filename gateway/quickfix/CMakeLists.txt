@@ -81,6 +81,7 @@ target_include_directories(sequencer_quickfix_gateway PUBLIC
 target_link_libraries(sequencer_quickfix_gateway PUBLIC
   sequencer::quickfix_input
   sequencer::quickfix_output
+  sequencer::common
 )
 target_compile_features(sequencer_quickfix_gateway PUBLIC cxx_std_20)
 

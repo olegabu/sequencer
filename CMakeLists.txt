@@ -61,6 +61,7 @@ find_package(glog CONFIG REQUIRED)
 # examples/counter's CMakeLists.txt alone), so it's found here.
 find_package(OpenSSL REQUIRED)
 
+add_subdirectory(common)
 add_subdirectory(journal)
 add_subdirectory(node)
 add_subdirectory(tools/replay)

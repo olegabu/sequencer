@@ -17,6 +17,8 @@
 // unary-call-only, not streaming).
 
 #include <gflags/gflags.h>
+#include <sequencer/stop_signal.hpp>
+
 #include <glog/logging.h>
 
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
@@ -41,8 +43,6 @@ DEFINE_int32(grpc_listen_port, 0,
 namespace sequencer::gateway::relay {
 namespace {
 
-std::atomic<bool> gStopRequested{false};
-void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 }  // namespace
 }  // namespace sequencer::gateway::relay
@@ -77,11 +77,7 @@ int main(int argc, char** argv) {
     LOG(INFO) << "relay gRPC service started: grpc_listen_port=" << FLAGS_grpc_listen_port;
   }
 
-  std::signal(SIGINT, sequencer::gateway::relay::handleStopSignal);
-  std::signal(SIGTERM, sequencer::gateway::relay::handleStopSignal);
-  while (!sequencer::gateway::relay::gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   LOG(INFO) << "relay gateway stopping";
   if (grpcServer) {

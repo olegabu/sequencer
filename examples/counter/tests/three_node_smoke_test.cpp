@@ -7,6 +7,7 @@
 
 #include "child_process.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 
 #include <brpc/channel.h>
@@ -31,13 +32,6 @@
 namespace sequencer::examples::counter {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "counter_smoke_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 // braft's PeerId format ("ip:port:idx") isn't a valid brpc::Channel
 // endpoint ("ip:port") — strip the trailing index.
@@ -124,9 +118,9 @@ bool waitForCommittedCount(const std::filesystem::path& dataDir, std::uint64_t t
 }
 
 TEST(ThreeNodeSmoke, ReplicatesIdenticallyAcrossAllThreeJournals) {
-  const std::filesystem::path dir0 = makeTempDir();
-  const std::filesystem::path dir1 = makeTempDir();
-  const std::filesystem::path dir2 = makeTempDir();
+  const std::filesystem::path dir0 = sequencer::makeTempDir("counter_smoke");
+  const std::filesystem::path dir1 = sequencer::makeTempDir("counter_smoke");
+  const std::filesystem::path dir2 = sequencer::makeTempDir("counter_smoke");
 
   const std::vector<std::string> raftPeers = {"127.0.0.1:28941:0", "127.0.0.1:28942:0",
                                                "127.0.0.1:28943:0"};

@@ -54,6 +54,7 @@ target_link_libraries(sequencer_gateway_output
     protobuf::libprotobuf
     gflags::gflags_static
     glog::glog
+    sequencer::common
 )
 
 target_compile_features(sequencer_gateway_output PUBLIC cxx_std_20)

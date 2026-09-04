@@ -9,6 +9,7 @@
 #include "evidence_server.hpp"
 #include "signing_gateway_impl.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/writer.hpp>
 
 #include <brpc/channel.h>
@@ -29,13 +30,6 @@
 namespace sequencer::evidence::detail {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "signing_gateway_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -79,7 +73,7 @@ bool waitUntil(std::chrono::seconds timeout, const std::function<bool()>& predic
 }
 
 TEST(SigningGateway, SignsACompleteBlockAndServesAVerifiableInclusionProof) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("signing_gateway_test");
   appendRecords(dir, kBlockSize);  // exactly one complete block
 
   const Ed25519PrivateKey privateKey = testPrivateKey();
@@ -166,7 +160,7 @@ TEST(SigningGateway, SignsACompleteBlockAndServesAVerifiableInclusionProof) {
 }
 
 TEST(SigningGateway, NeverSignsAnIncompleteBlock) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("signing_gateway_test");
   appendRecords(dir, kBlockSize - 1);  // one short of a complete block
 
   SigningGatewayConfig config;
@@ -188,7 +182,7 @@ TEST(SigningGateway, NeverSignsAnIncompleteBlock) {
 }
 
 TEST(SigningGateway, TwoIndependentInstancesReadingTheSameJournalProduceIdenticalSignedRoots) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("signing_gateway_test");
   appendRecords(dir, kBlockSize * 2);  // two complete blocks
 
   const Ed25519PrivateKey sharedKey = testPrivateKey();

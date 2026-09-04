@@ -1,5 +1,6 @@
 #include <sequencer/quickfix/quickfix_session_gateway.hpp>
 
+#include <sequencer/stop_signal.hpp>
 #include <sequencer/journal/journal.hpp>
 #include <sequencer/quickfix/journal_message_store.hpp>
 #include <sequencer/quickfix/quickfix_input_transport.hpp>
@@ -19,8 +20,6 @@
 namespace sequencer::quickfix {
 namespace {
 
-std::atomic<bool> gStopRequested{false};
-void handleStopSignal(int) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 // The BodySource the message store rebuilds from: re-read the journal
 // record, re-run the OUTPUT codec, hand back the bytes it produced.
@@ -192,7 +191,7 @@ class FileSequences : public SequenceNumberStore {
 int RunQuickFixSessionGateway(QuickFixGatewayConfig config,
                               std::unique_ptr<sequencer::InputCodec> inputCodec,
                               std::unique_ptr<sequencer::OutputCodec> outputCodec) {
-  gStopRequested.store(false, std::memory_order_relaxed);
+  sequencer::clearStopRequest();
 
   QuickFixInputConfig inputConfig;
   inputConfig.senderCompId = config.senderCompId;
@@ -230,11 +229,7 @@ int RunQuickFixSessionGateway(QuickFixGatewayConfig config,
   outputGateway.start();
   inputGateway.start();
 
-  std::signal(SIGINT, handleStopSignal);
-  std::signal(SIGTERM, handleStopSignal);
-  while (!gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   inputGateway.stop();
   outputGateway.stop();

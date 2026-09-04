@@ -6,6 +6,7 @@
 #include "relay_gateway_impl.hpp"
 #include "relay_grpc_service_impl.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/writer.hpp>
 
 #include <grpcpp/grpcpp.h>
@@ -24,13 +25,6 @@
 namespace sequencer::gateway::relay::detail {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "relay_grpc_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -94,7 +88,7 @@ class TestGrpcRelayClient {
 };
 
 TEST(RelayGrpc, SubscribingFromTheBeginningReplaysAlreadyCommittedHistory) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_grpc_test");
   appendRecords(dir, 1, {5, -2, 10, -13, 100});
 
   RelayGatewayConfig config;
@@ -126,7 +120,7 @@ TEST(RelayGrpc, SubscribingFromTheBeginningReplaysAlreadyCommittedHistory) {
 }
 
 TEST(RelayGrpc, DeliversRecordsAppendedContinuouslyWhileSubscribed) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_grpc_test");
   appendRecords(dir, 1, {1});  // seed the journal so a JournalReader can open before appending live
 
   RelayGatewayConfig config;
@@ -182,7 +176,7 @@ TEST(RelayGrpc, DeliversRecordsAppendedContinuouslyWhileSubscribed) {
 // no crash, no hang, and a fresh subscriber started after all the
 // cancelling still gets correct, in-order data.
 TEST(RelayGrpc, SurvivesClientsCancellingMidStreamRepeatedly) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_grpc_test");
   appendRecords(dir, 1, {1});
 
   RelayGatewayConfig config;
@@ -244,7 +238,7 @@ TEST(RelayGrpc, SurvivesClientsCancellingMidStreamRepeatedly) {
 // achieves locally) catches a repeat of that class of bug without
 // being sensitive to ordinary machine-to-machine variance.
 TEST(RelayGrpc, BacklogCatchUpThroughputStaysOffTheGatherLoopFloor) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_grpc_test");
   constexpr int kBacklog = 50000;
   {
     journal::JournalWriter writer(dir / "journal");
@@ -290,7 +284,7 @@ TEST(RelayGrpc, BacklogCatchUpThroughputStaysOffTheGatherLoopFloor) {
 }
 
 TEST(RelayGrpc, EachSubscriberHasAnIndependentCursorFromItsOwnRequestedSequenceNumber) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_grpc_test");
   appendRecords(dir, 1, {10, 20, 30, 40, 50});
 
   RelayGatewayConfig config;

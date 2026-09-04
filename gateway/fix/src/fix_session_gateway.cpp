@@ -5,6 +5,7 @@
 #include <csignal>
 #include <thread>
 
+#include <sequencer/stop_signal.hpp>
 #include <sequencer/fix/fix_input_transport.hpp>
 #include <sequencer/fix/fix_output_transport.hpp>
 
@@ -14,8 +15,6 @@
 namespace sequencer::fix {
 namespace {
 
-std::atomic<bool> gStopRequested{false};
-void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 }  // namespace
 
@@ -28,7 +27,7 @@ int RunFixSessionGateway(SessionGatewayConfig config,
   // inherit the first one's SIGTERM and exit before it started --
   // leaving its threads joinable and taking the process down with
   // "terminate called without an active exception".
-  gStopRequested.store(false, std::memory_order_relaxed);
+  sequencer::clearStopRequest();
 
   // The input transport is built FIRST and held by raw pointer, because
   // both halves need it: the input chassis owns it as its transport,
@@ -99,11 +98,7 @@ int RunFixSessionGateway(SessionGatewayConfig config,
   outputGateway.start();
   inputGateway.start();
 
-  std::signal(SIGINT, handleStopSignal);
-  std::signal(SIGTERM, handleStopSignal);
-  while (!gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   // Input first on the way down: stop admitting orders before the
   // thing that delivers their consequences goes away.
@@ -114,7 +109,7 @@ int RunFixSessionGateway(SessionGatewayConfig config,
 
 int RunFixMarketDataGateway(MarketDataGatewayConfig config,
                              std::unique_ptr<sequencer::OutputCodec> outputCodec) {
-  gStopRequested.store(false, std::memory_order_relaxed);
+  sequencer::clearStopRequest();
 
   // FixInputTransport is used here purely as a SESSION ACCEPTOR -- it
   // is the component that accepts connections, runs Logon, heartbeats
@@ -155,11 +150,7 @@ int RunFixMarketDataGateway(MarketDataGatewayConfig config,
   outputGateway.start();
   acceptor.start(config.listenPort);
 
-  std::signal(SIGINT, handleStopSignal);
-  std::signal(SIGTERM, handleStopSignal);
-  while (!gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   acceptor.stop();
   outputGateway.stop();

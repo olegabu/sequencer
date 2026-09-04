@@ -62,6 +62,7 @@ target_link_libraries(sequencer_node
     unofficial::brpc::brpc-static
     protobuf::libprotobuf
     gflags::gflags_static
+    sequencer::common
 )
 
 target_compile_features(sequencer_node PUBLIC cxx_std_20)

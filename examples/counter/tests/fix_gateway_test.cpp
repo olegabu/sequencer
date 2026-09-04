@@ -8,6 +8,7 @@
 // sequence-number order, and the synchronous receipt is bookkeeping
 // only. This asserts exactly that difference.
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/fix/fix_session.hpp>
 
 #include <boost/asio/connect.hpp>
@@ -128,13 +129,6 @@ class FixClient {
   std::vector<Received> totals_;
 };
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "counter_fix_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return std::filesystem::path(tmpl);
-}
 
 // Which gateway binary is under test. Both implement the same example
 // -- same codecs, same journal, same §8.11 delivery -- and differ only
@@ -178,7 +172,7 @@ TEST_P(CounterFixGatewayEndToEnd, TotalsArriveAsU2FromTheJournalNotAsTheSynchron
   const int nodePort = gatewayUnderTest.needsClientCompIds ? 29751 : 29701;
   const int fixPort = gatewayUnderTest.needsClientCompIds ? 29752 : 29702;
 
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("counter_fix");
   const std::string nodePeer = "127.0.0.1:" + std::to_string(nodePort) + ":0";
 
   ChildProcess node(COUNTER_NODE_MAIN_PATH,
@@ -241,7 +235,7 @@ TEST_P(CounterFixGatewayEndToEnd, TotalsArriveAsU2FromTheJournalNotAsTheSynchron
 // failed and both paths delivered; zero would mean the flag turned the
 // reply off without turning the inline path on.
 TEST(CounterFixGateway, InlineDesignatedOutputsAnswerOnceNotTwice) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("counter_fix");
   const std::string nodePeer = "127.0.0.1:29711:0";
 
   ChildProcess node(COUNTER_NODE_MAIN_PATH,

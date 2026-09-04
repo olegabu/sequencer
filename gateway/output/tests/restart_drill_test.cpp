@@ -17,6 +17,7 @@
 // client-side counterpart to the server-side BrpcStreamFanout::closeAll()
 // race documented elsewhere in this component's README.
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/brpc_output_transport.hpp>
 #include "collecting_stream_client.hpp"
 #include "output_gateway_impl.hpp"
@@ -46,13 +47,6 @@ class EchoOutputCodec : public sequencer::OutputCodec {
   }
 };
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "restart_drill_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -84,7 +78,7 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
 
   // Gateway A: one continuous run, subscribed throughout — the
   // reference "uninterrupted run" this drill compares against.
-  const std::filesystem::path dirA = makeTempDir();
+  const std::filesystem::path dirA = sequencer::makeTempDir("restart_drill_test");
   OutputGatewayConfig configA;
   configA.dataDir = dirA;
   configA.resumeFile = dirA / "resume";
@@ -105,7 +99,7 @@ TEST(RestartDrill, RestartedGatewayProducesDisseminationIdenticalToAnUninterrupt
 
   // Gateway B: stopped and restarted partway through, at an arbitrary
   // sequence number — the interrupted run.
-  const std::filesystem::path dirB = makeTempDir();
+  const std::filesystem::path dirB = sequencer::makeTempDir("restart_drill_test");
   OutputGatewayConfig configB;
   configB.dataDir = dirB;
   configB.resumeFile = dirB / "resume";

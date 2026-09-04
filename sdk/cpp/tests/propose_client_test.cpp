@@ -16,6 +16,7 @@
 #include "input_gateway_impl.hpp"
 #include "node_impl.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 #include <sequencer/sdk/client_signer.hpp>
 #include <sequencer/sdk/propose_client.hpp>
@@ -74,13 +75,6 @@ class PassThroughCodec : public sequencer::InputCodec {
   std::optional<Bytes> onDisconnect(const SessionInfo&) override { return std::nullopt; }
 };
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "propose_client_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -106,7 +100,7 @@ Ed25519PublicKey derivePublicKey(const Ed25519PrivateKey& privateKey) {
 class ProposeClientTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    dir_ = makeTempDir();
+    dir_ = sequencer::makeTempDir("propose_client_test");
 
     node::detail::NodeConfig nodeConfig;
     nodeConfig.groupId = "propose-client-test";

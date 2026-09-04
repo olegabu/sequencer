@@ -21,6 +21,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <sequencer/comma_separated.hpp>
 #include <sequencer/fix/fix_session_gateway.hpp>
 
 #include "counter_fix_codecs.hpp"
@@ -44,17 +45,6 @@ DEFINE_bool(inline_designated_outputs, false,
 
 namespace {
 
-std::vector<std::string> splitCommaSeparated(const std::string& value) {
-  std::vector<std::string> parts;
-  std::stringstream stream(value);
-  std::string part;
-  while (std::getline(stream, part, ',')) {
-    if (!part.empty()) {
-      parts.push_back(part);
-    }
-  }
-  return parts;
-}
 
 }  // namespace
 
@@ -70,7 +60,7 @@ int main(int argc, char** argv) {
   }
 
   sequencer::fix::SessionGatewayConfig config;
-  config.nodeEndpoints = splitCommaSeparated(FLAGS_node_peers);
+  config.nodeEndpoints = sequencer::splitCommaSeparated(FLAGS_node_peers);
   config.listenPort = FLAGS_listen_port;
   config.dataDir = FLAGS_data_dir;
   config.resumeFile = FLAGS_resume_file;

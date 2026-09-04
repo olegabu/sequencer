@@ -6,6 +6,7 @@
 // restart, which is the whole point of the durable resume position
 // (§8.3: "restartable from any sequence number with identical output").
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/brpc_output_transport.hpp>
 #include "collecting_stream_client.hpp"
 #include "output_gateway_impl.hpp"
@@ -51,13 +52,6 @@ class EchoOutputCodec : public sequencer::OutputCodec {
   }
 };
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "output_gateway_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -73,7 +67,7 @@ void appendRecords(const std::filesystem::path& dataDir, std::uint64_t startSeq,
 }
 
 TEST(OutputGateway, DeliversLiveRecordsInOrderToAConnectedSubscriber) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("output_gateway_test");
 
   OutputGatewayConfig config;
   config.dataDir = dir;
@@ -110,7 +104,7 @@ TEST(OutputGateway, DeliversLiveRecordsInOrderToAConnectedSubscriber) {
 }
 
 TEST(OutputGateway, ResumesFromDurablePositionAfterRestartWithoutRedelivering) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("output_gateway_test");
 
   OutputGatewayConfig config;
   config.dataDir = dir;
@@ -228,7 +222,7 @@ class TestWsClient {
 // received every record while the WebSocket one received none. See
 // src/websocket_output_transport.cpp's wire-format comment.
 TEST(OutputGateway, OneGatewayServesTwoTransportsFromOneJournalTail) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("output_gateway_test");
   constexpr int kBrpcPort = 28963;
   constexpr int kWsPort = 28964;
 

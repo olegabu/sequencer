@@ -13,6 +13,7 @@
 // JSON response body, not in any generic field LoadGenerator itself
 // could read.
 
+#include <sequencer/comma_separated.hpp>
 #include <sequencer/bench/brpc_output_observer.hpp>
 #include <sequencer/bench/grpc_output_observer.hpp>
 #include <sequencer/bench/fix_requester.hpp>
@@ -342,17 +343,6 @@ class SubmitRequester : public sequencer::bench::LoadGeneratorRequester {
 namespace {
 
 // Splits "a,b,c" -- used for the FIX endpoint list.
-std::vector<std::string> splitCommaSeparated(const std::string& value) {
-  std::vector<std::string> parts;
-  std::stringstream stream(value);
-  std::string part;
-  while (std::getline(stream, part, ',')) {
-    if (!part.empty()) {
-      parts.push_back(part);
-    }
-  }
-  return parts;
-}
 
 }  // namespace
 
@@ -434,7 +424,7 @@ int main(int argc, char** argv) {
   // arm skips beyond the network hop.
   std::unique_ptr<sequencer::bench::LoadGeneratorRequester> requesterOwner;
   if (!FLAGS_fix_gateway_addr.empty()) {
-    const std::vector<std::string> addrs = splitCommaSeparated(FLAGS_fix_gateway_addr);
+    const std::vector<std::string> addrs = sequencer::splitCommaSeparated(FLAGS_fix_gateway_addr);
     if (addrs.empty()) {
       LOG(ERROR) << "load_generator: --fix_gateway_addr must be \"ip:port\" or a list of them";
       return 1;

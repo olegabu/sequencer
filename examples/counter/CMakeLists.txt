@@ -207,6 +207,7 @@ target_link_libraries(counter_quickfix_gateway_main PRIVATE
   sequencer::quickfix_gateway
   gflags::gflags
   glog::glog
+  sequencer::common
 )
 
 add_executable(counter_fix_gateway_main fix_gateway_main.cpp)

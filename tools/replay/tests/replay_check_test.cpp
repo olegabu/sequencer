@@ -6,6 +6,7 @@
 
 #include "replay_check.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/writer.hpp>
 
 #include <cstring>
@@ -44,19 +45,12 @@ Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
 }
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "replay_check_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 // Records a journal by directly driving a SumStateMachine + JournalWriter
 // — no node, no braft — exactly the shape of records replay must
 // reproduce.
 std::filesystem::path recordJournal(const std::vector<std::int64_t>& deltas) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("replay_check_test");
   journal::JournalWriter writer(dir / "journal");
   SumStateMachine recorder;
   for (std::size_t i = 0; i < deltas.size(); ++i) {
@@ -130,7 +124,7 @@ TEST(ReplayCheck, EmptyJournalReplaysTrivially) {
 TEST(ReplayCheck, ExplicitOutputDirIsUsedAndNotAutoRemoved) {
   const std::vector<std::int64_t> deltas = {1, 2, 3};
   const std::filesystem::path dataDir = recordJournal(deltas);
-  const std::filesystem::path outputDir = makeTempDir();
+  const std::filesystem::path outputDir = sequencer::makeTempDir("replay_check_test");
 
   ReplayConfig config;
   config.dataDir = dataDir;

@@ -24,6 +24,7 @@ target_link_libraries(sequencer_replay
   PRIVATE
     gflags::gflags_static
     glog::glog
+    sequencer::common
 )
 
 target_compile_features(sequencer_replay PUBLIC cxx_std_20)

@@ -9,6 +9,7 @@ target_link_libraries(relay_gateway_test PRIVATE
   GTest::gtest
   GTest::gtest_main
   Threads::Threads
+  sequencer::common
 )
 gtest_discover_tests(relay_gateway_test PROPERTIES TIMEOUT 60)
 
@@ -19,5 +20,6 @@ target_link_libraries(relay_grpc_test PRIVATE
   GTest::gtest
   GTest::gtest_main
   Threads::Threads
+  sequencer::common
 )
 gtest_discover_tests(relay_grpc_test PROPERTIES TIMEOUT 60)

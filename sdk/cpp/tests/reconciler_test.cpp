@@ -1,5 +1,6 @@
 #include <sequencer/sdk/reconciler.hpp>
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/writer.hpp>
 
 #include <cstdint>
@@ -14,13 +15,6 @@
 namespace sequencer::sdk {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "reconciler_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -34,7 +28,7 @@ Bytes rawRecordBytesFor(std::uint64_t sequenceNumber, std::int64_t input) {
 }
 
 TEST(Reconciler, MatchingBytesReconcileCleanly) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("reconciler_test");
   {
     journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});
@@ -52,7 +46,7 @@ TEST(Reconciler, MatchingBytesReconcileCleanly) {
 }
 
 TEST(Reconciler, MismatchedBytesAreReportedAsAFraudProof) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("reconciler_test");
   {
     journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});
@@ -71,7 +65,7 @@ TEST(Reconciler, MismatchedBytesAreReportedAsAFraudProof) {
 }
 
 TEST(Reconciler, NotYetCommittedIsDistinguishedFromAMismatch) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("reconciler_test");
   {
     journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});
@@ -88,7 +82,7 @@ TEST(Reconciler, NotYetCommittedIsDistinguishedFromAMismatch) {
 }
 
 TEST(Reconciler, CheckAllReturnsOnlyTheMismatches) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("reconciler_test");
   {
     journal::JournalWriter writer(dir / "journal");
     writer.append(1, payloadOf(5), {});

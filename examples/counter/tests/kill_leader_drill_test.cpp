@@ -26,6 +26,7 @@
 
 #include "child_process.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 
 #include <brpc/channel.h>
@@ -51,13 +52,6 @@
 namespace sequencer::examples::counter {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "kill_leader_drill_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 std::string stripPeerIdIndex(const std::string& peerId) {
   const auto lastColon = peerId.rfind(':');
@@ -136,7 +130,7 @@ Cluster startCluster(const std::string& group, int basePort) {
   for (int i = 0; i < 3; ++i) {
     raftPeers.push_back("127.0.0.1:" + std::to_string(basePort + i) + ":0");
     cluster.channelEndpoints.push_back("127.0.0.1:" + std::to_string(basePort + i));
-    cluster.dataDirs.push_back(makeTempDir());
+    cluster.dataDirs.push_back(sequencer::makeTempDir("kill_leader_drill"));
   }
   const std::string peersFlag = "--peers=" + raftPeers[0] + "," + raftPeers[1] + "," + raftPeers[2];
   const std::string nodePath = COUNTER_NODE_MAIN_PATH;

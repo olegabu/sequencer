@@ -38,6 +38,7 @@ target_include_directories(sequencer_gateway_input
 target_link_libraries(sequencer_gateway_input
   PUBLIC
     sequencer::journal
+    sequencer::common
     # Reuses node/'s already-generated Propose proto types (node.pb.h)
     # rather than duplicating that wire format in a second .proto —
     # see node_proposer.hpp. The PROTO target specifically, not

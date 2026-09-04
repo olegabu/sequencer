@@ -14,7 +14,7 @@ target_link_libraries(sdk_alarm_test PRIVATE sequencer::sdk GTest::gtest GTest::
 gtest_discover_tests(sdk_alarm_test)
 
 add_executable(sdk_reconciler_test reconciler_test.cpp)
-target_link_libraries(sdk_reconciler_test PRIVATE sequencer::sdk GTest::gtest GTest::gtest_main)
+target_link_libraries(sdk_reconciler_test PRIVATE sequencer::sdk GTest::gtest GTest::gtest_main sequencer::common)
 gtest_discover_tests(sdk_reconciler_test)
 
 add_executable(sdk_acceptance_drill_test acceptance_drill_test.cpp)
@@ -25,6 +25,7 @@ target_link_libraries(sdk_acceptance_drill_test PRIVATE
   GTest::gtest
   GTest::gtest_main
   Threads::Threads
+  sequencer::common
 )
 gtest_discover_tests(sdk_acceptance_drill_test PROPERTIES TIMEOUT 60)
 
@@ -37,5 +38,6 @@ target_link_libraries(sdk_propose_client_test PRIVATE
   GTest::gtest
   GTest::gtest_main
   Threads::Threads
+  sequencer::common
 )
 gtest_discover_tests(sdk_propose_client_test PROPERTIES TIMEOUT 60)

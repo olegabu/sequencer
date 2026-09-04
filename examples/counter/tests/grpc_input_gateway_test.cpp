@@ -13,6 +13,8 @@
 // ConcurrentSubmitsEachGetTheirOwnSequenceNumber guarding the same
 // path for the same reason; this is that guard for the typed path.
 
+#include <sequencer/temp_dir.hpp>
+
 #include <grpcpp/grpcpp.h>
 
 #include "counter_input_grpc.grpc.pb.h"
@@ -41,17 +43,9 @@ struct Reply {
   std::int64_t total = 0;
 };
 
-std::filesystem::path makeTempDir() {
-  const std::filesystem::path dir =
-      std::filesystem::temp_directory_path() /
-      ("counter-grpc-input-test-" + std::to_string(::getpid()) + "-" +
-       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-  std::filesystem::create_directories(dir);
-  return dir;
-}
 
 TEST(CounterGrpcInputGateway, ConcurrentSubmitsEachGetTheirOwnSequenceNumberAndTotal) {
-  const std::filesystem::path nodeDataDir = makeTempDir();
+  const std::filesystem::path nodeDataDir = sequencer::makeTempDir("counter-grpc-input-test");
   const std::string nodePeer = "127.0.0.1:28971:0";
   ChildProcess node(COUNTER_NODE_MAIN_PATH, {"--peer=" + nodePeer, "--peers=" + nodePeer,
                                               "--data_dir=" + nodeDataDir.string(),

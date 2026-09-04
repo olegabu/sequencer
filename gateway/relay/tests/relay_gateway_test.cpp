@@ -7,6 +7,7 @@
 #include "relay_gateway_impl.hpp"
 #include "relay_server.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/writer.hpp>
 #include <sequencer/relay/subscribe_client.hpp>
 
@@ -25,13 +26,6 @@
 namespace sequencer::gateway::relay::detail {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "relay_gateway_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -99,7 +93,7 @@ bool waitForCount(CollectingClient& client, std::size_t count, std::chrono::seco
 }
 
 TEST(RelayGateway, SubscribingFromTheBeginningReplaysAlreadyCommittedHistory) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_gateway_test");
   appendRecords(dir, 1, {5, -2, 10, -13, 100});
 
   RelayGatewayConfig config;
@@ -124,7 +118,7 @@ TEST(RelayGateway, SubscribingFromTheBeginningReplaysAlreadyCommittedHistory) {
 }
 
 TEST(RelayGateway, DeliversLiveRecordsAppendedAfterSubscribing) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_gateway_test");
   appendRecords(dir, 1, {1, 2});  // some pre-existing history
 
   RelayGatewayConfig config;
@@ -148,7 +142,7 @@ TEST(RelayGateway, DeliversLiveRecordsAppendedAfterSubscribing) {
 }
 
 TEST(RelayGateway, EachSubscriberHasAnIndependentCursorFromItsOwnRequestedSequenceNumber) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_gateway_test");
   appendRecords(dir, 1, {10, 20, 30, 40, 50});
 
   RelayGatewayConfig config;
@@ -176,7 +170,7 @@ TEST(RelayGateway, EachSubscriberHasAnIndependentCursorFromItsOwnRequestedSequen
 }
 
 TEST(RelayGateway, DeliveredRecordsAreByteIdenticalToTheColocatedJournal) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("relay_gateway_test");
   appendRecords(dir, 1, {7, -8, 42});
 
   RelayGatewayConfig config;

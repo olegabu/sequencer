@@ -1,5 +1,8 @@
 #include <sequencer/input_gateway.hpp>
 
+#include <sequencer/stop_signal.hpp>
+#include <sequencer/comma_separated.hpp>
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -27,20 +30,7 @@ DEFINE_int32(max_inflight_batches, 0,
 namespace sequencer {
 namespace {
 
-std::vector<std::string> splitCommaSeparated(const std::string& s) {
-  std::vector<std::string> parts;
-  std::stringstream ss(s);
-  std::string part;
-  while (std::getline(ss, part, ',')) {
-    if (!part.empty()) {
-      parts.push_back(part);
-    }
-  }
-  return parts;
-}
 
-std::atomic<bool> gStopRequested{false};
-void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 }  // namespace
 
@@ -60,7 +50,7 @@ int RunInputGateway(int argc, char** argv, std::unique_ptr<InputCodec> codec,
   }
 
   gateway::input::detail::InputGatewayConfig config;
-  config.nodeEndpoints = splitCommaSeparated(FLAGS_node_peers);
+  config.nodeEndpoints = sequencer::splitCommaSeparated(FLAGS_node_peers);
   config.listenPort = FLAGS_listen_port;
   config.maxBatchSize = static_cast<std::size_t>(std::max(0, FLAGS_max_batch_size));
   config.maxInFlightBatches = std::max(0, FLAGS_max_inflight_batches);
@@ -72,11 +62,7 @@ int RunInputGateway(int argc, char** argv, std::unique_ptr<InputCodec> codec,
   LOG(INFO) << "input gateway started: listen_port=" << FLAGS_listen_port
             << " node_peers=" << FLAGS_node_peers;
 
-  std::signal(SIGINT, handleStopSignal);
-  std::signal(SIGTERM, handleStopSignal);
-  while (!gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   LOG(INFO) << "input gateway stopping";
   gateway.stop();

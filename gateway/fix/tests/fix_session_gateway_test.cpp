@@ -8,6 +8,7 @@
 // that the client is never answered synchronously, and that both fills
 // arrive in JOURNAL order on the wire.
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/fix/fix_session_gateway.hpp>
 #include <sequencer/fix/fix_session.hpp>
 
@@ -234,19 +235,12 @@ class TestClient {
   bool sawPossDup_ = false;
 };
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "fix_gateway_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return std::filesystem::path(tmpl);
-}
 
 // The named deliverable of instruction 03 step 5: an aggressive order
 // and a resting one on the SAME session, with both fills arriving in
 // journal order and neither returned synchronously.
 TEST(FixSessionGateway, ExecutionReportsArriveFromTheJournalInOrderNeverSynchronously) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("fix_gateway_test");
 
   node::detail::NodeConfig nodeConfig;
   nodeConfig.groupId = "fix-gateway-test";
@@ -348,7 +342,7 @@ TEST(FixSessionGateway, ExecutionReportsArriveFromTheJournalInOrderNeverSynchron
 // messages. ResendRequest covers the other case -- messages the gateway
 // did send -- and is tested directly in fix_session_test.cpp.
 TEST(FixSessionGateway, AClientIsCaughtUpFromTheJournalAfterReconnecting) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("fix_gateway_test");
 
   node::detail::NodeConfig nodeConfig;
   nodeConfig.groupId = "fix-resend-test";
@@ -456,7 +450,7 @@ class BroadcastOutputCodec : public sequencer::OutputCodec {
 };
 
 TEST(FixMarketDataGateway, BroadcastsReachOnlySubscribersAndNothingCanBeProposed) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("fix_gateway_test");
 
   // A journal with content, written by a node that then goes away --
   // the market-data gateway only ever reads it.

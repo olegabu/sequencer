@@ -1,6 +1,8 @@
 #include <sequencer/node.hpp>
 
 #include <gflags/gflags.h>
+#include <sequencer/stop_signal.hpp>
+
 #include <glog/logging.h>
 
 #include <atomic>
@@ -44,12 +46,10 @@ DEFINE_uint64(journal_max_record_bytes, 0,
 namespace sequencer {
 namespace {
 
-std::atomic<bool> gStopRequested{false};
 
 // Signal-handler-safe: only sets a flag. The actual shutdown sequence
 // (stop the apply thread, shut down the raft node, stop the brpc
 // server) runs on the ordinary thread that started them, below.
-void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 }  // namespace
 
@@ -82,11 +82,7 @@ int RunNode(int argc, char** argv, std::unique_ptr<StateMachine> stateMachine) {
   LOG(INFO) << "node started: group=" << FLAGS_group << " peer=" << FLAGS_peer
             << " data_dir=" << FLAGS_data_dir;
 
-  std::signal(SIGINT, handleStopSignal);
-  std::signal(SIGTERM, handleStopSignal);
-  while (!gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   LOG(INFO) << "node stopping";
   nodeImpl.stop();

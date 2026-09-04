@@ -13,6 +13,7 @@ target_include_directories(sequencer_evidence INTERFACE
 target_link_libraries(sequencer_evidence INTERFACE
   sequencer::journal
   OpenSSL::Crypto
+  sequencer::common
 )
 target_compile_features(sequencer_evidence INTERFACE cxx_std_20)
 

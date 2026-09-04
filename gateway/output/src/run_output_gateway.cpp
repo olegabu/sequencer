@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include <sequencer/stop_signal.hpp>
 #include <sequencer/brpc_output_transport.hpp>
 #include "output_gateway_impl.hpp"
 
@@ -40,8 +41,6 @@ DEFINE_int32(idle_spin_iterations, 1000,
 namespace sequencer {
 namespace {
 
-std::atomic<bool> gStopRequested{false};
-void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 int runOutputGatewayCommon(int argc, char** argv, std::unique_ptr<OutputCodec> codec,
                             const std::function<std::vector<OutputTransportBinding>()>& bindingsFactory) {
@@ -83,11 +82,7 @@ int runOutputGatewayCommon(int argc, char** argv, std::unique_ptr<OutputCodec> c
   LOG(INFO) << "output gateway started: listen_ports=" << ports
             << " data_dir=" << FLAGS_data_dir;
 
-  std::signal(SIGINT, handleStopSignal);
-  std::signal(SIGTERM, handleStopSignal);
-  while (!gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   LOG(INFO) << "output gateway stopping";
   gateway.stop();

@@ -8,6 +8,7 @@
 #include "input_gateway_impl.hpp"
 #include "node_impl.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 
 #include <brpc/channel.h>
@@ -109,18 +110,11 @@ Bytes bytesOf(std::int64_t v) {
   return b;
 }
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "input_gateway_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 class InputGatewayTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    dir_ = makeTempDir();
+    dir_ = sequencer::makeTempDir("input_gateway_test");
 
     node::detail::NodeConfig nodeConfig;
     nodeConfig.groupId = "input-gateway-test";

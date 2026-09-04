@@ -15,6 +15,8 @@
 #include <stdexcept>
 #include <thread>
 
+#include <sequencer/stop_signal.hpp>
+
 #include "evidence_server.hpp"
 #include "signing_gateway_impl.hpp"
 
@@ -28,8 +30,6 @@ DEFINE_int32(listen_port, 0, "This gateway's own client-facing port (required)")
 namespace sequencer::evidence {
 namespace {
 
-std::atomic<bool> gStopRequested{false};
-void handleStopSignal(int /*signum*/) { gStopRequested.store(true, std::memory_order_relaxed); }
 
 int hexDigit(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -84,11 +84,7 @@ int main(int argc, char** argv) {
   sequencer::evidence::detail::EvidenceServer server(gateway, FLAGS_listen_port);
   LOG(INFO) << "signing gateway started: listen_port=" << FLAGS_listen_port << " data_dir=" << FLAGS_data_dir;
 
-  std::signal(SIGINT, sequencer::evidence::handleStopSignal);
-  std::signal(SIGTERM, sequencer::evidence::handleStopSignal);
-  while (!sequencer::evidence::gStopRequested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  sequencer::waitForStopSignal();
 
   LOG(INFO) << "signing gateway stopping";
   server.stop();

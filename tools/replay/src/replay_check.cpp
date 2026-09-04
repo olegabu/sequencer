@@ -1,5 +1,6 @@
 #include "replay_check.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 #include <sequencer/journal/writer.hpp>
 
@@ -11,13 +12,6 @@ namespace sequencer::replay::detail {
 
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "sequencer_replay_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("replay: mkdtemp failed");
-  }
-  return tmpl;
-}
 
 }  // namespace
 
@@ -28,7 +22,7 @@ ReplayResult runReplayCheck(const ReplayConfig& config, StateMachine& stateMachi
   const std::uint64_t total = original.committedCount();
 
   const bool autoCreatedOutputDir = config.replayOutputDir.empty();
-  result.replayOutputDir = autoCreatedOutputDir ? makeTempDir() : config.replayOutputDir;
+  result.replayOutputDir = autoCreatedOutputDir ? sequencer::makeTempDir("sequencer_replay") : config.replayOutputDir;
   if (!autoCreatedOutputDir) {
     std::filesystem::create_directories(result.replayOutputDir);
   }

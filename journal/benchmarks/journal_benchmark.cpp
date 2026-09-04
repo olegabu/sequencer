@@ -5,6 +5,7 @@
 // development"), not the cross-process/cross-machine measurement that
 // belongs in the separate benchmarking repository.
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 #include <sequencer/journal/writer.hpp>
 
@@ -18,13 +19,6 @@
 namespace sequencer::journal {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "sequencer_journal_bench_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    std::abort();
-  }
-  return tmpl;
-}
 
 // A segment large enough that Google Benchmark's auto-selected
 // iteration count for a sub-microsecond operation does not spend the
@@ -39,7 +33,7 @@ JournalOptions benchmarkOptions() {
 }
 
 void BM_Append(benchmark::State& state) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("sequencer_journal_bench");
   JournalWriter writer(dir / "journal", benchmarkOptions());
 
   const std::string inputStr(64, 'i');
@@ -60,7 +54,7 @@ void BM_Append(benchmark::State& state) {
 BENCHMARK(BM_Append);
 
 void BM_RecordViewRead(benchmark::State& state) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("sequencer_journal_bench");
   {
     JournalWriter writer(dir / "journal", benchmarkOptions());
     const std::string inputStr(64, 'i');

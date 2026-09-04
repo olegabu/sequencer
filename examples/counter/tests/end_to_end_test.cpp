@@ -11,6 +11,7 @@
 
 #include "child_process.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/reader.hpp>
 
 #include <brpc/channel.h>
@@ -44,13 +45,6 @@ namespace websocket = beast::websocket;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "counter_e2e_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 // A minimal synchronous WebSocket client — see
 // gateway/output/tests's and websocket_transport_test.cpp's identical
@@ -146,8 +140,8 @@ SubmitResult submitDelta(brpc::Channel& channel, std::int64_t delta) {
 }
 
 TEST(CounterEndToEnd, SubmitThroughInputGatewayIsObservedThroughOutputGateway) {
-  const std::filesystem::path nodeDataDir = makeTempDir();
-  const std::filesystem::path resumeFile = makeTempDir() / "resume";
+  const std::filesystem::path nodeDataDir = sequencer::makeTempDir("counter_e2e");
+  const std::filesystem::path resumeFile = sequencer::makeTempDir("counter_e2e") / "resume";
 
   const std::string nodePeer = "127.0.0.1:28981:0";
   ChildProcess node(COUNTER_NODE_MAIN_PATH, {"--peer=" + nodePeer, "--peers=" + nodePeer,

@@ -119,6 +119,7 @@ target_link_libraries(sequencer_relay PRIVATE
   gRPC::grpc++_reflection
   gflags::gflags_static
   glog::glog
+  sequencer::common
 )
 
 if(SEQUENCER_BUILD_TESTS)

@@ -20,6 +20,7 @@
 // covered thoroughly by proof_verifier_test.cpp already and isn't
 // repeated here.)
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/evidence/merkle.hpp>
 #include <sequencer/sdk/alarm.hpp>
 
@@ -47,13 +48,6 @@
 namespace sequencer::sdk {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "acceptance_drill_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
@@ -88,7 +82,7 @@ bool waitUntil(std::chrono::seconds timeout, const std::function<bool()>& predic
 }
 
 TEST(AcceptanceDrills, ProofReconstructionFromThePublishedJournalAloneSucceeds) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("acceptance_drill_test");
   {
     journal::JournalWriter writer(dir / "journal");
     for (std::uint64_t seq = 1; seq <= evidence::kBlockSize; ++seq) {
@@ -155,7 +149,7 @@ TEST(AcceptanceDrills, ProofReconstructionFromThePublishedJournalAloneSucceeds) 
 }
 
 TEST(AcceptanceDrills, ProofTimeoutAlarmFiresWhenTheSigningGatewayIsDeliberatelyStalled) {
-  const std::filesystem::path dir = makeTempDir();
+  const std::filesystem::path dir = sequencer::makeTempDir("acceptance_drill_test");
   const std::uint64_t submittedSeq = 5;
   {
     // Deliberately far short of a full block (specification.md §7.1:

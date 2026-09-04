@@ -15,6 +15,7 @@
 #include "../counter_state_machine.hpp"
 #include "replay_check.hpp"
 
+#include <sequencer/temp_dir.hpp>
 #include <sequencer/journal/writer.hpp>
 
 #include <cstring>
@@ -27,20 +28,13 @@
 namespace sequencer::examples::counter {
 namespace {
 
-std::filesystem::path makeTempDir() {
-  std::string tmpl = (std::filesystem::temp_directory_path() / "counter_replay_test_XXXXXX").string();
-  if (::mkdtemp(tmpl.data()) == nullptr) {
-    throw std::runtime_error("mkdtemp failed");
-  }
-  return tmpl;
-}
 
 Payload payloadOf(const std::int64_t& v) {
   return Payload(reinterpret_cast<const std::byte*>(&v), sizeof(v));
 }
 
 TEST(CounterReplay, RecordedJournalReplaysByteIdenticalThroughFreshStateMachine) {
-  const std::filesystem::path dataDir = makeTempDir();
+  const std::filesystem::path dataDir = sequencer::makeTempDir("counter_replay_test");
   const std::vector<std::int64_t> deltas = {5, -2, 10, -13, 100, 0, 42};
 
   {

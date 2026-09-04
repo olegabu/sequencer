@@ -16,5 +16,6 @@ target_link_libraries(evidence_signing_gateway_test PRIVATE
   GTest::gtest
   GTest::gtest_main
   Threads::Threads
+  sequencer::common
 )
 gtest_discover_tests(evidence_signing_gateway_test PROPERTIES TIMEOUT 60)

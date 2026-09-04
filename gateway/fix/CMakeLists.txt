@@ -90,6 +90,7 @@ target_link_libraries(sequencer_fix_gateway
   PUBLIC
     sequencer::fix_input
     sequencer::fix_output
+    sequencer::common
 )
 target_compile_features(sequencer_fix_gateway PUBLIC cxx_std_20)
 
