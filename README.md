@@ -59,7 +59,7 @@ with nobody's pager firing before service resumes.
 | `evidence/` | Deterministic Merkle blocks over journal records, signed by the signing gateway — an ordinary journal reader, so a node itself does no operator cryptography. |
 | `sdk/` | Reference client, per language: propose, verify proofs against your own bytes, reconcile against the journal, alarm on missing proofs — includes each language's journal reader, since verification requires reading the journal anyway. |
 | `tools/` | `replay` (a library an application links to certify byte-identical replay — the signature test) and `dumper` (a standalone raw-record viewer). |
-| `bench/load_generator/` | A reusable open/closed-loop, HDR-histogram load-testing harness — the piece an application-specific load generator (`examples/counter`'s included) supplies a request body and destination to. Feeds the sibling [raft-tests](https://github.com/olegabu/raft-tests) repo, this repository's actual benchmarking harness. |
+| `bench/load_generator/` | A reusable open/closed-loop, HDR-histogram load-testing harness — the piece an application-specific load generator (`examples/counter`'s included) supplies a request body and destination to. Feeds the sibling [raft-tests](https://github.com/opensequencer/raft-tests) repo, this repository's actual benchmarking harness. |
 | `examples/counter/` | The one example: a running total, its input and output codecs, node/gateway executables, and a load generator — the complete plug-point pattern at the smallest useful scale. |
 
 ## Design document

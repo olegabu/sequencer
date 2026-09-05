@@ -12,7 +12,7 @@ implements `LoadGeneratorRequester`; this header does the rest.
 ## Why this exists, and what it is not
 
 This is **not** this repository's actual benchmarking harness. That is
-[raft-tests](https://github.com/olegabu/raft-tests) — a sibling repo
+[raft-tests](https://github.com/opensequencer/raft-tests) — a sibling repo
 comparing this project's own raft implementation choice (braft)
 against openraft and aeron, with the terraform/EC2 deployment,
 multi-rate sweeps, and knee-curve chart generation that real
